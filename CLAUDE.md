@@ -77,12 +77,16 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/bols/{id}/approve` | Approve a record; idempotent |
 | POST | `/api/bols/{id}/unapprove` | Revert an approved record back to pending |
 | POST | `/api/bols/{id}/flag` | Flag a record with a reason |
+| POST | `/api/bols/{id}/unflag` | Remove flag from a record |
+| PATCH | `/api/bols/{id}/notes` | Auto-save notes field (called by frontend with 500ms debounce) |
 | POST | `/api/admin/pull` | Pull Technique manifests from AWP-SQL-PROD (disabled in mock mode) |
 | POST | `/api/admin/poll-email` | Poll O365 IMAP for unread ALG invoice emails → extract CSVs → process (live mode only) |
+| POST | `/api/admin/reset-invoices` | Dev: clear invoice fields on all records + delete invoice-only stubs |
 | POST | `/api/invoices/upload` | Upload ALG invoice CSV (Z-number format) → match + update record |
+| POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` path for unprocessed CSVs → process each |
 | GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only) |
 | POST | `/api/export` | Generate accounting CSV and email to Mary + Katie |
-| GET | `/api/logs` | All records across all dates; optional `?start_date=` / `?end_date=` filters |
+| GET | `/api/logs` | All records across all dates; optional `?start_date=` / `?end_date=` / `?status=` filters |
 | GET | `/api/logs/export` | Download log as CSV; same date-range params as above |
 
 ---
