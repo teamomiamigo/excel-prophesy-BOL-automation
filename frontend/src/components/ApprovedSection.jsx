@@ -1,3 +1,5 @@
+import { useState } from 'react';
+
 const TH = {
   padding: '7px 10px',
   background: '#374151',
@@ -38,16 +40,19 @@ export default function ApprovedSection({
   approvedBols,
   loading,
   sendLoading,
-  sendConfirmPending,
   sidLoading,
+  sidExportedThisSession,
   unapprovingId,
   onUnapprove,
-  onSendToAccounting,
   onConfirmSend,
-  onCancelSend,
   onExportProphecy,
 }) {
-  const sidCount = approvedBols.filter(b => b.needs_sid_export).length;
+  const [showModal, setShowModal] = useState(false);
+
+  const sidCount  = approvedBols.filter(b => b.needs_sid_export).length;
+  const bCount    = approvedBols.length - sidCount;
+  const canSend   = sidCount === 0 || sidExportedThisSession;
+
   return (
     <section>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
@@ -55,93 +60,152 @@ export default function ApprovedSection({
           Approved Today ({approvedBols.length})
         </h2>
 
-        {approvedBols.length > 0 && !sendConfirmPending && (
-          <div style={{ display: 'flex', gap: 8 }}>
-            {sidCount > 0 && (
-              <button
-                onClick={onExportProphecy}
-                disabled={sidLoading}
-                title={`Download Prophecy SID import file for ${sidCount} Type-A record(s) that need a BOL created`}
-                style={{
-                  background: '#fff',
-                  color: '#374151',
-                  border: '1px solid #d1d5db',
-                  borderRadius: 6,
-                  padding: '8px 16px',
-                  fontWeight: 600,
-                  fontSize: 13,
-                  opacity: sidLoading ? 0.6 : 1,
-                  cursor: sidLoading ? 'not-allowed' : 'pointer',
-                }}
-              >
-                {sidLoading ? 'Generating…' : `Export to Prophecy (${sidCount})`}
-              </button>
-            )}
-            <button
-              onClick={onSendToAccounting}
-              disabled={sendLoading}
-              style={{
-                background: '#2D6A4F',
-                color: '#fff',
-                border: 'none',
-                borderRadius: 6,
-                padding: '8px 18px',
-                fontWeight: 600,
-                fontSize: 13,
-                opacity: sendLoading ? 0.6 : 1,
-                cursor: sendLoading ? 'not-allowed' : 'pointer',
-              }}
-            >
-              {sendLoading ? 'Sending…' : `Send to Accounting (${approvedBols.length})`}
-            </button>
-          </div>
-        )}
-
-        {sendConfirmPending && (
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-            background: '#fff',
-            border: '1px solid #d1d5db',
-            borderRadius: 6,
-            padding: '8px 14px',
-          }}>
-            <span style={{ fontSize: 13, color: '#374151' }}>
-              Send {approvedBols.length} approved record{approvedBols.length !== 1 ? 's' : ''} to Mary and Katie?
-            </span>
-            <button
-              onClick={onConfirmSend}
-              style={{
-                background: '#2D6A4F',
-                color: '#fff',
-                border: 'none',
-                borderRadius: 4,
-                padding: '5px 14px',
-                fontWeight: 600,
-                fontSize: 13,
-                cursor: 'pointer',
-              }}
-            >
-              Confirm
-            </button>
-            <button
-              onClick={onCancelSend}
-              style={{
-                background: '#fff',
-                color: '#6b7280',
-                border: '1px solid #d1d5db',
-                borderRadius: 4,
-                padding: '5px 14px',
-                fontSize: 13,
-                cursor: 'pointer',
-              }}
-            >
-              Cancel
-            </button>
-          </div>
+        {approvedBols.length > 0 && (
+          <button
+            onClick={() => setShowModal(true)}
+            disabled={sendLoading}
+            style={{
+              background: '#2D6A4F',
+              color: '#fff',
+              border: 'none',
+              borderRadius: 6,
+              padding: '8px 18px',
+              fontWeight: 600,
+              fontSize: 13,
+              opacity: sendLoading ? 0.6 : 1,
+              cursor: sendLoading ? 'not-allowed' : 'pointer',
+            }}
+          >
+            {sendLoading ? 'Sending…' : 'Finalize & Export'}
+          </button>
         )}
       </div>
+
+      {/* Finalize & Export modal */}
+      {showModal && (
+        <div
+          onClick={() => setShowModal(false)}
+          style={{
+            position: 'fixed', inset: 0,
+            background: 'rgba(0,0,0,0.45)',
+            zIndex: 1000,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              background: '#fff',
+              borderRadius: 10,
+              padding: '28px 32px',
+              width: 480,
+              maxWidth: '95vw',
+              boxShadow: '0 20px 40px rgba(0,0,0,0.18)',
+            }}
+          >
+            <h3 style={{ fontSize: 16, fontWeight: 700, color: '#111827', marginBottom: 20 }}>
+              Finalize & Export — {approvedBols.length} approved record{approvedBols.length !== 1 ? 's' : ''}
+            </h3>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 24 }}>
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 10,
+                padding: '10px 14px',
+                background: '#f0fdf4',
+                border: '1px solid #bbf7d0',
+                borderRadius: 6,
+                fontSize: 13,
+                color: '#166534',
+              }}>
+                <span style={{ fontWeight: 700, fontSize: 16 }}>✓</span>
+                <span><strong>{bCount}</strong> record{bCount !== 1 ? 's' : ''} have BOL numbers — ready for accounting</span>
+              </div>
+
+              {sidCount > 0 && (
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '10px 14px',
+                  background: sidExportedThisSession ? '#f0fdf4' : '#fffbeb',
+                  border: `1px solid ${sidExportedThisSession ? '#bbf7d0' : '#fcd34d'}`,
+                  borderRadius: 6,
+                  fontSize: 13,
+                  color: sidExportedThisSession ? '#166534' : '#92400e',
+                }}>
+                  <span style={{ fontWeight: 700, fontSize: 16 }}>{sidExportedThisSession ? '✓' : '⚠'}</span>
+                  <span>
+                    <strong>{sidCount}</strong> record{sidCount !== 1 ? 's' : ''} need SID export first (no BOL number yet)
+                    {sidExportedThisSession ? ' — SID exported' : ''}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {sidCount > 0 && !sidExportedThisSession && (
+              <div style={{ marginBottom: 16 }}>
+                <button
+                  onClick={onExportProphecy}
+                  disabled={sidLoading}
+                  style={{
+                    display: 'block',
+                    width: '100%',
+                    background: sidLoading ? '#e5e7eb' : '#f9fafb',
+                    color: sidLoading ? '#9ca3af' : '#374151',
+                    border: '1px solid #d1d5db',
+                    borderRadius: 6,
+                    padding: '10px 0',
+                    fontWeight: 600,
+                    fontSize: 13,
+                    cursor: sidLoading ? 'not-allowed' : 'pointer',
+                    textAlign: 'center',
+                  }}
+                >
+                  {sidLoading ? 'Generating…' : `Export to Prophecy (${sidCount})`}
+                </button>
+                <p style={{ fontSize: 12, color: '#6b7280', marginTop: 6, textAlign: 'center' }}>
+                  Complete SID export before sending to accounting.
+                </p>
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setShowModal(false)}
+                style={{
+                  background: '#fff',
+                  color: '#6b7280',
+                  border: '1px solid #d1d5db',
+                  borderRadius: 5,
+                  padding: '8px 18px',
+                  fontSize: 13,
+                  cursor: 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { setShowModal(false); onConfirmSend(); }}
+                disabled={!canSend || sendLoading}
+                title={!canSend ? 'Export SID to Prophecy first' : undefined}
+                style={{
+                  background: canSend ? '#2D6A4F' : '#9ca3af',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: 5,
+                  padding: '8px 18px',
+                  fontWeight: 600,
+                  fontSize: 13,
+                  cursor: canSend ? 'pointer' : 'not-allowed',
+                  opacity: sendLoading ? 0.7 : 1,
+                }}
+              >
+                Send to Accounting ({approvedBols.length})
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {loading ? (
         <div style={{ padding: 24, textAlign: 'center', color: '#9ca3af' }}>Loading…</div>

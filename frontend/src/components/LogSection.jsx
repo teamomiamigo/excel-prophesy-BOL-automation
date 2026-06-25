@@ -103,7 +103,7 @@ export default function LogSection() {
     <section>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
         <h2 style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>
-          Log — All Records ({records.length})
+          Log — Approved Records ({records.length})
         </h2>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <form onSubmit={handleFilter} style={{ display: 'flex', gap: 6, alignItems: 'center' }}>

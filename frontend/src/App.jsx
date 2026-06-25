@@ -21,7 +21,6 @@ export default function App() {
   const [flagSubmitting, setFlagSubmitting] = useState(false);
 
   const [sendLoading, setSendLoading] = useState(false);
-  const [sendConfirmPending, setSendConfirmPending] = useState(false);
   const [sidLoading, setSidLoading] = useState(false);
   const [invoiceUploading, setInvoiceUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(null);
@@ -247,7 +246,6 @@ export default function App() {
   }
 
   async function handleSendToAccounting() {
-    setSendConfirmPending(false);
     setSendLoading(true);
     try {
       const res = await fetch('/api/export', { method: 'POST' });
@@ -369,9 +367,10 @@ export default function App() {
         {activeTab === 'dashboard' && (
           <>
             <SummaryBar
-              pending={summary.pending}
-              approved={summary.approved}
-              flagged={summary.flagged}
+              manifestOnly={summary.manifestOnly}
+              invoiceOnly={summary.invoiceOnly}
+              readyToReview={summary.readyToReview}
+              approvedToday={summary.approvedToday}
             />
 
             {/* Date / context banner + invoice upload */}
@@ -391,14 +390,14 @@ export default function App() {
                 {new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}
               </span>
               <span>·</span>
-              <span>{summary.pending + summary.flagged + summary.approved} records loaded</span>
+              <span>{summary.manifestOnly + summary.invoiceOnly + summary.readyToReview + summary.approvedToday} records loaded</span>
               <span>·</span>
-              <span>{summary.pending} pending &nbsp;·&nbsp; {summary.flagged} flagged &nbsp;·&nbsp; {summary.approved} approved</span>
+              <span>{summary.readyToReview} ready &nbsp;·&nbsp; {summary.manifestOnly} manifest only &nbsp;·&nbsp; {summary.invoiceOnly} invoice only &nbsp;·&nbsp; {summary.approvedToday} approved</span>
               <span style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
                 <button
                   onClick={handlePull}
                   disabled={pullLoading}
-                  title="Pull latest manifests from Technique (last 10 days)"
+                  title="Pull latest manifests from Technique"
                   style={{
                     background: pullLoading ? '#e5e7eb' : '#f9fafb',
                     color: pullLoading ? '#9ca3af' : '#374151',
@@ -410,24 +409,24 @@ export default function App() {
                     cursor: pullLoading ? 'not-allowed' : 'pointer',
                   }}
                 >
-                  {pullLoading ? 'Pulling…' : '↻ Refresh Manifests'}
+                  {pullLoading ? 'Pulling…' : '↻ Pull Manifests'}
                 </button>
                 <button
-                  onClick={handleCheckEmail}
-                  disabled={emailLoading}
-                  title="Check O365 inbox for new ALG invoice emails from Tanya and process any CSV attachments"
+                  onClick={handlePollFolder}
+                  disabled={pollFolderLoading}
+                  title="Scan invoice folder for new ALG CSVs and process them"
                   style={{
-                    background: emailLoading ? '#e5e7eb' : '#faf5ff',
-                    color: emailLoading ? '#9ca3af' : '#7c3aed',
-                    border: '1px solid #ddd6fe',
+                    background: pollFolderLoading ? '#e5e7eb' : '#f0fdf4',
+                    color: pollFolderLoading ? '#9ca3af' : '#2D6A4F',
+                    border: '1px solid #bbf7d0',
                     borderRadius: 5,
                     padding: '4px 12px',
                     fontWeight: 600,
                     fontSize: 12,
-                    cursor: emailLoading ? 'not-allowed' : 'pointer',
+                    cursor: pollFolderLoading ? 'not-allowed' : 'pointer',
                   }}
                 >
-                  {emailLoading ? 'Checking…' : '✉ Check Email'}
+                  {pollFolderLoading ? 'Scanning…' : '⤓ Pull Invoices'}
                 </button>
                 <label style={{
                   display: 'inline-block',
@@ -492,6 +491,8 @@ export default function App() {
               loading={loadingPending}
               approvingId={approvingId}
               unflaggingId={unflaggingId}
+              filterText={filterText}
+              onFilterChange={setFilterText}
               onApprove={handleApprove}
               onFlagOpen={setFlagTarget}
               onUnflag={handleUnflag}
@@ -502,13 +503,11 @@ export default function App() {
               approvedBols={approvedBols}
               loading={loadingApproved}
               sendLoading={sendLoading}
-              sendConfirmPending={sendConfirmPending}
               sidLoading={sidLoading}
+              sidExportedThisSession={sidExportedThisSession}
               unapprovingId={unapprovingId}
               onUnapprove={handleUnapprove}
-              onSendToAccounting={() => setSendConfirmPending(true)}
               onConfirmSend={handleSendToAccounting}
-              onCancelSend={() => setSendConfirmPending(false)}
               onExportProphecy={handleExportProphecy}
             />
           </>

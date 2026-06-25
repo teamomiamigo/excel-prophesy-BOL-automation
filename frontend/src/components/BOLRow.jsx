@@ -136,7 +136,11 @@ export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFl
 
       {/* Invoice info */}
       <td style={{ ...TD, fontWeight: 600 }}>{bol.invoice_number || <span style={{ color: '#d1d5db' }}>—</span>}</td>
-      <td style={TD_R}>{fmtMoney(bol.access_prog)}</td>
+      <td style={TD_R}
+        title={bol.base_tariff != null && bol.fsc_pct != null
+          ? `Base: ${fmtMoney(bol.base_tariff)} × FSC (${(parseFloat(bol.fsc_pct) * 100).toFixed(1)}%) = ${fmtMoney(bol.access_prog)}`
+          : undefined}
+      >{fmtMoney(bol.access_prog)}</td>
       <td style={{ ...TD_R, fontWeight: 600 }}>{fmtMoney(bol.amount)}</td>
 
       <td style={{ ...TD_R, ...getCostPctStyle(bol.cost_pct) }}>
