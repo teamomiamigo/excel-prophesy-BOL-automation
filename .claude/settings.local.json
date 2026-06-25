@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run *)",
+      "PowerShell(\\(Get-Item \"C:\\\\nikhilm\\\\excel-prophesy-BOL-automation\\\\backend\\\\data_layer.py\"\\).LastWriteTime = Get-Date; Write-Host \"Touched — waiting for reload...\"; Start-Sleep -Seconds 4; $result = Invoke-WebRequest -Uri \"http://localhost:8000/api/admin/pull?days_back=3\" -Method POST -UseBasicParsing 2>&1; Write-Host \"Status: $\\($result.StatusCode\\)\"; $result.Content)",
+      "PowerShell(Invoke-WebRequest -Uri \"http://localhost:8000/api/bols\" -UseBasicParsing | Select-Object -ExpandProperty Content | Select-Object -First 1)",
+      "Bash(Get-ChildItem -Path \"C:\\\\nikhilm\\\\excel-prophesy-BOL-automation\" -Recurse -Depth 2)",
+      "Bash(Select-Object FullName)"
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+sqlalchemy>=2.0.30
+psycopg2-binary>=2.9.9      # requires PostgreSQL client libs; add when USE_MOCK_DATA=False
+pydantic>=2.7.1
+pydantic-settings>=2.2.1
+pandas>=2.2.3               # 2.2.3+ required for Python 3.13
+python-dotenv>=1.0.1
+python-multipart>=0.0.9
+openpyxl>=3.1.0             # required by backend/seed_rates.py to read the FSC Excel
