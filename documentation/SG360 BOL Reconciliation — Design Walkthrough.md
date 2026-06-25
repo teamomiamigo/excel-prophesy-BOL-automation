@@ -144,3 +144,23 @@ calculated_cost = base_tariff × (1 + fsc_pct)
 7. What would happen with the PDF files, do those still need to be moved around?
 8. Am I missing anything in your process that isn't a part of this method or any issues that you would probably encounter?
 9. Can you define again how the matching situation works and how that is moved over?
+
+notes from katie:
+job number # wording needs to change
+coloring on differential of weights, pcs, and pallets
+is there a button to fix it - to go to the invoice number and then flag it with a different trip number
+when it comes to trips they are live 
+- invoices usually take 5-10 days to come in
+pending BOLs 
+- 1 they aren't created yet or they are 3rd party trips and manifest (we load the truck customer pays them directly so no invoice)
+	- to the right there should be an 3rd party button
+it will give the VMU_T
+when carrier comes from Wolf then they reference the BOL
+when corp ships they don't create a BOL
+if trip and manifest start with TEC, that's technique and out of corp wheeling (these don't have access to prophesy)
+pending ones are 3rd party and these don't go in prophesy
+the stuff coming out of wolf road, and their manifests are made in visualmail and they get started with VMI and wolf has the way to create their own BOL
+- they also ship 3rd party so they will also have manifests that would be without a prophesy number 
+ones that have number of manifest is through visual mail
+when it comes to filtering, it can be filtered by date
+shared drive: 
