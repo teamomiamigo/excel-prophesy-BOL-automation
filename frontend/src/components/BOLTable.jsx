@@ -24,16 +24,118 @@ const TH_GROUP = {
   color: '#d1d5db',
 };
 
-export default function BOLTable({ bols, loading, approvingId, unflaggingId, onApprove, onFlagOpen, onUnflag, onNotesUpdate }) {
+function TableHead() {
+  return (
+    <thead>
+      <tr>
+        <th colSpan={4} style={TH_STYLE} />
+        <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '2px solid #404040' }}>Technique</th>
+        <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '1px solid #404040' }}>Invoice (ALG)</th>
+        <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '1px solid #404040' }}>Diff</th>
+        <th colSpan={4} style={TH_STYLE} />
+      </tr>
+      <tr>
+        <th style={TH_STYLE}>Trip</th>
+        <th style={TH_STYLE}>Manifest</th>
+        <th style={TH_STYLE}>BOL</th>
+        <th style={TH_STYLE}>Job #</th>
+        <th style={{ ...TH_STYLE, textAlign: 'right', borderLeft: '2px solid #333' }}>Wgt</th>
+        <th style={{ ...TH_STYLE, textAlign: 'right' }}>Pal</th>
+        <th style={{ ...TH_STYLE, textAlign: 'right' }}>PCS</th>
+        <th style={{ ...TH_STYLE, textAlign: 'right', borderLeft: '1px solid #333' }}>Wgt</th>
+        <th style={{ ...TH_STYLE, textAlign: 'right' }}>Pal</th>
+        <th style={{ ...TH_STYLE, textAlign: 'right' }}>PCS</th>
+        <th style={{ ...TH_STYLE, textAlign: 'right', borderLeft: '1px solid #333' }}>ΔWgt</th>
+        <th style={{ ...TH_STYLE, textAlign: 'right' }}>ΔPal</th>
+        <th style={{ ...TH_STYLE, textAlign: 'right' }}>ΔPCS</th>
+        <th style={TH_STYLE}>Invoice #</th>
+        <th style={{ ...TH_STYLE, textAlign: 'right' }}>Calc Cost</th>
+        <th style={{ ...TH_STYLE, textAlign: 'right' }}>Amount</th>
+        <th style={{ ...TH_STYLE, textAlign: 'right' }}>Cost %</th>
+        <th style={TH_STYLE}>Notes</th>
+        <th style={{ ...TH_STYLE, textAlign: 'center' }}>Actions</th>
+      </tr>
+    </thead>
+  );
+}
+
+export default function BOLTable({
+  bols, loading, approvingId, unflaggingId,
+  filterText, onFilterChange,
+  onApprove, onFlagOpen, onUnflag, onNotesUpdate,
+}) {
+  const lower = (filterText || '').toLowerCase();
+  const matchesBol = b => !filterText || [
+    b.technique_trip, b.manifest, b.invoice_number, b.inv_job_number,
+    b.bol_number != null ? String(b.bol_number) : '',
+  ].some(v => (v || '').toLowerCase().includes(lower));
+
+  const isComingle    = b => (b.manifest || '').startsWith('CM_');
+  const isInvoiceOnly = b => b.technique_trip == null && !isComingle(b);
+  const isMain        = b => b.technique_trip != null && !isComingle(b);
+
+  const mainBols        = bols.filter(isMain).filter(matchesBol);
+  const invoiceOnlyBols = bols.filter(isInvoiceOnly).filter(matchesBol);
+  const comingleBols    = bols.filter(isComingle).filter(matchesBol);
+  const totalVisible    = mainBols.length + invoiceOnlyBols.length + comingleBols.length;
+
+  function rowProps(bol) {
+    return {
+      key: bol.id,
+      bol,
+      isApproving:  approvingId  === bol.id,
+      isUnflagging: unflaggingId === bol.id,
+      onApprove:    () => onApprove(bol.id),
+      onFlagOpen:   () => onFlagOpen(bol),
+      onUnflag:     () => onUnflag(bol.id),
+      onNotesUpdate: notes => onNotesUpdate(bol.id, notes),
+    };
+  }
+
   return (
     <section style={{ marginBottom: 28 }}>
-      <h2 style={{ fontSize: 14, fontWeight: 600, color: '#374151', marginBottom: 10 }}>
-        Pending Review ({bols.filter(b => b.status === 'pending').length}) &nbsp;·&nbsp; Flagged ({bols.filter(b => b.status === 'flagged').length})
-      </h2>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+        <h2 style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>
+          Pending Review ({bols.filter(b => b.status === 'pending').length})
+          &nbsp;·&nbsp;
+          Flagged ({bols.filter(b => b.status === 'flagged').length})
+        </h2>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <input
+            placeholder="Filter by trip, manifest, invoice #, job #, or BOL…"
+            value={filterText}
+            onChange={e => onFilterChange(e.target.value)}
+            style={{
+              border: '1px solid #d1d5db',
+              borderRadius: 5,
+              padding: '5px 10px',
+              fontSize: 12,
+              width: 320,
+              outline: 'none',
+            }}
+          />
+          {filterText && (
+            <button
+              onClick={() => onFilterChange('')}
+              style={{
+                background: '#fff',
+                color: '#6b7280',
+                border: '1px solid #d1d5db',
+                borderRadius: 4,
+                padding: '5px 10px',
+                fontSize: 12,
+                cursor: 'pointer',
+              }}
+            >
+              Clear
+            </button>
+          )}
+        </div>
+      </div>
 
       {loading ? (
         <div style={{ padding: 32, textAlign: 'center', color: '#9ca3af' }}>Loading records…</div>
-      ) : bols.length === 0 ? (
+      ) : totalVisible === 0 ? (
         <div style={{
           padding: 32,
           textAlign: 'center',
@@ -42,59 +144,75 @@ export default function BOLTable({ bols, loading, approvingId, unflaggingId, onA
           borderRadius: 8,
           border: '1px solid #e5e7eb',
         }}>
-          No pending records — all caught up!
+          {filterText ? `No records match "${filterText}"` : 'No pending records — all caught up!'}
         </div>
       ) : (
-        <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
-            <thead>
-              {/* Group header row */}
-              <tr>
-                <th colSpan={4} style={TH_STYLE} />
-                <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '2px solid #404040' }}>Technique</th>
-                <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '1px solid #404040' }}>Invoice (ALG)</th>
-                <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '1px solid #404040' }}>Diff</th>
-                <th colSpan={4} style={TH_STYLE} />
-              </tr>
-              {/* Column header row */}
-              <tr>
-                <th style={TH_STYLE}>Trip</th>
-                <th style={TH_STYLE}>Manifest</th>
-                <th style={TH_STYLE}>BOL</th>
-                <th style={TH_STYLE}>Job #</th>
-                <th style={{ ...TH_STYLE, textAlign: 'right', borderLeft: '2px solid #333' }}>Wgt</th>
-                <th style={{ ...TH_STYLE, textAlign: 'right' }}>Pal</th>
-                <th style={{ ...TH_STYLE, textAlign: 'right' }}>PCS</th>
-                <th style={{ ...TH_STYLE, textAlign: 'right', borderLeft: '1px solid #333' }}>Wgt</th>
-                <th style={{ ...TH_STYLE, textAlign: 'right' }}>Pal</th>
-                <th style={{ ...TH_STYLE, textAlign: 'right' }}>PCS</th>
-                <th style={{ ...TH_STYLE, textAlign: 'right', borderLeft: '1px solid #333' }}>ΔWgt</th>
-                <th style={{ ...TH_STYLE, textAlign: 'right' }}>ΔPal</th>
-                <th style={{ ...TH_STYLE, textAlign: 'right' }}>ΔPCS</th>
-                <th style={TH_STYLE}>Invoice #</th>
-                <th style={{ ...TH_STYLE, textAlign: 'right' }}>Calc Cost</th>
-                <th style={{ ...TH_STYLE, textAlign: 'right' }}>Amount</th>
-                <th style={{ ...TH_STYLE, textAlign: 'right' }}>Cost %</th>
-                <th style={TH_STYLE}>Notes</th>
-                <th style={{ ...TH_STYLE, textAlign: 'center' }}>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {bols.map(bol => (
-                <BOLRow
-                  key={bol.id}
-                  bol={bol}
-                  isApproving={approvingId === bol.id}
-                  isUnflagging={unflaggingId === bol.id}
-                  onApprove={() => onApprove(bol.id)}
-                  onFlagOpen={() => onFlagOpen(bol)}
-                  onUnflag={() => onUnflag(bol.id)}
-                  onNotesUpdate={(notes) => onNotesUpdate(bol.id, notes)}
-                />
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <>
+          {mainBols.length > 0 && (
+            <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb', marginBottom: 12 }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
+                <TableHead />
+                <tbody>
+                  {mainBols.map(bol => <BOLRow {...rowProps(bol)} />)}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {invoiceOnlyBols.length > 0 && (
+            <details style={{ marginBottom: 12 }}>
+              <summary style={{
+                cursor: 'pointer',
+                padding: '8px 14px',
+                background: '#faf5ff',
+                border: '1px solid #ddd6fe',
+                borderRadius: 8,
+                fontSize: 13,
+                fontWeight: 600,
+                color: '#7c3aed',
+                userSelect: 'none',
+                listStyle: 'none',
+              }}>
+                ▸ Invoice Only — {invoiceOnlyBols.length} record{invoiceOnlyBols.length !== 1 ? 's' : ''} (no matching manifest yet)
+              </summary>
+              <div style={{ overflowX: 'auto', borderRadius: '0 0 8px 8px', border: '1px solid #ddd6fe', borderTop: 'none' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
+                  <TableHead />
+                  <tbody>
+                    {invoiceOnlyBols.map(bol => <BOLRow {...rowProps(bol)} />)}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          )}
+
+          {comingleBols.length > 0 && (
+            <details style={{ marginBottom: 12 }}>
+              <summary style={{
+                cursor: 'pointer',
+                padding: '8px 14px',
+                background: '#fffbeb',
+                border: '1px solid #fcd34d',
+                borderRadius: 8,
+                fontSize: 13,
+                fontWeight: 600,
+                color: '#92400e',
+                userSelect: 'none',
+                listStyle: 'none',
+              }}>
+                ▸ Comingle — {comingleBols.length} record{comingleBols.length !== 1 ? 's' : ''}
+              </summary>
+              <div style={{ overflowX: 'auto', borderRadius: '0 0 8px 8px', border: '1px solid #fcd34d', borderTop: 'none' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
+                  <TableHead />
+                  <tbody>
+                    {comingleBols.map(bol => <BOLRow {...rowProps(bol)} />)}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          )}
+        </>
       )}
     </section>
   );
