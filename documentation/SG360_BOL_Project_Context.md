@@ -27,8 +27,8 @@ Katie manually copies data from all three into the spreadsheet, calculates cost 
 | **Mary** | SG360 accounting | Receives the approved BOL summary CSV by email |
 | **Marge** | SG360 SQL team | Wrote original Technique queries; knows DB schema |
 | **Megha** | SG360 Prophecy admin | Knows Prophecy internals and Z-number generation |
-| **Phil** | Logistics lead | Owns ALG relationship; could request CSV invoices instead of PDF |
-| **Nikhil** | Developer | Building this system |
+| **Phil** | Logistics lead |
+| **Nikhil** | Developer |
 
 ---
 
@@ -207,15 +207,15 @@ fuel_surcharge_rates  ← 135 rows seeded
 
 ## API Routes
 
-| Method | Path                   | Purpose                             |
-| ------ | ---------------------- | ----------------------------------- |
-| GET    | /health                | Status + mock mode flag             |
-| GET    | /api/bols              | All pending + flagged records       |
-| GET    | /api/bols/approved     | Approved records for today          |
-| POST   | /api/bols/{id}/approve | Approve a record                    |
-| POST   | /api/bols/{id}/flag    | Flag with reason                    |
-| POST   | /api/admin/pull        | Morning data pull from AWP-SQL-PROD |
-| POST   | /api/export            | CSV export + email to Mary + Katie  |
+| Method | Path | Purpose |
+|---|---|---|
+| GET | /health | Status + mock mode flag |
+| GET | /api/bols | All pending + flagged records |
+| GET | /api/bols/approved | Approved records for today |
+| POST | /api/bols/{id}/approve | Approve a record |
+| POST | /api/bols/{id}/flag | Flag with reason |
+| POST | /api/admin/pull | Morning data pull from AWP-SQL-PROD |
+| POST | /api/export | CSV export + email to Mary + Katie |
 
 ---
 
@@ -257,16 +257,16 @@ C:\nikhilm\excel-prophesy-BOL-automation\
 
 ## Open Questions (Must Resolve Before Go-Live)
 
-| #   | Question                                                                           | Who           | Blocks               |
-| --- | ---------------------------------------------------------------------------------- | ------------- | -------------------- |
-| 1   | FSC unit: is `fsc_amount` a % of base rate or $/cwt?                               | Katie / Tanya | Accurate cost calc   |
-| 2   | Destination → ZIP: what 3-digit SCF zone maps to ENRU, ALG, LSC, CHOICE?           | Katie         | Access Prog + Cost % |
-| 3   | Can ALG send CSV invoices instead of PDF?                                          | Phil / Tanya  | Invoice automation   |
-| 4   | Which diesel price index does SG360 use for FSC? How often does it change?         | Phil / Katie  | FSC calc             |
-| 5   | What triggers Z-number creation in Prophecy — Technique import or manual step?     | Katie / Megha | Invoice matching     |
-| 6   | Is `VisualMail.dbo.Pallet.NumberOfCopies` the right pieces column (matches Excel)? | Marge         | Pieces accuracy      |
-| 7   | Is there a BOL number in ShipperPlus linked to the manifest via `load_id`?         | Marge         | BOL auto-fill        |
-| 8   | Which ShipperPlus column holds the Prop Reship (Prophecy cost estimate)?           | Marge         | Prop Reship field    |
+| # | Question | Who | Blocks |
+|---|---|---|---|
+| 1 | FSC unit: is `fsc_amount` a % of base rate or $/cwt? | Katie / Tanya | Accurate cost calc |
+| 2 | Destination → ZIP: what 3-digit SCF zone maps to ENRU, ALG, LSC, CHOICE? | Katie | Access Prog + Cost % |
+| 3 | Can ALG send CSV invoices instead of PDF? | Phil / Tanya | Invoice automation |
+| 4 | Which diesel price index does SG360 use for FSC? How often does it change? | Phil / Katie | FSC calc |
+| 5 | What triggers Z-number creation in Prophecy — Technique import or manual step? | Katie / Megha | Invoice matching |
+| 6 | Is `VisualMail.dbo.Pallet.NumberOfCopies` the right pieces column (matches Excel)? | Marge | Pieces accuracy |
+| 7 | Is there a BOL number in ShipperPlus linked to the manifest via `load_id`? | Marge | BOL auto-fill |
+| 8 | Which ShipperPlus column holds the Prop Reship (Prophecy cost estimate)? | Marge | Prop Reship field |
 
 ---
 
