@@ -219,9 +219,9 @@ Cost %:        stored as ratio 0.9881 = 98.81% (amount / access_prog)
 **Cost %** = `amount / access_prog` (actual ALG invoice ÷ expected Access program rate).
 
 Color thresholds:
-- Green: within 5% of 100% (0.95–1.05)
-- Yellow: 5–10% off (0.90–0.95 or 1.05–1.10)
-- Red: >10% off (<0.90 or >1.10)
+- Green: within 3% of 100% (0.97–1.03)
+- Orange: 3–6% off (0.94–0.97 or 1.03–1.06)
+- Red: >6% off (<0.94 or >1.06)
 
 Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — shown with sign but no hard threshold.
 

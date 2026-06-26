@@ -2,14 +2,14 @@ import { useState, useRef, useEffect } from 'react';
 
 // ---------------------------------------------------------------------------
 // Cost % variance logic — primary metric (amount / access_prog)
-// Green: within 5% of 100% | Yellow: 5–10% off | Red: >10% off
+// Green: within 3% | Orange: 3–6% off | Red: >6% off
 // ---------------------------------------------------------------------------
 function getCostPctStyle(costPct) {
   if (costPct == null) return { color: '#9ca3af' };
   const deviation = Math.abs(costPct * 100 - 100);
-  if (deviation < 5)  return { color: '#16a34a', fontWeight: 600 };
-  if (deviation < 10) return { color: '#d97706', fontWeight: 600 };
-  return               { color: '#dc2626', fontWeight: 700 };
+  if (deviation < 3) return { color: '#16a34a', fontWeight: 600 };
+  if (deviation < 6) return { color: '#ea580c', fontWeight: 600 };
+  return              { color: '#dc2626', fontWeight: 700 };
 }
 
 function formatCostPct(costPct) {
@@ -33,15 +33,6 @@ function fmtDiff(val) {
   return n > 0 ? `+${n.toLocaleString('en-US')}` : n.toLocaleString('en-US');
 }
 
-// Diff cell color: amber if non-zero, red if >5% of technique value
-function getDiffStyle(diff, base) {
-  if (diff == null) return {};
-  const n = parseInt(diff);
-  if (n === 0) return { color: '#9ca3af' };
-  const b = base ? parseFloat(base) : 0;
-  if (b > 0 && Math.abs(n / b) > 0.05) return { background: '#fee2e2', color: '#991b1b', fontWeight: 600 };
-  return { background: '#fef3c7', color: '#92400e' };
-}
 
 const TD = {
   padding: '8px 10px',
@@ -124,13 +115,13 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
       </td>
 
       {/* Diffs — alg minus technique */}
-      <td style={{ ...TD_R, borderLeft: '1px solid #f3f4f6', ...getDiffStyle(bol.weight_diff, bol.technique_weight) }}>
+      <td style={{ ...TD_R, borderLeft: '1px solid #f3f4f6' }}>
         {fmtDiff(bol.weight_diff)}
       </td>
-      <td style={{ ...TD_R, ...getDiffStyle(bol.pallet_diff, bol.technique_pallets) }}>
+      <td style={TD_R}>
         {fmtDiff(bol.pallet_diff)}
       </td>
-      <td style={{ ...TD_R, ...getDiffStyle(bol.pcs_diff, bol.technique_pcs) }}>
+      <td style={TD_R}>
         {fmtDiff(bol.pcs_diff)}
       </td>
 
