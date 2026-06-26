@@ -11,6 +11,7 @@ Covers every UI state the dashboard must handle:
   - "cancels out" notes
   - Approved, pending, and flagged statuses
   - Type A (needs_sid_export=True) vs Type B (bol_number exists, needs_sid_export=False)
+  - Records 13–14: no_invoice=True for third-party button testing
 """
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -50,6 +51,7 @@ MOCK_BOLS = [
         "approved_by": None,
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
+        "is_third_party": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -90,6 +92,7 @@ MOCK_BOLS = [
         "approved_by": None,
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
+        "is_third_party": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -130,6 +133,7 @@ MOCK_BOLS = [
         "approved_by": "coordinator",
         "needs_sid_export": False,  # Type B — bol_number 145538 already exists
         "no_invoice": False,
+        "is_third_party": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -170,6 +174,7 @@ MOCK_BOLS = [
         "approved_by": None,
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
+        "is_third_party": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -210,6 +215,7 @@ MOCK_BOLS = [
         "approved_by": None,
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
+        "is_third_party": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -250,6 +256,7 @@ MOCK_BOLS = [
         "approved_by": None,
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
+        "is_third_party": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -290,6 +297,7 @@ MOCK_BOLS = [
         "approved_by": "coordinator",
         "needs_sid_export": False,  # Type B — bol_number 145572 already exists
         "no_invoice": False,
+        "is_third_party": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -330,6 +338,7 @@ MOCK_BOLS = [
         "approved_by": None,
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
+        "is_third_party": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -370,6 +379,7 @@ MOCK_BOLS = [
         "approved_by": "coordinator",
         "needs_sid_export": False,  # Type B — bol_number 145574 already exists
         "no_invoice": False,
+        "is_third_party": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -410,6 +420,7 @@ MOCK_BOLS = [
         "approved_by": None,
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
+        "is_third_party": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -452,6 +463,7 @@ MOCK_BOLS = [
         "approved_by": None,
         "needs_sid_export": True,   # Type A — no BOL yet; will need SID export
         "no_invoice": False,
+        "is_third_party": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -492,10 +504,96 @@ MOCK_BOLS = [
         "approved_by": None,
         "needs_sid_export": True,   # Type A — no BOL yet; will need SID export
         "no_invoice": False,
+        "is_third_party": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
         "created_at": datetime(2026, 6, 10, 7, 0, 11, tzinfo=timezone.utc),
         "updated_at": datetime(2026, 6, 10, 7, 0, 11, tzinfo=timezone.utc),
+    },
+    # Records 13–14: no_invoice=True — customer pays freight directly.
+    # Record 13: shows the "3rd Party" button in the pending table.
+    # Record 14: pre-seeded as already marked third-party (appears in ThirdPartySection on load).
+    {
+        "id": "aaaaaaaa-0013-0013-0013-000000000013",
+        "bol_number": None,
+        "technique_trip": "TEC_T_0109890",
+        "manifest": "TEC_M_0228932",
+        "technique_weight": Decimal("14210.00"),
+        "technique_pallets": 44,
+        "technique_pcs": 198600,
+        "invoice_number": None,
+        "invoice_email_sender": None,
+        "inv_job_number": None,
+        "carrier": None,
+        "alg_weight": None,
+        "alg_pallets": None,
+        "alg_pcs": None,
+        "prop_reship": None,
+        "access_prog": Decimal("1847.32"),
+        "amount": None,
+        "cost_pct": None,
+        "base_tariff": Decimal("1353.17"),
+        "fsc_pct": Decimal("0.365000"),
+        "prophecy_weight": None,
+        "weight_diff": None,
+        "prophecy_pallets": None,
+        "pallet_diff": None,
+        "prophecy_pcs": None,
+        "pcs_diff": None,
+        "notes": None,
+        "status": "pending",
+        "flag_reason": None,
+        "approved_at": None,
+        "approved_by": None,
+        "needs_sid_export": True,
+        "no_invoice": True,         # customer pays freight — 3rd Party button visible
+        "is_third_party": False,    # not yet marked; click "3rd Party" to move it
+        "match_strategy": None,
+        "sid_exported_at": None,
+        "accounting_exported_at": None,
+        "created_at": datetime(2026, 6, 10, 7, 0, 12, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 6, 10, 7, 0, 12, tzinfo=timezone.utc),
+    },
+    {
+        "id": "aaaaaaaa-0014-0014-0014-000000000014",
+        "bol_number": None,
+        "technique_trip": "TEC_T_0109891",
+        "manifest": "TEC_M_0228933",
+        "technique_weight": Decimal("9850.00"),
+        "technique_pallets": 28,
+        "technique_pcs": 124300,
+        "invoice_number": None,
+        "invoice_email_sender": None,
+        "inv_job_number": None,
+        "carrier": None,
+        "alg_weight": None,
+        "alg_pallets": None,
+        "alg_pcs": None,
+        "prop_reship": None,
+        "access_prog": Decimal("1121.45"),
+        "amount": None,
+        "cost_pct": None,
+        "base_tariff": Decimal("821.43"),
+        "fsc_pct": Decimal("0.365000"),
+        "prophecy_weight": None,
+        "weight_diff": None,
+        "prophecy_pallets": None,
+        "pallet_diff": None,
+        "prophecy_pcs": None,
+        "pcs_diff": None,
+        "notes": None,
+        "status": "pending",
+        "flag_reason": None,
+        "approved_at": None,
+        "approved_by": None,
+        "needs_sid_export": True,
+        "no_invoice": True,         # customer pays freight
+        "is_third_party": True,     # pre-seeded in ThirdPartySection for testing
+        "match_strategy": None,
+        "sid_exported_at": None,
+        "accounting_exported_at": None,
+        "created_at": datetime(2026, 6, 10, 7, 0, 13, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 6, 10, 7, 0, 13, tzinfo=timezone.utc),
     },
 ]

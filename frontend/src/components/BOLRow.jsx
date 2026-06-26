@@ -52,7 +52,7 @@ const TD = {
 
 const TD_R = { ...TD, textAlign: 'right' };
 
-export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFlagOpen, onUnflag, onNotesUpdate }) {
+export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty }) {
   const [hovered, setHovered] = useState(false);
   const [notesValue, setNotesValue] = useState(bol.notes || '');
   const [saveFlash, setSaveFlash] = useState(false);
@@ -181,9 +181,10 @@ export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFl
         </div>
       </td>
 
-      {/* Actions */}
+      {/* Actions — fixed 3-slot grid so every row has identical column width */}
       <td style={{ ...TD, textAlign: 'center' }}>
-        <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '80px 36px 36px', gap: 4, alignItems: 'center', justifyContent: 'center' }}>
+          {/* Slot 1: Approve */}
           <button
             onClick={onApprove}
             disabled={isApproving}
@@ -193,7 +194,8 @@ export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFl
               color: isApproving ? '#065f46' : '#fff',
               border: 'none',
               borderRadius: 4,
-              padding: '4px 10px',
+              padding: '4px 0',
+              width: '100%',
               fontSize: 12,
               fontWeight: 600,
               opacity: isApproving ? 0.7 : 1,
@@ -202,22 +204,8 @@ export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFl
           >
             {isApproving ? '…' : '✓ Approve'}
           </button>
-          <button
-            onClick={onFlagOpen}
-            title="Flag this record for review"
-            style={{
-              background: isFlagged ? '#fef3c7' : '#fff7ed',
-              color: '#92400e',
-              border: '1px solid #fcd34d',
-              borderRadius: 4,
-              padding: '4px 10px',
-              fontSize: 12,
-              fontWeight: 600,
-            }}
-          >
-            ⚑ Flag
-          </button>
-          {isFlagged && (
+          {/* Slot 2: Flag ↔ Unflag (swaps in place, same slot) */}
+          {isFlagged ? (
             <button
               onClick={onUnflag}
               disabled={isUnflagging}
@@ -227,15 +215,59 @@ export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFl
                 color: '#6b7280',
                 border: '1px solid #d1d5db',
                 borderRadius: 4,
-                padding: '4px 10px',
+                padding: '4px 0',
+                width: '100%',
                 fontSize: 12,
                 fontWeight: 600,
                 cursor: isUnflagging ? 'not-allowed' : 'pointer',
                 opacity: isUnflagging ? 0.6 : 1,
               }}
             >
-              {isUnflagging ? '…' : '✕ Unflag'}
+              {isUnflagging ? '…' : '✕'}
             </button>
+          ) : (
+            <button
+              onClick={onFlagOpen}
+              title="Flag this record for review"
+              style={{
+                background: '#fff7ed',
+                color: '#92400e',
+                border: '1px solid #fcd34d',
+                borderRadius: 4,
+                padding: '4px 0',
+                width: '100%',
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              ⚑
+            </button>
+          )}
+          {/* Slot 3: 3P button for eligible rows, spacer otherwise */}
+          {!bol.amount && !bol.bol_number && !bol.is_third_party ? (
+            <button
+              onClick={onMarkThirdParty}
+              disabled={isMarkingThirdParty}
+              title="Mark as third-party — customer pays freight directly"
+              style={{
+                background: '#fff7ed',
+                color: '#c2410c',
+                border: '1px solid #fed7aa',
+                borderRadius: 4,
+                padding: '4px 0',
+                width: '100%',
+                fontSize: 11,
+                fontWeight: 700,
+                cursor: isMarkingThirdParty ? 'not-allowed' : 'pointer',
+                opacity: isMarkingThirdParty ? 0.6 : 1,
+                letterSpacing: '0.02em',
+              }}
+            >
+              {isMarkingThirdParty ? '…' : '3P'}
+            </button>
+          ) : (
+            <div style={{ width: '100%' }} />
           )}
         </div>
       </td>

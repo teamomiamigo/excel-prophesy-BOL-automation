@@ -249,7 +249,24 @@ export default function ApprovedSection({
                   <tr key={bol.id} style={{ background: '#f0fdf4' }}>
                     <td style={TD}>{bol.technique_trip || '—'}</td>
                     <td style={TD}>{bol.manifest || '—'}</td>
-                    <td style={TD}>{bol.bol_number ?? <span style={{ color: '#9ca3af' }}>—</span>}</td>
+                    <td style={TD}>
+                      {bol.bol_number ?? <span style={{ color: '#9ca3af' }}>—</span>}
+                      {bol.is_third_party && (
+                        <span style={{
+                          display: 'inline-block',
+                          marginLeft: bol.bol_number ? 6 : 4,
+                          background: '#fff7ed',
+                          color: '#c2410c',
+                          border: '1px solid #fed7aa',
+                          borderRadius: 3,
+                          padding: '1px 6px',
+                          fontSize: 10,
+                          fontWeight: 700,
+                          letterSpacing: '0.04em',
+                          verticalAlign: 'middle',
+                        }}>3RD PARTY</span>
+                      )}
+                    </td>
                     <td style={TD_R}>{fmtNum(bol.technique_weight)}</td>
                     <td style={TD_R}>{fmtNum(bol.technique_pallets)}</td>
                     <td style={TD_R}>{fmtNum(bol.technique_pcs)}</td>

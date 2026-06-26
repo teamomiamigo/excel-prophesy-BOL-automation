@@ -43,8 +43,9 @@ async def lifespan(app: FastAPI):
         with engine.connect() as _conn:
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS base_tariff NUMERIC(10,2)"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS fsc_pct NUMERIC(8,6)"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_third_party BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.commit()
-        logger.info("DB column migration for base_tariff/fsc_pct complete.")
+        logger.info("DB column migration for base_tariff/fsc_pct/is_third_party complete.")
     logger.info(
         "SG360 BOL API started. Mock mode: %s | Version: %s",
         settings.USE_MOCK_DATA,
@@ -341,6 +342,71 @@ def unflag_bol(
         performed_by="coordinator",
         reason="Unflagged — returned to pending",
     ))
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.post(
+    "/api/bols/{record_id}/mark-third-party",
+    response_model=BOLSummary,
+    status_code=status.HTTP_200_OK,
+    tags=["BOLs"],
+)
+def mark_third_party(
+    record_id: str,
+    db: Session = Depends(get_db),
+):
+    """Mark a record as third-party (customer pays freight directly).
+    Only valid for records with no_invoice=True. Idempotent."""
+    if settings.USE_MOCK_DATA:
+        rec = _find_mock(record_id)
+        if rec.get("amount") is not None or rec.get("bol_number") is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Only records with no matched invoice and no BOL number can be marked as third-party.",
+            )
+        rec["is_third_party"] = True
+        rec["updated_at"] = datetime.now(timezone.utc)
+        return _record_to_summary(rec)
+
+    row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
+    if row.amount is not None or row.bol_number is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Only records with no matched invoice and no BOL number can be marked as third-party.",
+        )
+    row.is_third_party = True
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.post(
+    "/api/bols/{record_id}/unmark-third-party",
+    response_model=BOLSummary,
+    status_code=status.HTTP_200_OK,
+    tags=["BOLs"],
+)
+def unmark_third_party(
+    record_id: str,
+    db: Session = Depends(get_db),
+):
+    """Revert a third-party record back to the normal pending queue."""
+    if settings.USE_MOCK_DATA:
+        rec = _find_mock(record_id)
+        rec["is_third_party"] = False
+        rec["updated_at"] = datetime.now(timezone.utc)
+        return _record_to_summary(rec)
+
+    row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
+    row.is_third_party = False
+    row.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(row)
     return row
@@ -848,6 +914,8 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
                 "flag_reason": None,
                 "match_strategy": "invoice_only",
                 "needs_sid_export": False,
+                "no_invoice": False,
+                "is_third_party": False,
                 "approved_at": None,
                 "approved_by": None,
                 "created_at": datetime.now(timezone.utc),
@@ -1176,7 +1244,9 @@ def export_prophecy_sid(db: Session = Depends(get_db)):
     if settings.USE_MOCK_DATA:
         approved = [
             r for r in _mock_state.values()
-            if r["status"] == "approved" and r.get("needs_sid_export", True)
+            if r["status"] == "approved"
+            and r.get("needs_sid_export", True)
+            and not r.get("is_third_party", False)
         ]
         if not approved:
             raise HTTPException(
@@ -1200,6 +1270,7 @@ def export_prophecy_sid(db: Session = Depends(get_db)):
         .filter(
             BOLRecord.status == BOLStatus.APPROVED,
             BOLRecord.needs_sid_export == True,
+            BOLRecord.is_third_party == False,
         )
         .all()
     )

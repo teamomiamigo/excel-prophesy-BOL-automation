@@ -78,6 +78,8 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/bols/{id}/unapprove` | Revert an approved record back to pending |
 | POST | `/api/bols/{id}/flag` | Flag a record with a reason |
 | POST | `/api/bols/{id}/unflag` | Remove flag from a record |
+| POST | `/api/bols/{id}/mark-third-party` | Mark as third-party (customer pays direct); excludes from SID export |
+| POST | `/api/bols/{id}/unmark-third-party` | Revert third-party record back to pending queue |
 | PATCH | `/api/bols/{id}/notes` | Auto-save notes field (called by frontend with 500ms debounce) |
 | POST | `/api/admin/pull` | Pull Technique manifests from AWP-SQL-PROD (disabled in mock mode) |
 | POST | `/api/admin/poll-email` | Poll O365 IMAP for unread ALG invoice emails → extract CSVs → process (live mode only) |

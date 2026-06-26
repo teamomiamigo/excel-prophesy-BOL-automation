@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import SummaryBar from './components/SummaryBar.jsx';
 import BOLTable from './components/BOLTable.jsx';
+import ThirdPartySection from './components/ThirdPartySection.jsx';
 import ApprovedSection from './components/ApprovedSection.jsx';
 import FlagModal from './components/FlagModal.jsx';
 import LogSection from './components/LogSection.jsx';
@@ -27,16 +28,21 @@ export default function App() {
   const [uploadResults, setUploadResults] = useState(null); // { matched, unmatched, errors }
   const [unapprovingId, setUnapprovingId] = useState(null);
   const [unflaggingId, setUnflaggingId] = useState(null);
+  const [markingThirdPartyId, setMarkingThirdPartyId] = useState(null);
+  const [unmarkingThirdPartyId, setUnmarkingThirdPartyId] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'log'
   const [pullLoading, setPullLoading] = useState(false);
   const [pollFolderLoading, setPollFolderLoading] = useState(false);
   const [filterText, setFilterText] = useState('');
   const [sidExportedThisSession, setSidExportedThisSession] = useState(false);
 
+  const thirdPartyBols     = pendingBols.filter(b => b.is_third_party);
+  const visiblePendingBols = pendingBols.filter(b => !b.is_third_party);
+
   const summary = {
-    manifestOnly:  pendingBols.filter(b => b.technique_trip != null && b.amount == null).length,
-    invoiceOnly:   pendingBols.filter(b => b.technique_trip == null).length,
-    readyToReview: pendingBols.filter(b => b.technique_trip != null && b.amount != null).length,
+    manifestOnly:  visiblePendingBols.filter(b => b.technique_trip != null && b.amount == null).length,
+    invoiceOnly:   visiblePendingBols.filter(b => b.technique_trip == null).length,
+    readyToReview: visiblePendingBols.filter(b => b.technique_trip != null && b.amount != null).length,
     approvedToday: approvedBols.length,
   };
 
@@ -195,6 +201,32 @@ export default function App() {
       setError(err.message);
     } finally {
       setUnflaggingId(null);
+    }
+  }
+
+  async function handleMarkThirdParty(recordId) {
+    setMarkingThirdPartyId(recordId);
+    try {
+      const res = await fetch(`/api/bols/${recordId}/mark-third-party`, { method: 'POST' });
+      if (!res.ok) throw new Error(`Mark third-party failed (${res.status})`);
+      await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setMarkingThirdPartyId(null);
+    }
+  }
+
+  async function handleUnmarkThirdParty(recordId) {
+    setUnmarkingThirdPartyId(recordId);
+    try {
+      const res = await fetch(`/api/bols/${recordId}/unmark-third-party`, { method: 'POST' });
+      if (!res.ok) throw new Error(`Unmark third-party failed (${res.status})`);
+      await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setUnmarkingThirdPartyId(null);
     }
   }
 
@@ -390,7 +422,7 @@ export default function App() {
                 {new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}
               </span>
               <span>·</span>
-              <span>{summary.manifestOnly + summary.invoiceOnly + summary.readyToReview + summary.approvedToday} records loaded</span>
+              <span>{summary.manifestOnly + summary.invoiceOnly + summary.readyToReview + thirdPartyBols.length + summary.approvedToday} records loaded</span>
               <span>·</span>
               <span>{summary.readyToReview} ready &nbsp;·&nbsp; {summary.manifestOnly} manifest only &nbsp;·&nbsp; {summary.invoiceOnly} invoice only &nbsp;·&nbsp; {summary.approvedToday} approved</span>
               <span style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -487,16 +519,26 @@ export default function App() {
             )}
 
             <BOLTable
-              bols={pendingBols}
+              bols={visiblePendingBols}
               loading={loadingPending}
               approvingId={approvingId}
               unflaggingId={unflaggingId}
+              markingThirdPartyId={markingThirdPartyId}
               filterText={filterText}
               onFilterChange={setFilterText}
               onApprove={handleApprove}
               onFlagOpen={setFlagTarget}
               onUnflag={handleUnflag}
               onNotesUpdate={handleNotesUpdate}
+              onMarkThirdParty={handleMarkThirdParty}
+            />
+
+            <ThirdPartySection
+              bols={thirdPartyBols}
+              approvingId={approvingId}
+              unmarkingThirdPartyId={unmarkingThirdPartyId}
+              onApprove={handleApprove}
+              onUnmark={handleUnmarkThirdParty}
             />
 
             <ApprovedSection
