@@ -60,9 +60,9 @@ function TableHead() {
 }
 
 export default function BOLTable({
-  bols, loading, approvingId, unflaggingId, markingThirdPartyId,
+  bols, loading, approvingId, unflaggingId, markingThirdPartyId, ignoringId,
   filterText, onFilterChange,
-  onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty,
+  onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore,
 }) {
   const lower = (filterText || '').toLowerCase();
   const matchesBol = b => !filterText || [
@@ -86,11 +86,14 @@ export default function BOLTable({
       isApproving:         approvingId         === bol.id,
       isUnflagging:        unflaggingId        === bol.id,
       isMarkingThirdParty: markingThirdPartyId === bol.id,
+      isIgnoring:          ignoringId          === bol.id,
       onApprove:           () => onApprove(bol.id),
       onFlagOpen:          () => onFlagOpen(bol),
       onUnflag:            () => onUnflag(bol.id),
       onNotesUpdate:       notes => onNotesUpdate(bol.id, notes),
       onMarkThirdParty:    () => onMarkThirdParty(bol.id),
+      onReassignOpen:      onReassignOpen,
+      onIgnore:            onIgnore,
     };
   }
 

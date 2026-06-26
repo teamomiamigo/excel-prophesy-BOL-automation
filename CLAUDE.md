@@ -80,11 +80,15 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/bols/{id}/unflag` | Remove flag from a record |
 | POST | `/api/bols/{id}/mark-third-party` | Mark as third-party (customer pays direct); excludes from SID export |
 | POST | `/api/bols/{id}/unmark-third-party` | Revert third-party record back to pending queue |
+| POST | `/api/bols/{id}/ignore` | Mark record as ignored — stays in log, excluded from exports, reversible |
+| POST | `/api/bols/{id}/unignore` | Remove ignored flag |
+| POST | `/api/bols/{id}/reassign-invoice` | Move invoice to a different trip/BOL/manifest; body: `{ target, action: preview\|merge\|replace }` |
 | PATCH | `/api/bols/{id}/notes` | Auto-save notes field (called by frontend with 500ms debounce) |
 | POST | `/api/admin/pull` | Pull Technique manifests from AWP-SQL-PROD (disabled in mock mode) |
 | POST | `/api/admin/poll-email` | Poll O365 IMAP for unread ALG invoice emails → extract CSVs → process (live mode only) |
 | POST | `/api/admin/reset-invoices` | Dev: clear invoice fields on all records + delete invoice-only stubs |
-| POST | `/api/invoices/upload` | Upload ALG invoice CSV (Z-number format) → match + update record |
+| POST | `/api/invoices/upload` | Upload ALG invoice CSV (Z-number format) → match + update record; response includes `conflict` key if trip already had an invoice |
+| GET | `/api/invoices/{z}/file` | Serve original Z-number CSV from `INVOICE_FOLDER` (or `test_data/` in mock mode) |
 | POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` path for unprocessed CSVs → process each |
 | GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only) |
 | POST | `/api/export` | Generate accounting CSV and email to Mary + Katie |

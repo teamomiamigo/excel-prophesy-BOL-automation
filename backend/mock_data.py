@@ -52,6 +52,7 @@ MOCK_BOLS = [
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
         "is_third_party": False,
+        "is_ignored": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -93,6 +94,7 @@ MOCK_BOLS = [
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
         "is_third_party": False,
+        "is_ignored": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -134,6 +136,7 @@ MOCK_BOLS = [
         "needs_sid_export": False,  # Type B — bol_number 145538 already exists
         "no_invoice": False,
         "is_third_party": False,
+        "is_ignored": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -175,6 +178,7 @@ MOCK_BOLS = [
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
         "is_third_party": False,
+        "is_ignored": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -216,6 +220,7 @@ MOCK_BOLS = [
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
         "is_third_party": False,
+        "is_ignored": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -257,6 +262,7 @@ MOCK_BOLS = [
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
         "is_third_party": False,
+        "is_ignored": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -298,6 +304,7 @@ MOCK_BOLS = [
         "needs_sid_export": False,  # Type B — bol_number 145572 already exists
         "no_invoice": False,
         "is_third_party": False,
+        "is_ignored": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -339,6 +346,7 @@ MOCK_BOLS = [
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
         "is_third_party": False,
+        "is_ignored": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -380,6 +388,7 @@ MOCK_BOLS = [
         "needs_sid_export": False,  # Type B — bol_number 145574 already exists
         "no_invoice": False,
         "is_third_party": False,
+        "is_ignored": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -421,6 +430,7 @@ MOCK_BOLS = [
         "needs_sid_export": True,   # Type A — no BOL yet
         "no_invoice": False,
         "is_third_party": False,
+        "is_ignored": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -464,6 +474,7 @@ MOCK_BOLS = [
         "needs_sid_export": True,   # Type A — no BOL yet; will need SID export
         "no_invoice": False,
         "is_third_party": False,
+        "is_ignored": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -505,6 +516,7 @@ MOCK_BOLS = [
         "needs_sid_export": True,   # Type A — no BOL yet; will need SID export
         "no_invoice": False,
         "is_third_party": False,
+        "is_ignored": False,
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,
@@ -548,7 +560,8 @@ MOCK_BOLS = [
         "approved_by": None,
         "needs_sid_export": True,
         "no_invoice": True,         # customer pays freight — 3rd Party button visible
-        "is_third_party": False,    # not yet marked; click "3rd Party" to move it
+        "is_third_party": False,
+        "is_ignored": False,    # not yet marked; click "3rd Party" to move it
         "match_strategy": None,
         "sid_exported_at": None,
         "accounting_exported_at": None,

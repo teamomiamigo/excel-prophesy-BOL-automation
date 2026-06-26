@@ -43,7 +43,7 @@ const TD = {
 
 const TD_R = { ...TD, textAlign: 'right' };
 
-export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty }) {
+export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isIgnoring, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore }) {
   const [hovered, setHovered] = useState(false);
   const [notesValue, setNotesValue] = useState(bol.notes || '');
   const [saveFlash, setSaveFlash] = useState(false);
@@ -55,7 +55,10 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
     setNotesValue(bol.notes || '');
   }, [bol.notes]);
 
-  const rowBg = isFlagged
+  const isIgnored = bol.is_ignored;
+  const rowBg = isIgnored
+    ? '#f9fafb'
+    : isFlagged
     ? '#fffbeb'
     : hovered
     ? '#f9fafb'
@@ -74,7 +77,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
 
   return (
     <tr
-      style={{ background: rowBg, transition: 'background 0.1s' }}
+      style={{ background: rowBg, transition: 'background 0.1s', opacity: isIgnored ? 0.45 : 1 }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
@@ -126,7 +129,19 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
       </td>
 
       {/* Invoice info */}
-      <td style={{ ...TD, fontWeight: 600 }}>{bol.invoice_number || <span style={{ color: '#d1d5db' }}>—</span>}</td>
+      <td style={{ ...TD, fontWeight: 600 }}>
+        {bol.invoice_number
+          ? <button
+              onClick={() => onReassignOpen && onReassignOpen(bol.id)}
+              title="Click to reassign this invoice to a different trip"
+              style={{ background: 'none', border: 'none', padding: 0, fontWeight: 600, fontSize: 13, cursor: 'pointer', color: '#1e40af', textDecoration: 'underline dotted', textUnderlineOffset: 3 }}
+            >
+              {bol.invoice_number}
+            </button>
+          : <span style={{ color: '#d1d5db' }}>—</span>
+        }
+        {isIgnored && <span style={{ marginLeft: 6, fontSize: 10, background: '#e5e7eb', color: '#6b7280', borderRadius: 3, padding: '1px 5px', fontWeight: 700, letterSpacing: '0.04em' }}>IGNORED</span>}
+      </td>
       <td style={TD_R}
         title={bol.base_tariff != null && bol.fsc_pct != null
           ? `Base: ${fmtMoney(bol.base_tariff)} × FSC (${(parseFloat(bol.fsc_pct) * 100).toFixed(1)}%) = ${fmtMoney(bol.access_prog)}`
@@ -235,7 +250,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
               ⚑
             </button>
           )}
-          {/* Slot 3: 3P button for eligible rows, spacer otherwise */}
+          {/* Slot 3: 3P for eligible rows | Ignore link for invoice-only stubs | spacer otherwise */}
           {!bol.amount && !bol.bol_number && !bol.is_third_party ? (
             <button
               onClick={onMarkThirdParty}
@@ -257,6 +272,25 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
             >
               {isMarkingThirdParty ? '…' : '3P'}
             </button>
+          ) : bol.technique_trip == null && bol.invoice_number ? (
+            isIgnored ? (
+              <button
+                onClick={() => onIgnore && onIgnore(bol.id, false)}
+                title="Unignore — restore this record"
+                style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#6b7280', cursor: 'pointer', textDecoration: 'underline' }}
+              >
+                {isIgnoring ? '…' : 'Unignore'}
+              </button>
+            ) : (
+              <button
+                onClick={() => onIgnore && onIgnore(bol.id, true)}
+                disabled={isIgnoring}
+                title="Ignore — mark as unresolvable, exclude from exports"
+                style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#9ca3af', cursor: isIgnoring ? 'not-allowed' : 'pointer', textDecoration: 'underline' }}
+              >
+                {isIgnoring ? '…' : 'Ignore'}
+              </button>
+            )
           ) : (
             <div style={{ width: '100%' }} />
           )}
