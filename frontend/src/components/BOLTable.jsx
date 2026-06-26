@@ -38,7 +38,7 @@ function TableHead() {
         <th style={TH_STYLE}>Trip</th>
         <th style={TH_STYLE}>Manifest</th>
         <th style={TH_STYLE}>BOL</th>
-        <th style={TH_STYLE}>Job #</th>
+        <th style={TH_STYLE}>Order #</th>
         <th style={{ ...TH_STYLE, textAlign: 'right', borderLeft: '2px solid #333' }}>Wgt</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Pal</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>PCS</th>
