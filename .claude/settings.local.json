@@ -11,7 +11,11 @@
       "Bash(grep -n \"^@app\\\\.\" /c/nikhilm/excel-prophesy-BOL-automation/backend/main.py | head -40)",
       "Bash(ls -la /c/nikhilm/excel-prophesy-BOL-automation/frontend/ | grep -E \"\\\\.\\(json|config|rc\\)\" | head -20)",
       "Bash(find /c/nikhilm/excel-prophesy-BOL-automation -maxdepth 2 -type f \\\\\\( -name \"*.md\" -o -name \"*.txt\" -o -name \".*\" \\\\\\) ! -path \"*/\\\\.*\" ! -path \"*/.git/*\" ! -path \"*/node_modules/*\" | sort)",
-      "Bash(wc -l /c/nikhilm/excel-prophesy-BOL-automation/backend/main.py /c/nikhilm/excel-prophesy-BOL-automation/frontend/src/App.jsx)"
+      "Bash(wc -l /c/nikhilm/excel-prophesy-BOL-automation/backend/main.py /c/nikhilm/excel-prophesy-BOL-automation/frontend/src/App.jsx)",
+      "Read(//c/Users/nikhilm/AppData/Roaming/Claude/local-agent-mode-sessions/skills-plugin/77d0919f-4ed1-4bbe-8891-19b440d0b92c/f26cdd37-d3fd-4d12-9f0a-faadc47ca4cd/skills/docx/**)",
+      "Bash(extract-text \"C:\\\\Users\\\\nikhilm\\\\Downloads\\\\Shipping Automation Process Clarifications .docx\")",
+      "Bash(extract-text \"C:\\\\Users\\\\nikhilm\\\\Downloads\\\\Discussing BOL excel automation \\(1\\).docx\")",
+      "PowerShell(pandoc \"C:\\\\Users\\\\nikhilm\\\\Downloads\\\\Discussing BOL excel automation \\(1\\).docx\" -t markdown 2>&1)"
     ]
   }
 }
