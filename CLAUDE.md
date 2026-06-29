@@ -244,6 +244,9 @@ Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — show
 
 ```
 backend/main.py          — All routes in one file (Module 1 only; split by module when Module 2 ships)
+backend/config.py        — Pydantic BaseSettings; loads .env with typed defaults for all keys (DB, SMTP,
+                           EIA API, IMAP, USE_MOCK_DATA). Single source of truth for config — no hardcoded
+                           values elsewhere.
 backend/data_layer.py    — The integration boundary; implement get_prophecy_data + get_alg_invoice to finish live mode
 backend/mock_data.py     — 12 records at real scale; safe to delete when DB is live
 backend/email_parser.py  — O365 IMAP4_SSL polling (outlook.office365.com:993); marks emails read even
@@ -260,21 +263,23 @@ backend/test_data/       — Sample ALG invoice CSVs for testing the upload flow
 test_invoices_0622/      — 26 real Z-number CSVs from Tanya's June 22 email (e.g. Z557707.CSV).
                            Use for live-mode invoice upload testing. NOT committed — real production
                            data; add to .gitignore if not already excluded.
+documentation/           — Six .md spec files (Design & Workflow, Requirements & SQL Mapping, etc.).
+                           Reference for business rules and SQL source queries; not runtime code.
 frontend/src/App.jsx     — Owns all state + fetch/mutation handlers; passes data+callbacks down as props
 frontend/src/components/
-  SummaryBar.jsx         — Pending/approved/flagged counts strip
-  BOLTable.jsx           — Pending + flagged records table (wraps BOLRow)
-  BOLRow.jsx             — Single record row; Approve and Flag buttons
-  ApprovedSection.jsx    — Approved records table + SID export + Send to Accounting flow
-  FlagModal.jsx          — Modal overlay for entering a flag reason
-  LogSection.jsx         — Historical log viewer (separate tab)
+  SummaryBar.jsx              — Pending/approved/flagged counts strip
+  BOLTable.jsx                — Pending + flagged records table (wraps BOLRow)
+  BOLRow.jsx                  — Single record row; Approve, Flag, Third-party, Ignore buttons
+  ApprovedSection.jsx         — Approved records table + SID export + Send to Accounting flow
+  ThirdPartySection.jsx       — Third-party records (customer pays direct); excluded from SID export
+  FlagModal.jsx               — Modal overlay for entering a flag reason
+  ReassignInvoiceModal.jsx    — Modal for moving an invoice to a different trip (preview/merge/replace)
+  LogSection.jsx              — Historical log viewer (separate tab)
 ```
 
 ## Known bugs
 
 **`days_back` default is 10**, but invoices lag 11–18 days from despatch — matching fails unless `?days_back=20` is passed explicitly. The default needs to be raised in two places: `get_technique_data(days_back=10)` in `data_layer.py` and the `pull_technique_data()` route default in `main.py`. Until changed, pass `?days_back=20` on the `POST /api/admin/pull` call.
-
-**Duplicate `unapprove_bol` function in `main.py`**: The function is defined twice (identical bodies), at the same FastAPI route `POST /api/bols/{record_id}/unapprove`. Python silently replaces the first definition with the second; FastAPI registers two route entries that both resolve to the second definition. Behavior is currently correct by coincidence — remove the duplicate (lines ~253–286 are the second copy).
 
 **Mock state** (`_mock_state` in `main.py`): in-memory dict initialized from `MOCK_BOLS` at startup. Mutations (approvals, flags, invoice uploads) survive the process lifetime but reset on every backend restart. Restart the backend to reset all records to their initial pending state during development.
 

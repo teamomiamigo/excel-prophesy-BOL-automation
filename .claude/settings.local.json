@@ -5,7 +5,13 @@
       "PowerShell(\\(Get-Item \"C:\\\\nikhilm\\\\excel-prophesy-BOL-automation\\\\backend\\\\data_layer.py\"\\).LastWriteTime = Get-Date; Write-Host \"Touched — waiting for reload...\"; Start-Sleep -Seconds 4; $result = Invoke-WebRequest -Uri \"http://localhost:8000/api/admin/pull?days_back=3\" -Method POST -UseBasicParsing 2>&1; Write-Host \"Status: $\\($result.StatusCode\\)\"; $result.Content)",
       "PowerShell(Invoke-WebRequest -Uri \"http://localhost:8000/api/bols\" -UseBasicParsing | Select-Object -ExpandProperty Content | Select-Object -First 1)",
       "Bash(Get-ChildItem -Path \"C:\\\\nikhilm\\\\excel-prophesy-BOL-automation\" -Recurse -Depth 2)",
-      "Bash(Select-Object FullName)"
+      "Bash(Select-Object FullName)",
+      "Bash(Get-ChildItem -Path \"C:\\\\nikhilm\\\\excel-prophesy-BOL-automation\" -Force)",
+      "Bash(Select-Object Name, PSIsContainer)",
+      "Bash(grep -n \"^@app\\\\.\" /c/nikhilm/excel-prophesy-BOL-automation/backend/main.py | head -40)",
+      "Bash(ls -la /c/nikhilm/excel-prophesy-BOL-automation/frontend/ | grep -E \"\\\\.\\(json|config|rc\\)\" | head -20)",
+      "Bash(find /c/nikhilm/excel-prophesy-BOL-automation -maxdepth 2 -type f \\\\\\( -name \"*.md\" -o -name \"*.txt\" -o -name \".*\" \\\\\\) ! -path \"*/\\\\.*\" ! -path \"*/.git/*\" ! -path \"*/node_modules/*\" | sort)",
+      "Bash(wc -l /c/nikhilm/excel-prophesy-BOL-automation/backend/main.py /c/nikhilm/excel-prophesy-BOL-automation/frontend/src/App.jsx)"
     ]
   }
 }

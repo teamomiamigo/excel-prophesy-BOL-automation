@@ -11,10 +11,14 @@
             "id": "1109fc8b645eae6e",
             "type": "leaf",
             "state": {
-              "type": "empty",
-              "state": {},
+              "type": "markdown",
+              "state": {
+                "file": "documentation/Design and Workflow - BOL Reconciliation.md",
+                "mode": "source",
+                "source": false
+              },
               "icon": "lucide-file",
-              "title": "New tab"
+              "title": "Design and Workflow - BOL Reconciliation"
             }
           }
         ]
@@ -179,52 +183,26 @@
       "bases:Create new base": false
     }
   },
-  "floating": {
-    "id": "3fd388bc8d5fbaec",
-    "type": "floating",
-    "children": [
-      {
-        "id": "5337cf9e760bcb8f",
-        "type": "window",
-        "children": [
-          {
-            "id": "88190b1d0d571d0d",
-            "type": "tabs",
-            "children": [
-              {
-                "id": "f88f2328d0f532a5",
-                "type": "leaf",
-                "state": {
-                  "type": "empty",
-                  "state": {},
-                  "icon": "lucide-file",
-                  "title": "New tab"
-                }
-              }
-            ]
-          }
-        ],
-        "direction": "vertical",
-        "x": 2021,
-        "y": 87,
-        "width": 890,
-        "height": 905,
-        "maximize": false,
-        "zoom": 0
-      }
-    ]
-  },
-  "active": "f88f2328d0f532a5",
+  "active": "1109fc8b645eae6e",
   "lastOpenFiles": [
+    "frontend/vite.config.js.timestamp-1782744315454-d71a640acfb5a.mjs",
+    "CLAUDE.md.tmp.31668.b31167e059a5",
+    "CLAUDE.md.tmp.31668.7cb87ff76415",
+    "documentation/Design and Workflow - BOL Reconciliation.md",
+    "frontend/src/components/ReassignInvoiceModal.jsx.tmp.31668.f32ca5b58c41",
+    "frontend/src/App.jsx.tmp.31668.945acb967101",
+    "frontend/src/App.jsx.tmp.31668.0fa17e654098",
+    "frontend/src/App.jsx.tmp.31668.249511d6ec66",
+    "frontend/src/App.jsx.tmp.31668.cb64765901be",
+    "frontend/src/App.jsx.tmp.31668.23513f40e04b",
+    "frontend/src/components/BOLTable.jsx.tmp.31668.32ed554a5c7d",
+    "frontend/src/components/BOLRow.jsx.tmp.31668.c8e89350627f",
     "documentation/SG360_BOL_Project_Context.md",
-    "documentation/SG360 BOL Reconciliation — Design Walkthrough.md",
     "documentation/SECURITY.md",
     "documentation/Requirements and SQL Mapping.md",
     "documentation/Developmental Documentation.md",
-    "documentation",
     "SG360_BOL_Project_Context.md",
     "SECURITY.md",
-    "CLAUDE.md.tmp.8020.ebab0a95ea73",
     "frontend/node_modules/@esbuild/win32-x64/README.md"
   ]
 }
