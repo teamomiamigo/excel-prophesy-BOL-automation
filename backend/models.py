@@ -156,6 +156,8 @@ class BOLRecord(Base):
     #                   False = Type B (load_id > 0, BOL already exists)
     needs_sid_export: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     no_invoice: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_third_party: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_ignored: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     match_strategy: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     sid_exported_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     accounting_exported_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -248,6 +250,8 @@ class BOLSummary(BaseModel):
     approved_by: Optional[str] = None
     needs_sid_export: bool = True
     no_invoice: bool = False
+    is_third_party: bool = False
+    is_ignored: bool = False
     match_strategy: Optional[str] = None
     sid_exported_at: Optional[datetime] = None
     accounting_exported_at: Optional[datetime] = None

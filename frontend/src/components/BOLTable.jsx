@@ -38,7 +38,7 @@ function TableHead() {
         <th style={TH_STYLE}>Trip</th>
         <th style={TH_STYLE}>Manifest</th>
         <th style={TH_STYLE}>BOL</th>
-        <th style={TH_STYLE}>Job #</th>
+        <th style={TH_STYLE}>Order #</th>
         <th style={{ ...TH_STYLE, textAlign: 'right', borderLeft: '2px solid #333' }}>Wgt</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Pal</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>PCS</th>
@@ -60,9 +60,9 @@ function TableHead() {
 }
 
 export default function BOLTable({
-  bols, loading, approvingId, unflaggingId,
+  bols, loading, approvingId, unflaggingId, markingThirdPartyId, ignoringId,
   filterText, onFilterChange,
-  onApprove, onFlagOpen, onUnflag, onNotesUpdate,
+  onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore,
 }) {
   const lower = (filterText || '').toLowerCase();
   const matchesBol = b => !filterText || [
@@ -83,12 +83,17 @@ export default function BOLTable({
     return {
       key: bol.id,
       bol,
-      isApproving:  approvingId  === bol.id,
-      isUnflagging: unflaggingId === bol.id,
-      onApprove:    () => onApprove(bol.id),
-      onFlagOpen:   () => onFlagOpen(bol),
-      onUnflag:     () => onUnflag(bol.id),
-      onNotesUpdate: notes => onNotesUpdate(bol.id, notes),
+      isApproving:         approvingId         === bol.id,
+      isUnflagging:        unflaggingId        === bol.id,
+      isMarkingThirdParty: markingThirdPartyId === bol.id,
+      isIgnoring:          ignoringId          === bol.id,
+      onApprove:           () => onApprove(bol.id),
+      onFlagOpen:          () => onFlagOpen(bol),
+      onUnflag:            () => onUnflag(bol.id),
+      onNotesUpdate:       notes => onNotesUpdate(bol.id, notes),
+      onMarkThirdParty:    () => onMarkThirdParty(bol.id),
+      onReassignOpen:      onReassignOpen,
+      onIgnore:            onIgnore,
     };
   }
 

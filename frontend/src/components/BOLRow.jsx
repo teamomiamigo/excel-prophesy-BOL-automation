@@ -2,14 +2,14 @@ import { useState, useRef, useEffect } from 'react';
 
 // ---------------------------------------------------------------------------
 // Cost % variance logic — primary metric (amount / access_prog)
-// Green: within 5% of 100% | Yellow: 5–10% off | Red: >10% off
+// Green: within 3% | Orange: 3–6% off | Red: >6% off
 // ---------------------------------------------------------------------------
 function getCostPctStyle(costPct) {
   if (costPct == null) return { color: '#9ca3af' };
   const deviation = Math.abs(costPct * 100 - 100);
-  if (deviation < 5)  return { color: '#16a34a', fontWeight: 600 };
-  if (deviation < 10) return { color: '#d97706', fontWeight: 600 };
-  return               { color: '#dc2626', fontWeight: 700 };
+  if (deviation < 3) return { color: '#16a34a', fontWeight: 600 };
+  if (deviation < 6) return { color: '#ea580c', fontWeight: 600 };
+  return              { color: '#dc2626', fontWeight: 700 };
 }
 
 function formatCostPct(costPct) {
@@ -33,15 +33,6 @@ function fmtDiff(val) {
   return n > 0 ? `+${n.toLocaleString('en-US')}` : n.toLocaleString('en-US');
 }
 
-// Diff cell color: amber if non-zero, red if >5% of technique value
-function getDiffStyle(diff, base) {
-  if (diff == null) return {};
-  const n = parseInt(diff);
-  if (n === 0) return { color: '#9ca3af' };
-  const b = base ? parseFloat(base) : 0;
-  if (b > 0 && Math.abs(n / b) > 0.05) return { background: '#fee2e2', color: '#991b1b', fontWeight: 600 };
-  return { background: '#fef3c7', color: '#92400e' };
-}
 
 const TD = {
   padding: '8px 10px',
@@ -52,7 +43,7 @@ const TD = {
 
 const TD_R = { ...TD, textAlign: 'right' };
 
-export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFlagOpen, onUnflag, onNotesUpdate }) {
+export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isIgnoring, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore }) {
   const [hovered, setHovered] = useState(false);
   const [notesValue, setNotesValue] = useState(bol.notes || '');
   const [saveFlash, setSaveFlash] = useState(false);
@@ -64,7 +55,10 @@ export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFl
     setNotesValue(bol.notes || '');
   }, [bol.notes]);
 
-  const rowBg = isFlagged
+  const isIgnored = bol.is_ignored;
+  const rowBg = isIgnored
+    ? '#f9fafb'
+    : isFlagged
     ? '#fffbeb'
     : hovered
     ? '#f9fafb'
@@ -83,7 +77,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFl
 
   return (
     <tr
-      style={{ background: rowBg, transition: 'background 0.1s' }}
+      style={{ background: rowBg, transition: 'background 0.1s', opacity: isIgnored ? 0.45 : 1 }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
@@ -124,18 +118,30 @@ export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFl
       </td>
 
       {/* Diffs — alg minus technique */}
-      <td style={{ ...TD_R, borderLeft: '1px solid #f3f4f6', ...getDiffStyle(bol.weight_diff, bol.technique_weight) }}>
+      <td style={{ ...TD_R, borderLeft: '1px solid #f3f4f6' }}>
         {fmtDiff(bol.weight_diff)}
       </td>
-      <td style={{ ...TD_R, ...getDiffStyle(bol.pallet_diff, bol.technique_pallets) }}>
+      <td style={TD_R}>
         {fmtDiff(bol.pallet_diff)}
       </td>
-      <td style={{ ...TD_R, ...getDiffStyle(bol.pcs_diff, bol.technique_pcs) }}>
+      <td style={TD_R}>
         {fmtDiff(bol.pcs_diff)}
       </td>
 
       {/* Invoice info */}
-      <td style={{ ...TD, fontWeight: 600 }}>{bol.invoice_number || <span style={{ color: '#d1d5db' }}>—</span>}</td>
+      <td style={{ ...TD, fontWeight: 600 }}>
+        {bol.invoice_number
+          ? <button
+              onClick={() => onReassignOpen && onReassignOpen(bol.id)}
+              title="Click to reassign this invoice to a different trip"
+              style={{ background: 'none', border: 'none', padding: 0, fontWeight: 600, fontSize: 13, cursor: 'pointer', color: '#1e40af', textDecoration: 'underline dotted', textUnderlineOffset: 3 }}
+            >
+              {bol.invoice_number}
+            </button>
+          : <span style={{ color: '#d1d5db' }}>—</span>
+        }
+        {isIgnored && <span style={{ marginLeft: 6, fontSize: 10, background: '#e5e7eb', color: '#6b7280', borderRadius: 3, padding: '1px 5px', fontWeight: 700, letterSpacing: '0.04em' }}>IGNORED</span>}
+      </td>
       <td style={TD_R}
         title={bol.base_tariff != null && bol.fsc_pct != null
           ? `Base: ${fmtMoney(bol.base_tariff)} × FSC (${(parseFloat(bol.fsc_pct) * 100).toFixed(1)}%) = ${fmtMoney(bol.access_prog)}`
@@ -181,9 +187,10 @@ export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFl
         </div>
       </td>
 
-      {/* Actions */}
+      {/* Actions — fixed 3-slot grid so every row has identical column width */}
       <td style={{ ...TD, textAlign: 'center' }}>
-        <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '80px 36px 36px', gap: 4, alignItems: 'center', justifyContent: 'center' }}>
+          {/* Slot 1: Approve */}
           <button
             onClick={onApprove}
             disabled={isApproving}
@@ -193,7 +200,8 @@ export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFl
               color: isApproving ? '#065f46' : '#fff',
               border: 'none',
               borderRadius: 4,
-              padding: '4px 10px',
+              padding: '4px 0',
+              width: '100%',
               fontSize: 12,
               fontWeight: 600,
               opacity: isApproving ? 0.7 : 1,
@@ -202,22 +210,8 @@ export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFl
           >
             {isApproving ? '…' : '✓ Approve'}
           </button>
-          <button
-            onClick={onFlagOpen}
-            title="Flag this record for review"
-            style={{
-              background: isFlagged ? '#fef3c7' : '#fff7ed',
-              color: '#92400e',
-              border: '1px solid #fcd34d',
-              borderRadius: 4,
-              padding: '4px 10px',
-              fontSize: 12,
-              fontWeight: 600,
-            }}
-          >
-            ⚑ Flag
-          </button>
-          {isFlagged && (
+          {/* Slot 2: Flag ↔ Unflag (swaps in place, same slot) */}
+          {isFlagged ? (
             <button
               onClick={onUnflag}
               disabled={isUnflagging}
@@ -227,15 +221,78 @@ export default function BOLRow({ bol, isApproving, isUnflagging, onApprove, onFl
                 color: '#6b7280',
                 border: '1px solid #d1d5db',
                 borderRadius: 4,
-                padding: '4px 10px',
+                padding: '4px 0',
+                width: '100%',
                 fontSize: 12,
                 fontWeight: 600,
                 cursor: isUnflagging ? 'not-allowed' : 'pointer',
                 opacity: isUnflagging ? 0.6 : 1,
               }}
             >
-              {isUnflagging ? '…' : '✕ Unflag'}
+              {isUnflagging ? '…' : '✕'}
             </button>
+          ) : (
+            <button
+              onClick={onFlagOpen}
+              title="Flag this record for review"
+              style={{
+                background: '#fff7ed',
+                color: '#92400e',
+                border: '1px solid #fcd34d',
+                borderRadius: 4,
+                padding: '4px 0',
+                width: '100%',
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              ⚑
+            </button>
+          )}
+          {/* Slot 3: 3P for eligible rows | Ignore link for invoice-only stubs | spacer otherwise */}
+          {!bol.amount && !bol.bol_number && !bol.is_third_party ? (
+            <button
+              onClick={onMarkThirdParty}
+              disabled={isMarkingThirdParty}
+              title="Mark as third-party — customer pays freight directly"
+              style={{
+                background: '#fff7ed',
+                color: '#c2410c',
+                border: '1px solid #fed7aa',
+                borderRadius: 4,
+                padding: '4px 0',
+                width: '100%',
+                fontSize: 11,
+                fontWeight: 700,
+                cursor: isMarkingThirdParty ? 'not-allowed' : 'pointer',
+                opacity: isMarkingThirdParty ? 0.6 : 1,
+                letterSpacing: '0.02em',
+              }}
+            >
+              {isMarkingThirdParty ? '…' : '3P'}
+            </button>
+          ) : bol.technique_trip == null && bol.invoice_number ? (
+            isIgnored ? (
+              <button
+                onClick={() => onIgnore && onIgnore(bol.id, false)}
+                title="Unignore — restore this record"
+                style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#6b7280', cursor: 'pointer', textDecoration: 'underline' }}
+              >
+                {isIgnoring ? '…' : 'Unignore'}
+              </button>
+            ) : (
+              <button
+                onClick={() => onIgnore && onIgnore(bol.id, true)}
+                disabled={isIgnoring}
+                title="Ignore — mark as unresolvable, exclude from exports"
+                style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#9ca3af', cursor: isIgnoring ? 'not-allowed' : 'pointer', textDecoration: 'underline' }}
+              >
+                {isIgnoring ? '…' : 'Ignore'}
+              </button>
+            )
+          ) : (
+            <div style={{ width: '100%' }} />
           )}
         </div>
       </td>

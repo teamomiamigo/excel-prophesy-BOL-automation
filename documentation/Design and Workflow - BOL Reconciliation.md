@@ -1,5 +1,5 @@
 
-*updated  june 25 2026*
+*updated june 26 2026*
 *created june 24 2026*
 
 ---
@@ -10,7 +10,7 @@ Every morning, Katie manually copies data from three systems into an Excel sprea
 ---
 #### **New Daily Workflow**
 **Step 1 — Load Manifests**
-clicks **Pull Manifests**. The system:
+click **Pull Manifests**. The system:
 - Queries Manifests and their relevant data from the past N days
 - Pulls weight, pallets, and pieces from VisualMail
 - Stores everything in the local database (as of now)
@@ -26,23 +26,22 @@ Katie clicks **Pull Invoices** (or uploads a CSV manually). The system:
 **Step 3 — Reviewing**
 Katie opens the dashboard. For each record she sees:
 
-| Field                          | Source               | Purpose                                    |
-| ------------------------------ | -------------------- | ------------------------------------------ |
-| Trip / Manifest                | Technique (SQL)      | Identifies the shipment                    |
-| BOL Number                     | Prophecy / auto-fill | Needed for accounting export               |
-| Job Number                     | ALG Invoice          | Verification: should match manifest suffix |
-| Tech Wgt / Pal / PCS           | VisualMail           | What SG360 shipped                         |
-| ALG Wgt / Pal / PCS            | ALG Invoice          | What ALG recorded                          |
-| Wgt Diff / Pal Diff / PCS Diff | Calculated           | Discrepancy flags                          |
-| Calculated Cost                | Tariff + FSC         | What SG360 expected to pay                 |
-| Invoice Amount                 | ALG Invoice          | What ALG actually charged                  |
-| **Cost %**                     | Calculated           | **The key metric**                         |
+| Field                          | Source                           | Purpose                                    |
+| ------------------------------ | -------------------------------- | ------------------------------------------ |
+| Trip / Manifest                | Technique (SQL) (from VM though) | Identifies the shipment                    |
+| BOL Number                     | Prophecy / auto-fill             | Needed for accounting export               |
+| Order Number                   | ALG Invoice                      | Verification: should match manifest suffix |
+| Tech Wgt / Pal / PCS           | VisualMail                       | What SG360 shipped                         |
+| ALG Wgt / Pal / PCS            | ALG Invoice                      | What ALG recorded                          |
+| Wgt Diff / Pal Diff / PCS Diff | Calculated                       | Discrepancy flags                          |
+| Calculated Cost                | Tariff + FSC                     | What SG360 expected to pay                 |
+| Invoice Amount                 | ALG Invoice                      | What ALG actually charged                  |
+| **Cost %**                     | Calculated                       | **The key metric**                         |
 
 Cost % color thresholds:
-- 🟢 Green (95–105%) — looks right, approve
-- 🟡 Yellow (90–95% or 105–110%) — worth checking
-- 🔴 Red (<90% or >110%) — flag for investigation
-this will be changed to 3%, I had just set it as this for earlier
+- 🟢 Green (97–103%) — looks right, approve
+- 🟡 Yellow (94%-97% or 103–106%) — worth checking
+- 🔴 Red (<94% or >106%) — flag for investigation
 Katie either **Approves** or **Flags** each record. Flagged records stay visible until resolved.
 
 **Step 4 — Export**

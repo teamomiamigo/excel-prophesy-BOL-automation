@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
 import SummaryBar from './components/SummaryBar.jsx';
 import BOLTable from './components/BOLTable.jsx';
+import ThirdPartySection from './components/ThirdPartySection.jsx';
 import ApprovedSection from './components/ApprovedSection.jsx';
 import FlagModal from './components/FlagModal.jsx';
+import ReassignInvoiceModal from './components/ReassignInvoiceModal.jsx';
 import LogSection from './components/LogSection.jsx';
 
 // When Module 2 ships: extract fetch helpers to src/api/bolsApi.js
@@ -27,16 +29,24 @@ export default function App() {
   const [uploadResults, setUploadResults] = useState(null); // { matched, unmatched, errors }
   const [unapprovingId, setUnapprovingId] = useState(null);
   const [unflaggingId, setUnflaggingId] = useState(null);
+  const [markingThirdPartyId, setMarkingThirdPartyId] = useState(null);
+  const [unmarkingThirdPartyId, setUnmarkingThirdPartyId] = useState(null);
+  const [reassignTargetId, setReassignTargetId] = useState(null);
+  const [reassignSubmitting, setReassignSubmitting] = useState(false);
+  const [ignoringId, setIgnoringId] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'log'
   const [pullLoading, setPullLoading] = useState(false);
   const [pollFolderLoading, setPollFolderLoading] = useState(false);
   const [filterText, setFilterText] = useState('');
   const [sidExportedThisSession, setSidExportedThisSession] = useState(false);
 
+  const thirdPartyBols     = pendingBols.filter(b => b.is_third_party);
+  const visiblePendingBols = pendingBols.filter(b => !b.is_third_party);
+
   const summary = {
-    manifestOnly:  pendingBols.filter(b => b.technique_trip != null && b.amount == null).length,
-    invoiceOnly:   pendingBols.filter(b => b.technique_trip == null).length,
-    readyToReview: pendingBols.filter(b => b.technique_trip != null && b.amount != null).length,
+    manifestOnly:  visiblePendingBols.filter(b => b.technique_trip != null && b.amount == null).length,
+    invoiceOnly:   visiblePendingBols.filter(b => b.technique_trip == null).length,
+    readyToReview: visiblePendingBols.filter(b => b.technique_trip != null && b.amount != null).length,
     approvedToday: approvedBols.length,
   };
 
@@ -160,7 +170,7 @@ export default function App() {
     e.target.value = '';
     setInvoiceUploading(true);
     setUploadResults(null);
-    const matched = [], unmatched = [], errors = [];
+    const matched = [], unmatched = [], errors = [], conflicts = [];
     for (let i = 0; i < files.length; i++) {
       setUploadProgress(`${i + 1} of ${files.length}`);
       const form = new FormData();
@@ -172,6 +182,7 @@ export default function App() {
           errors.push({ name: files[i].name, msg: data.detail || `HTTP ${res.status}` });
         } else if (data.matched) {
           matched.push({ name: files[i].name, invoice: data.invoice_number, trip: data.matched_trip, strategy: data.match_strategy });
+          if (data.conflict) conflicts.push(data.conflict);
         } else {
           unmatched.push({ name: files[i].name, invoice: data.invoice_number, jobName: data.job_name, note: data.message });
         }
@@ -181,7 +192,7 @@ export default function App() {
     }
     setInvoiceUploading(false);
     setUploadProgress(null);
-    setUploadResults({ matched, unmatched, errors });
+    setUploadResults({ matched, unmatched, errors, conflicts });
     await Promise.all([fetchPending(), fetchApproved()]);
   }
 
@@ -195,6 +206,32 @@ export default function App() {
       setError(err.message);
     } finally {
       setUnflaggingId(null);
+    }
+  }
+
+  async function handleMarkThirdParty(recordId) {
+    setMarkingThirdPartyId(recordId);
+    try {
+      const res = await fetch(`/api/bols/${recordId}/mark-third-party`, { method: 'POST' });
+      if (!res.ok) throw new Error(`Mark third-party failed (${res.status})`);
+      await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setMarkingThirdPartyId(null);
+    }
+  }
+
+  async function handleUnmarkThirdParty(recordId) {
+    setUnmarkingThirdPartyId(recordId);
+    try {
+      const res = await fetch(`/api/bols/${recordId}/unmark-third-party`, { method: 'POST' });
+      if (!res.ok) throw new Error(`Unmark third-party failed (${res.status})`);
+      await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setUnmarkingThirdPartyId(null);
     }
   }
 
@@ -259,6 +296,42 @@ export default function App() {
       setError(err.message);
     } finally {
       setSendLoading(false);
+    }
+  }
+
+  async function handleReassignInvoice(recordId, target, action) {
+    setReassignSubmitting(true);
+    try {
+      const res = await fetch(`/api/bols/${recordId}/reassign-invoice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target, action }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `Reassign failed (${res.status})`);
+      }
+      setReassignTargetId(null);
+      await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setReassignSubmitting(false);
+    }
+  }
+
+  async function handleIgnore(recordId, shouldIgnore) {
+    setIgnoringId(recordId);
+    try {
+      const route = shouldIgnore ? 'ignore' : 'unignore';
+      const res = await fetch(`/api/bols/${recordId}/${route}`, { method: 'POST' });
+      if (!res.ok) throw new Error(`${route} failed (${res.status})`);
+      setReassignTargetId(null);
+      await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setIgnoringId(null);
     }
   }
 
@@ -390,7 +463,7 @@ export default function App() {
                 {new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}
               </span>
               <span>·</span>
-              <span>{summary.manifestOnly + summary.invoiceOnly + summary.readyToReview + summary.approvedToday} records loaded</span>
+              <span>{summary.manifestOnly + summary.invoiceOnly + summary.readyToReview + thirdPartyBols.length + summary.approvedToday} records loaded</span>
               <span>·</span>
               <span>{summary.readyToReview} ready &nbsp;·&nbsp; {summary.manifestOnly} manifest only &nbsp;·&nbsp; {summary.invoiceOnly} invoice only &nbsp;·&nbsp; {summary.approvedToday} approved</span>
               <span style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -483,20 +556,52 @@ export default function App() {
                     <span style={{ marginLeft: 'auto', color: '#991b1b' }}>{r.msg}</span>
                   </div>
                 ))}
+                {(uploadResults.conflicts || []).length > 0 && (
+                  <div style={{ background: '#fffbeb', borderTop: '2px solid #fcd34d', padding: '8px 12px' }}>
+                    <div style={{ fontWeight: 700, color: '#92400e', marginBottom: 6, fontSize: 12 }}>
+                      ⚠ {uploadResults.conflicts.length} invoice conflict{uploadResults.conflicts.length > 1 ? 's' : ''} — auto-merged, review recommended
+                    </div>
+                    {uploadResults.conflicts.map((c, i) => (
+                      <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 12, color: '#374151', marginBottom: 4 }}>
+                        <span style={{ fontWeight: 600, color: '#92400e' }}>{c.invoice_number}</span>
+                        <span>auto-merged with {c.matched_trip} (already had {c.existing_invoice})</span>
+                        <button
+                          onClick={() => setReassignTargetId(c.record_id)}
+                          style={{ marginLeft: 'auto', background: '#fff7ed', border: '1px solid #fed7aa', borderRadius: 4, padding: '2px 8px', fontSize: 11, fontWeight: 600, color: '#c2410c', cursor: 'pointer' }}
+                        >
+                          Reassign
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 
             <BOLTable
-              bols={pendingBols}
+              bols={visiblePendingBols}
               loading={loadingPending}
               approvingId={approvingId}
               unflaggingId={unflaggingId}
+              markingThirdPartyId={markingThirdPartyId}
+              ignoringId={ignoringId}
               filterText={filterText}
               onFilterChange={setFilterText}
               onApprove={handleApprove}
               onFlagOpen={setFlagTarget}
               onUnflag={handleUnflag}
               onNotesUpdate={handleNotesUpdate}
+              onMarkThirdParty={handleMarkThirdParty}
+              onReassignOpen={id => setReassignTargetId(id)}
+              onIgnore={handleIgnore}
+            />
+
+            <ThirdPartySection
+              bols={thirdPartyBols}
+              approvingId={approvingId}
+              unmarkingThirdPartyId={unmarkingThirdPartyId}
+              onApprove={handleApprove}
+              onUnmark={handleUnmarkThirdParty}
             />
 
             <ApprovedSection
@@ -522,6 +627,16 @@ export default function App() {
           submitting={flagSubmitting}
           onClose={() => setFlagTarget(null)}
           onSubmit={handleFlagSubmit}
+        />
+      )}
+
+      {reassignTargetId && (
+        <ReassignInvoiceModal
+          bol={pendingBols.find(b => b.id === reassignTargetId) || null}
+          submitting={reassignSubmitting}
+          onClose={() => setReassignTargetId(null)}
+          onReassign={handleReassignInvoice}
+          onIgnore={handleIgnore}
         />
       )}
     </div>
