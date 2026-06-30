@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import EmailComposeModal from './EmailComposeModal.jsx';
 
 const TH = {
   padding: '7px 10px',
@@ -36,174 +37,111 @@ function fmtCostPct(costPct) {
   return `${(costPct * 100).toFixed(2)}%`;
 }
 
+function groupByBatch(records) {
+  const groups = {};
+  for (const r of records) {
+    const key = r.invoice_email_sender || '__unassigned__';
+    if (!groups[key]) {
+      groups[key] = {
+        label: r.invoice_email_sender || 'No Sender',
+        sentAt: r.invoice_sent_at || null,
+        records: [],
+      };
+    }
+    // Track the most recent sentAt for this group
+    if (r.invoice_sent_at && (!groups[key].sentAt || r.invoice_sent_at > groups[key].sentAt)) {
+      groups[key].sentAt = r.invoice_sent_at;
+    }
+    groups[key].records.push(r);
+  }
+  // Sort: most recent sentAt first, null sentAt last
+  return Object.values(groups).sort((a, b) => {
+    if (!a.sentAt && !b.sentAt) return 0;
+    if (!a.sentAt) return 1;
+    if (!b.sentAt) return -1;
+    return b.sentAt.localeCompare(a.sentAt);
+  });
+}
+
 export default function ApprovedSection({
   approvedBols,
   loading,
-  sendLoading,
   sidLoading,
   sidExportedThisSession,
   unapprovingId,
   onUnapprove,
-  onConfirmSend,
   onExportProphecy,
+  onRefetchBols,
+  onMarkSent,
 }) {
-  const [showModal, setShowModal] = useState(false);
+  const [collapsedGroups, setCollapsedGroups] = useState(new Set());
+  const [composeModalGroup, setComposeModalGroup] = useState(null);
+  const [refetchingKey, setRefetchingKey] = useState(null);
+  const [refetchError, setRefetchError] = useState(null);
 
-  const sidCount  = approvedBols.filter(b => b.needs_sid_export).length;
-  const bCount    = approvedBols.length - sidCount;
-  const canSend   = sidCount === 0 || sidExportedThisSession;
+  const sidCount = approvedBols.filter(b => b.needs_sid_export).length;
+  const batches = groupByBatch(approvedBols);
+
+  function toggleGroup(key) {
+    setCollapsedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  async function handleRefetchBols(batch) {
+    const manifests = batch.records
+      .filter(r => r.manifest && !r.bol_number)
+      .map(r => r.manifest);
+    if (!manifests.length) return;
+    setRefetchingKey(batch.label);
+    setRefetchError(null);
+    try {
+      await onRefetchBols(manifests);
+    } catch (err) {
+      setRefetchError(err.message);
+    } finally {
+      setRefetchingKey(null);
+    }
+  }
 
   return (
     <section>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-        <h2 style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>
-          Approved Today ({approvedBols.length})
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+        <h2 style={{ fontSize: 14, fontWeight: 600, color: '#374151', margin: 0 }}>
+          Approved ({approvedBols.length})
         </h2>
-
-        {approvedBols.length > 0 && (
+        {sidCount > 0 && (
           <button
-            onClick={() => setShowModal(true)}
-            disabled={sendLoading}
+            onClick={onExportProphecy}
+            disabled={sidLoading || sidExportedThisSession}
             style={{
-              background: '#2D6A4F',
-              color: '#fff',
-              border: 'none',
+              background: sidExportedThisSession ? '#f0fdf4' : '#fffbeb',
+              color: sidExportedThisSession ? '#166534' : '#92400e',
+              border: `1px solid ${sidExportedThisSession ? '#bbf7d0' : '#fcd34d'}`,
               borderRadius: 6,
-              padding: '8px 18px',
+              padding: '6px 14px',
               fontWeight: 600,
-              fontSize: 13,
-              opacity: sendLoading ? 0.6 : 1,
-              cursor: sendLoading ? 'not-allowed' : 'pointer',
+              fontSize: 12,
+              cursor: (sidLoading || sidExportedThisSession) ? 'not-allowed' : 'pointer',
+              opacity: sidLoading ? 0.6 : 1,
             }}
           >
-            {sendLoading ? 'Sending…' : 'Finalize & Export'}
+            {sidExportedThisSession ? '✓ SID Exported' : sidLoading ? 'Generating…' : `Export to Prophecy (${sidCount})`}
           </button>
         )}
       </div>
 
-      {/* Finalize & Export modal */}
-      {showModal && (
-        <div
-          onClick={() => setShowModal(false)}
-          style={{
-            position: 'fixed', inset: 0,
-            background: 'rgba(0,0,0,0.45)',
-            zIndex: 1000,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-          }}
-        >
-          <div
-            onClick={e => e.stopPropagation()}
-            style={{
-              background: '#fff',
-              borderRadius: 10,
-              padding: '28px 32px',
-              width: 480,
-              maxWidth: '95vw',
-              boxShadow: '0 20px 40px rgba(0,0,0,0.18)',
-            }}
-          >
-            <h3 style={{ fontSize: 16, fontWeight: 700, color: '#111827', marginBottom: 20 }}>
-              Finalize & Export — {approvedBols.length} approved record{approvedBols.length !== 1 ? 's' : ''}
-            </h3>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 24 }}>
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 10,
-                padding: '10px 14px',
-                background: '#f0fdf4',
-                border: '1px solid #bbf7d0',
-                borderRadius: 6,
-                fontSize: 13,
-                color: '#166534',
-              }}>
-                <span style={{ fontWeight: 700, fontSize: 16 }}>✓</span>
-                <span><strong>{bCount}</strong> record{bCount !== 1 ? 's' : ''} have BOL numbers — ready for accounting</span>
-              </div>
-
-              {sidCount > 0 && (
-                <div style={{
-                  display: 'flex', alignItems: 'center', gap: 10,
-                  padding: '10px 14px',
-                  background: sidExportedThisSession ? '#f0fdf4' : '#fffbeb',
-                  border: `1px solid ${sidExportedThisSession ? '#bbf7d0' : '#fcd34d'}`,
-                  borderRadius: 6,
-                  fontSize: 13,
-                  color: sidExportedThisSession ? '#166534' : '#92400e',
-                }}>
-                  <span style={{ fontWeight: 700, fontSize: 16 }}>{sidExportedThisSession ? '✓' : '⚠'}</span>
-                  <span>
-                    <strong>{sidCount}</strong> record{sidCount !== 1 ? 's' : ''} need SID export first (no BOL number yet)
-                    {sidExportedThisSession ? ' — SID exported' : ''}
-                  </span>
-                </div>
-              )}
-            </div>
-
-            {sidCount > 0 && !sidExportedThisSession && (
-              <div style={{ marginBottom: 16 }}>
-                <button
-                  onClick={onExportProphecy}
-                  disabled={sidLoading}
-                  style={{
-                    display: 'block',
-                    width: '100%',
-                    background: sidLoading ? '#e5e7eb' : '#f9fafb',
-                    color: sidLoading ? '#9ca3af' : '#374151',
-                    border: '1px solid #d1d5db',
-                    borderRadius: 6,
-                    padding: '10px 0',
-                    fontWeight: 600,
-                    fontSize: 13,
-                    cursor: sidLoading ? 'not-allowed' : 'pointer',
-                    textAlign: 'center',
-                  }}
-                >
-                  {sidLoading ? 'Generating…' : `Export to Prophecy (${sidCount})`}
-                </button>
-                <p style={{ fontSize: 12, color: '#6b7280', marginTop: 6, textAlign: 'center' }}>
-                  Complete SID export before sending to accounting.
-                </p>
-              </div>
-            )}
-
-            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
-              <button
-                onClick={() => setShowModal(false)}
-                style={{
-                  background: '#fff',
-                  color: '#6b7280',
-                  border: '1px solid #d1d5db',
-                  borderRadius: 5,
-                  padding: '8px 18px',
-                  fontSize: 13,
-                  cursor: 'pointer',
-                }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => { setShowModal(false); onConfirmSend(); }}
-                disabled={!canSend || sendLoading}
-                title={!canSend ? 'Export SID to Prophecy first' : undefined}
-                style={{
-                  background: canSend ? '#2D6A4F' : '#9ca3af',
-                  color: '#fff',
-                  border: 'none',
-                  borderRadius: 5,
-                  padding: '8px 18px',
-                  fontWeight: 600,
-                  fontSize: 13,
-                  cursor: canSend ? 'pointer' : 'not-allowed',
-                  opacity: sendLoading ? 0.7 : 1,
-                }}
-              >
-                Send to Accounting ({approvedBols.length})
-              </button>
-            </div>
-          </div>
+      {refetchError && (
+        <div style={{
+          background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 5,
+          padding: '8px 12px', marginBottom: 10, fontSize: 12, color: '#991b1b',
+          display: 'flex', justifyContent: 'space-between',
+        }}>
+          <span>Re-fetch failed: {refetchError}</span>
+          <button onClick={() => setRefetchError(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#991b1b' }}>×</button>
         </div>
       )}
 
@@ -211,107 +149,173 @@ export default function ApprovedSection({
         <div style={{ padding: 24, textAlign: 'center', color: '#9ca3af' }}>Loading…</div>
       ) : approvedBols.length === 0 ? (
         <div style={{
-          padding: 20,
-          textAlign: 'center',
-          color: '#9ca3af',
-          background: '#fff',
-          borderRadius: 8,
-          border: '1px solid #e5e7eb',
-          fontSize: 13,
+          padding: 20, textAlign: 'center', color: '#9ca3af',
+          background: '#fff', borderRadius: 8, border: '1px solid #e5e7eb', fontSize: 13,
         }}>
-          No approved records yet today.
+          No approved records pending accounting.
         </div>
       ) : (
-        <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
-            <thead>
-              <tr>
-                <th style={TH}>Trip</th>
-                <th style={TH}>Manifest</th>
-                <th style={TH}>BOL</th>
-                <th style={{ ...TH, textAlign: 'right' }}>Wgt</th>
-                <th style={{ ...TH, textAlign: 'right' }}>Pallets</th>
-                <th style={{ ...TH, textAlign: 'right' }}>PCS</th>
-                <th style={TH}>Invoice Sender</th>
-                <th style={TH}>Invoice #</th>
-                <th style={{ ...TH, textAlign: 'right' }}>Calc Cost</th>
-                <th style={{ ...TH, textAlign: 'right' }}>Amount</th>
-                <th style={{ ...TH, textAlign: 'right' }}>Cost %</th>
-                <th style={TH}>Notes</th>
-                <th style={TH}>Approved By</th>
-                <th style={TH}>Approved At</th>
-                <th style={{ ...TH, textAlign: 'center' }}>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {approvedBols.map(bol => {
-                const isUnapproving = unapprovingId === bol.id;
-                return (
-                  <tr key={bol.id} style={{ background: '#f0fdf4' }}>
-                    <td style={TD}>{bol.technique_trip || '—'}</td>
-                    <td style={TD}>{bol.manifest || '—'}</td>
-                    <td style={TD}>
-                      {bol.bol_number ?? <span style={{ color: '#9ca3af' }}>—</span>}
-                      {bol.is_third_party && (
-                        <span style={{
-                          display: 'inline-block',
-                          marginLeft: bol.bol_number ? 6 : 4,
-                          background: '#fff7ed',
-                          color: '#c2410c',
-                          border: '1px solid #fed7aa',
-                          borderRadius: 3,
-                          padding: '1px 6px',
-                          fontSize: 10,
-                          fontWeight: 700,
-                          letterSpacing: '0.04em',
-                          verticalAlign: 'middle',
-                        }}>3RD PARTY</span>
-                      )}
-                    </td>
-                    <td style={TD_R}>{fmtNum(bol.technique_weight)}</td>
-                    <td style={TD_R}>{fmtNum(bol.technique_pallets)}</td>
-                    <td style={TD_R}>{fmtNum(bol.technique_pcs)}</td>
-                    <td style={{ ...TD, color: '#6b7280', fontSize: 12 }}>{bol.invoice_email_sender || '—'}</td>
-                    <td style={{ ...TD, fontWeight: 600 }}>{bol.invoice_number || '—'}</td>
-                    <td style={TD_R}>{fmtMoney(bol.access_prog)}</td>
-                    <td style={{ ...TD_R, fontWeight: 600 }}>{fmtMoney(bol.amount)}</td>
-                    <td style={{ ...TD_R, color: '#16a34a', fontWeight: 600 }}>
-                      {fmtCostPct(bol.cost_pct)}
-                    </td>
-                    <td style={{ ...TD, color: '#6b7280', fontSize: 12, maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      {bol.notes || '—'}
-                    </td>
-                    <td style={{ ...TD, color: '#6b7280' }}>{bol.approved_by || 'coordinator'}</td>
-                    <td style={{ ...TD, color: '#6b7280', fontSize: 12 }}>
-                      {bol.approved_at
-                        ? new Date(bol.approved_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
-                        : '—'}
-                    </td>
-                    <td style={{ ...TD, textAlign: 'center' }}>
-                      <button
-                        onClick={() => onUnapprove(bol.id)}
-                        disabled={isUnapproving}
-                        title="Move back to pending review"
-                        style={{
-                          background: isUnapproving ? '#f3f4f6' : '#fff',
-                          color: isUnapproving ? '#9ca3af' : '#6b7280',
-                          border: '1px solid #d1d5db',
-                          borderRadius: 4,
-                          padding: '4px 10px',
-                          fontSize: 12,
-                          fontWeight: 600,
-                          cursor: isUnapproving ? 'not-allowed' : 'pointer',
-                        }}
-                      >
-                        {isUnapproving ? '…' : '↩ Revert'}
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {batches.map((batch, idx) => {
+            const isExpanded = !collapsedGroups.has(batch.label);
+            const total = batch.records.reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
+            const missingBolCount = batch.records.filter(r => r.technique_trip && !r.bol_number).length;
+            const isRefetching = refetchingKey === batch.label;
+
+            return (
+              <div key={batch.label} style={{ border: '1px solid #e5e7eb', borderRadius: 8, overflow: 'hidden' }}>
+                {/* Batch header — click to expand/collapse */}
+                <div
+                  onClick={() => toggleGroup(batch.label)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '10px 14px',
+                    background: idx === 0 ? '#f0fdf4' : '#f9fafb',
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                  }}
+                >
+                  <span style={{ fontSize: 12, fontWeight: 700, color: '#111827', flex: 1 }}>
+                    {batch.label}
+                    <span style={{ fontWeight: 400, color: '#6b7280', marginLeft: 8 }}>
+                      · {batch.records.length} record{batch.records.length !== 1 ? 's' : ''} · {fmtMoney(total)}
+                    </span>
+                  </span>
+                  {missingBolCount > 0 && (
+                    <span style={{
+                      fontSize: 11, background: '#fff7ed', color: '#c2410c',
+                      border: '1px solid #fed7aa', borderRadius: 3, padding: '2px 7px', fontWeight: 600,
+                    }}>
+                      {missingBolCount} missing BOL
+                    </span>
+                  )}
+                  <span style={{ fontSize: 13, color: '#9ca3af' }}>{isExpanded ? '▾' : '▸'}</span>
+                </div>
+
+                {/* Action bar */}
+                <div style={{
+                  display: 'flex', gap: 8, padding: '8px 14px',
+                  background: '#fff',
+                  borderBottom: isExpanded ? '1px solid #e5e7eb' : 'none',
+                  borderTop: '1px solid #e5e7eb',
+                }}>
+                  {missingBolCount > 0 && (
+                    <button
+                      onClick={() => handleRefetchBols(batch)}
+                      disabled={isRefetching}
+                      title="Re-run the Technique query for these manifests to pull BOL numbers created in Prophecy"
+                      style={{
+                        background: '#f0fdf4',
+                        color: '#166534',
+                        border: '1px solid #bbf7d0',
+                        borderRadius: 5,
+                        padding: '5px 12px',
+                        fontSize: 12,
+                        fontWeight: 600,
+                        cursor: isRefetching ? 'not-allowed' : 'pointer',
+                        opacity: isRefetching ? 0.6 : 1,
+                      }}
+                    >
+                      {isRefetching ? 'Fetching…' : '↺ Re-fetch BOLs'}
+                    </button>
+                  )}
+                  <button
+                    onClick={() => setComposeModalGroup(batch)}
+                    style={{
+                      background: '#2D6A4F',
+                      color: '#fff',
+                      border: 'none',
+                      borderRadius: 5,
+                      padding: '5px 14px',
+                      fontSize: 12,
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      marginLeft: 'auto',
+                    }}
+                  >
+                    Send to Accounting →
+                  </button>
+                </div>
+
+                {/* Records table */}
+                {isExpanded && (
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
+                      <thead>
+                        <tr>
+                          <th style={TH}>Trip</th>
+                          <th style={TH}>Manifest</th>
+                          <th style={TH}>BOL</th>
+                          <th style={{ ...TH, textAlign: 'right' }}>Wgt</th>
+                          <th style={{ ...TH, textAlign: 'right' }}>Pallets</th>
+                          <th style={{ ...TH, textAlign: 'right' }}>PCS</th>
+                          <th style={TH}>Invoice #</th>
+                          <th style={{ ...TH, textAlign: 'right' }}>Calc Cost</th>
+                          <th style={{ ...TH, textAlign: 'right' }}>Amount</th>
+                          <th style={{ ...TH, textAlign: 'right' }}>Cost %</th>
+                          <th style={{ ...TH, textAlign: 'center' }}>Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {batch.records.map(bol => {
+                          const isUnapproving = unapprovingId === bol.id;
+                          return (
+                            <tr key={bol.id} style={{ background: '#f0fdf4' }}>
+                              <td style={TD}>{bol.technique_trip || '—'}</td>
+                              <td style={TD}>{bol.manifest || '—'}</td>
+                              <td style={TD}>
+                                {bol.bol_number ?? <span style={{ color: '#9ca3af' }}>—</span>}
+                              </td>
+                              <td style={TD_R}>{fmtNum(bol.technique_weight)}</td>
+                              <td style={TD_R}>{fmtNum(bol.technique_pallets)}</td>
+                              <td style={TD_R}>{fmtNum(bol.technique_pcs)}</td>
+                              <td style={{ ...TD, fontWeight: 600 }}>{bol.invoice_number || '—'}</td>
+                              <td style={TD_R}>{fmtMoney(bol.access_prog)}</td>
+                              <td style={{ ...TD_R, fontWeight: 600 }}>{fmtMoney(bol.amount)}</td>
+                              <td style={{ ...TD_R, color: '#16a34a', fontWeight: 600 }}>
+                                {fmtCostPct(bol.cost_pct)}
+                              </td>
+                              <td style={{ ...TD, textAlign: 'center' }}>
+                                <button
+                                  onClick={() => onUnapprove(bol.id)}
+                                  disabled={isUnapproving}
+                                  style={{
+                                    background: isUnapproving ? '#f3f4f6' : '#fff',
+                                    color: isUnapproving ? '#9ca3af' : '#6b7280',
+                                    border: '1px solid #d1d5db',
+                                    borderRadius: 4,
+                                    padding: '4px 10px',
+                                    fontSize: 12,
+                                    fontWeight: 600,
+                                    cursor: isUnapproving ? 'not-allowed' : 'pointer',
+                                  }}
+                                >
+                                  {isUnapproving ? '…' : '↩ Revert'}
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
+      )}
+
+      {composeModalGroup && (
+        <EmailComposeModal
+          records={composeModalGroup.records}
+          senderLabel={composeModalGroup.label}
+          onClose={() => setComposeModalGroup(null)}
+          onMarkSent={ids => {
+            setComposeModalGroup(null);
+            onMarkSent(ids);
+          }}
+        />
       )}
     </section>
   );
