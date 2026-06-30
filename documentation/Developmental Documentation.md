@@ -1,3 +1,5 @@
+*updated june 30 2026*
+
 #### **Things to Confirm Before Going Live**
 
 - [ ] Connect to live AWP-SQL-PROD and verify manifests pull correctly

@@ -2,7 +2,6 @@ import csv
 import io
 import logging
 import os
-import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -1457,8 +1456,6 @@ def get_invoice_file(invoice_number: str):
     candidates = [
         os.path.join(folder, f"{z}.CSV"),
         os.path.join(folder, f"{z}.csv"),
-        os.path.join(folder, "processed", f"{z}.CSV"),
-        os.path.join(folder, "processed", f"{z}.csv"),
     ]
     for path in candidates:
         if os.path.isfile(path):
@@ -1473,7 +1470,8 @@ def get_invoice_file(invoice_number: str):
 def poll_invoice_folder(db: Session = Depends(get_db)):
     """
     Scan INVOICE_FOLDER for unprocessed ALG invoice CSVs and process each.
-    Processed files are moved to a 'processed/' subfolder to prevent re-processing.
+    Files are NOT moved — "already processed" is tracked by checking invoice_number
+    against existing BOLRecord rows (or _mock_state in mock mode).
 
     In mock mode uses backend/test_data/ as the folder.
     Set INVOICE_FOLDER in .env for live mode.
@@ -1482,6 +1480,12 @@ def poll_invoice_folder(db: Session = Depends(get_db)):
         folder = os.path.join(os.path.dirname(__file__), "test_data")
     else:
         folder = settings.INVOICE_FOLDER
+        # If the process started before INVOICE_FOLDER was added to .env, read the
+        # file directly so a restart isn't required.
+        if not folder:
+            from dotenv import dotenv_values
+            _env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+            folder = dotenv_values(_env_path).get("INVOICE_FOLDER", "")
 
     if not folder:
         raise HTTPException(
@@ -1494,16 +1498,27 @@ def poll_invoice_folder(db: Session = Depends(get_db)):
             detail=f"INVOICE_FOLDER path does not exist: {folder}",
         )
 
-    processed_dir = os.path.join(folder, "processed")
-    os.makedirs(processed_dir, exist_ok=True)
-
-    already_done = {f.lower() for f in os.listdir(processed_dir)}
+    # Build set of Z-numbers already imported so we skip files already in the DB.
+    # ALG CSV filenames are named after their Z-number (e.g. Z557707.CSV).
+    if settings.USE_MOCK_DATA:
+        existing_invoices = {
+            v.get("invoice_number", "").upper()
+            for v in _mock_state.values()
+            if v.get("invoice_number")
+        }
+    else:
+        existing_invoices = {
+            row[0].upper()
+            for row in db.query(BOLRecord.invoice_number)
+                          .filter(BOLRecord.invoice_number.isnot(None))
+                          .all()
+        }
 
     candidates = [
         f for f in os.listdir(folder)
         if f.lower().endswith(".csv")
         and os.path.isfile(os.path.join(folder, f))
-        and f.lower() not in already_done
+        and os.path.splitext(f)[0].upper() not in existing_invoices
     ]
 
     if not candidates:
@@ -1517,8 +1532,7 @@ def poll_invoice_folder(db: Session = Depends(get_db)):
                 content = fh.read()
             result = _process_invoice_csv(content, fname, db)
             results.append(result)
-            shutil.move(fpath, os.path.join(processed_dir, fname))
-            logger.info("[POLL-FOLDER] Processed and moved: %s", fname)
+            logger.info("[POLL-FOLDER] Processed: %s", fname)
         except HTTPException as exc:
             results.append({"error": exc.detail, "filename": fname, "matched": False})
             logger.warning("[POLL-FOLDER] HTTPException processing %s: %s", fname, exc.detail)
