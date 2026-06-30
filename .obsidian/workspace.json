@@ -181,9 +181,14 @@
   },
   "active": "1109fc8b645eae6e",
   "lastOpenFiles": [
+    "frontend/src/components/ThirdPartySection.jsx",
+    "frontend/src/components/ReassignInvoiceModal.jsx",
+    "documentation/SG360_BOL_Project_Context.md",
+    "documentation/SECURITY.md",
+    "documentation/Requirements and SQL Mapping.md",
+    "documentation/Design and Workflow - BOL Reconciliation.md",
     "documentation/Developmental Documentation.md",
     "documentation",
-    "documentation/Design and Workflow - BOL Reconciliation.md",
     "SG360_BOL_Project_Context.md",
     "SECURITY.md",
     "backend/data_layer.py.tmp.46208.4f38380c90ae",
@@ -194,10 +199,6 @@
     "CLAUDE.md.tmp.46208.e8756b208cfe",
     "CLAUDE.md.tmp.46208.c1d43e9903d3",
     "documentation/Design and Workflow - BOL Reconciliation.md.tmp.46208.a61418fbfc50",
-    "backfill_wolf311_diffs.py.tmp.46208.d5067c31562b",
-    "documentation/SG360_BOL_Project_Context.md",
-    "documentation/SECURITY.md",
-    "documentation/Requirements and SQL Mapping.md",
     "frontend/node_modules/@esbuild/win32-x64/README.md"
   ]
 }

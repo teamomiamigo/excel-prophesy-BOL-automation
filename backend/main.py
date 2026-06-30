@@ -12,7 +12,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Depends, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -43,8 +43,10 @@ async def lifespan(app: FastAPI):
         with engine.connect() as _conn:
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS base_tariff NUMERIC(10,2)"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS fsc_pct NUMERIC(8,6)"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_third_party BOOLEAN NOT NULL DEFAULT FALSE"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_ignored BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.commit()
-        logger.info("DB column migration for base_tariff/fsc_pct complete.")
+        logger.info("DB column migration for base_tariff/fsc_pct/is_third_party/is_ignored complete.")
     logger.info(
         "SG360 BOL API started. Mock mode: %s | Version: %s",
         settings.USE_MOCK_DATA,
@@ -346,6 +348,337 @@ def unflag_bol(
     return row
 
 
+@app.post(
+    "/api/bols/{record_id}/mark-third-party",
+    response_model=BOLSummary,
+    status_code=status.HTTP_200_OK,
+    tags=["BOLs"],
+)
+def mark_third_party(
+    record_id: str,
+    db: Session = Depends(get_db),
+):
+    """Mark a record as third-party (customer pays freight directly).
+    Only valid for records with no_invoice=True. Idempotent."""
+    if settings.USE_MOCK_DATA:
+        rec = _find_mock(record_id)
+        if rec.get("amount") is not None or rec.get("bol_number") is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Only records with no matched invoice and no BOL number can be marked as third-party.",
+            )
+        rec["is_third_party"] = True
+        rec["updated_at"] = datetime.now(timezone.utc)
+        return _record_to_summary(rec)
+
+    row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
+    if row.amount is not None or row.bol_number is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Only records with no matched invoice and no BOL number can be marked as third-party.",
+        )
+    row.is_third_party = True
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.post(
+    "/api/bols/{record_id}/unmark-third-party",
+    response_model=BOLSummary,
+    status_code=status.HTTP_200_OK,
+    tags=["BOLs"],
+)
+def unmark_third_party(
+    record_id: str,
+    db: Session = Depends(get_db),
+):
+    """Revert a third-party record back to the normal pending queue."""
+    if settings.USE_MOCK_DATA:
+        rec = _find_mock(record_id)
+        rec["is_third_party"] = False
+        rec["updated_at"] = datetime.now(timezone.utc)
+        return _record_to_summary(rec)
+
+    row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
+    row.is_third_party = False
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.post("/api/bols/{record_id}/ignore", response_model=BOLSummary, tags=["BOLs"])
+def ignore_bol(record_id: str, db: Session = Depends(get_db)):
+    """Mark a record as ignored — stays in log, excluded from exports, reversible."""
+    if settings.USE_MOCK_DATA:
+        rec = _find_mock(record_id)
+        rec["is_ignored"] = True
+        rec["updated_at"] = datetime.now(timezone.utc)
+        return _record_to_summary(rec)
+    row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
+    row.is_ignored = True
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.post("/api/bols/{record_id}/unignore", response_model=BOLSummary, tags=["BOLs"])
+def unignore_bol(record_id: str, db: Session = Depends(get_db)):
+    """Remove ignored flag from a record."""
+    if settings.USE_MOCK_DATA:
+        rec = _find_mock(record_id)
+        rec["is_ignored"] = False
+        rec["updated_at"] = datetime.now(timezone.utc)
+        return _record_to_summary(rec)
+    row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
+    row.is_ignored = False
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.post("/api/bols/{record_id}/reassign-invoice", tags=["BOLs"])
+def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
+    """
+    Reassign the invoice on a record to a different trip/BOL/manifest.
+    body: { "target": str, "action": "preview" | "merge" | "replace" }
+
+    target search order:
+    1. Pure integer → match bol_number
+    2. Starts with TEC_T_ → match technique_trip
+    3. Starts with TEC_M_ → match manifest
+    4. Else → suffix match on trip (e.g. "110707" → TEC_T_0110707)
+    """
+    target_str = (body.get("target") or "").strip()
+    action = body.get("action", "preview")
+
+    if not target_str:
+        raise HTTPException(status_code=400, detail="target is required")
+    if action not in ("preview", "merge", "replace"):
+        raise HTTPException(status_code=400, detail="action must be preview, merge, or replace")
+
+    def _find_target_mock(t: str):
+        """Return mock record dict matching target string, or None."""
+        try:
+            bol_int = int(t)
+            for r in _mock_state.values():
+                if r.get("bol_number") == bol_int:
+                    return r
+        except ValueError:
+            pass
+        if t.upper().startswith("TEC_T_"):
+            for r in _mock_state.values():
+                if (r.get("technique_trip") or "").upper() == t.upper():
+                    return r
+        if t.upper().startswith("TEC_M_"):
+            for r in _mock_state.values():
+                if (r.get("manifest") or "").upper() == t.upper():
+                    return r
+        # Suffix match: "110707" matches TEC_T_0110707
+        for r in _mock_state.values():
+            trip = r.get("technique_trip") or ""
+            if trip and trip.split("_")[-1].lstrip("0") == t.lstrip("0"):
+                return r
+        return None
+
+    def _clear_invoice_fields(rec: dict):
+        rec["invoice_number"] = None
+        rec["amount"] = None
+        rec["cost_pct"] = None
+        rec["alg_weight"] = None
+        rec["alg_pallets"] = None
+        rec["alg_pcs"] = None
+        rec["weight_diff"] = None
+        rec["pallet_diff"] = None
+        rec["pcs_diff"] = None
+        rec["inv_job_number"] = None
+        rec["updated_at"] = datetime.now(timezone.utc)
+
+    def _merge_invoice_numbers_util(existing, new):
+        if not existing:
+            return new
+        parts = [p.strip() for p in existing.split(",")]
+        if new not in parts:
+            parts.append(new)
+        return ", ".join(parts)
+
+    if settings.USE_MOCK_DATA:
+        source = _find_mock(record_id)
+        if not source.get("invoice_number"):
+            raise HTTPException(status_code=400, detail="Source record has no invoice to reassign")
+
+        target_rec = _find_target_mock(target_str)
+        target_found = target_rec is not None
+        target_trip = target_rec.get("technique_trip") if target_rec else None
+        target_inv = target_rec.get("invoice_number") if target_rec else None
+        target_amount = float(target_rec.get("amount") or 0) if target_rec else None
+        has_conflict = bool(target_inv) if target_rec else False
+
+        if action == "preview":
+            return {
+                "target_found": target_found,
+                "target_trip": target_trip,
+                "target_invoice_number": target_inv,
+                "target_amount": target_amount,
+                "has_conflict": has_conflict,
+            }
+
+        if not target_found:
+            raise HTTPException(status_code=404, detail=f"No record found matching '{target_str}'")
+
+        src_inv = source.get("invoice_number")
+        src_amount = source.get("amount")
+        src_alg_weight = source.get("alg_weight")
+        src_alg_pallets = source.get("alg_pallets")
+        src_alg_pcs = source.get("alg_pcs")
+
+        if action == "merge":
+            target_rec["invoice_number"] = _merge_invoice_numbers_util(target_inv, src_inv)
+            target_rec["amount"] = Decimal(str(round(
+                float(target_rec.get("amount") or 0) + float(src_amount or 0), 2
+            )))
+            if not target_inv:
+                target_rec["alg_weight"] = src_alg_weight
+                target_rec["alg_pallets"] = src_alg_pallets
+                target_rec["alg_pcs"] = src_alg_pcs
+        elif action == "replace":
+            target_rec["invoice_number"] = src_inv
+            target_rec["amount"] = src_amount
+            target_rec["alg_weight"] = src_alg_weight
+            target_rec["alg_pallets"] = src_alg_pallets
+            target_rec["alg_pcs"] = src_alg_pcs
+
+        if target_rec.get("amount") and target_rec.get("access_prog"):
+            target_rec["cost_pct"] = round(
+                float(target_rec["amount"]) / float(target_rec["access_prog"]), 6
+            )
+        target_rec["updated_at"] = datetime.now(timezone.utc)
+
+        # Clear invoice from source; delete stub if invoice-only
+        is_stub = source.get("technique_trip") is None
+        if is_stub:
+            del _mock_state[source["id"]]
+        else:
+            _clear_invoice_fields(source)
+
+        return {"success": True, "action": action, "target_trip": target_trip}
+
+    # --- Live DB mode ---
+    source_row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if not source_row:
+        raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
+    if not source_row.invoice_number:
+        raise HTTPException(status_code=400, detail="Source record has no invoice to reassign")
+
+    # Find target
+    target_row = None
+    try:
+        bol_int = int(target_str)
+        target_row = db.query(BOLRecord).filter(BOLRecord.bol_number == bol_int).first()
+    except ValueError:
+        pass
+    if not target_row and target_str.upper().startswith("TEC_T_"):
+        target_row = db.query(BOLRecord).filter(
+            BOLRecord.technique_trip.ilike(target_str)
+        ).first()
+    if not target_row and target_str.upper().startswith("TEC_M_"):
+        target_row = db.query(BOLRecord).filter(
+            BOLRecord.manifest.ilike(target_str)
+        ).first()
+    if not target_row:
+        # Suffix match
+        for r in db.query(BOLRecord).all():
+            trip = r.technique_trip or ""
+            if trip and trip.split("_")[-1].lstrip("0") == target_str.lstrip("0"):
+                target_row = r
+                break
+
+    target_found = target_row is not None
+    target_trip = target_row.technique_trip if target_row else None
+    target_inv = target_row.invoice_number if target_row else None
+    target_amount = float(target_row.amount or 0) if target_row else None
+    has_conflict = bool(target_inv) if target_row else False
+
+    if action == "preview":
+        return {
+            "target_found": target_found,
+            "target_trip": target_trip,
+            "target_invoice_number": target_inv,
+            "target_amount": target_amount,
+            "has_conflict": has_conflict,
+        }
+
+    if not target_found:
+        raise HTTPException(status_code=404, detail=f"No record found matching '{target_str}'")
+
+    def _merge_nums_db(existing, new):
+        if not existing:
+            return new
+        parts = [p.strip() for p in existing.split(",")]
+        if new not in parts:
+            parts.append(new)
+        return ", ".join(parts)
+
+    src_inv = source_row.invoice_number
+    src_amount = source_row.amount
+    src_alg_weight = source_row.alg_weight
+    src_alg_pallets = source_row.alg_pallets
+    src_alg_pcs = source_row.alg_pcs
+
+    if action == "merge":
+        target_row.invoice_number = _merge_nums_db(target_inv, src_inv)
+        target_row.amount = Decimal(str(round(
+            float(target_row.amount or 0) + float(src_amount or 0), 2
+        )))
+        if not target_inv:
+            target_row.alg_weight = src_alg_weight
+            target_row.alg_pallets = src_alg_pallets
+            target_row.alg_pcs = src_alg_pcs
+    elif action == "replace":
+        target_row.invoice_number = src_inv
+        target_row.amount = src_amount
+        target_row.alg_weight = src_alg_weight
+        target_row.alg_pallets = src_alg_pallets
+        target_row.alg_pcs = src_alg_pcs
+
+    if target_row.amount and target_row.access_prog:
+        target_row.cost_pct = Decimal(str(round(
+            float(target_row.amount) / float(target_row.access_prog), 6
+        )))
+    target_row.updated_at = datetime.now(timezone.utc)
+
+    is_stub = source_row.technique_trip is None
+    if is_stub:
+        db.delete(source_row)
+    else:
+        source_row.invoice_number = None
+        source_row.amount = None
+        source_row.cost_pct = None
+        source_row.alg_weight = None
+        source_row.alg_pallets = None
+        source_row.alg_pcs = None
+        source_row.weight_diff = None
+        source_row.pallet_diff = None
+        source_row.pcs_diff = None
+        source_row.inv_job_number = None
+        source_row.updated_at = datetime.now(timezone.utc)
+
+    db.commit()
+    return {"success": True, "action": action, "target_trip": target_trip}
+
+
 @app.patch("/api/bols/{record_id}/notes", response_model=BOLSummary, tags=["BOLs"])
 def update_notes(
     record_id: str,
@@ -447,8 +780,7 @@ def pull_technique_data(db: Session = Depends(get_db)):
 
     from backend.data_layer import get_technique_data, get_manifest_weights
 
-    record_count = db.query(BOLRecord).count()
-    days_back = 21 if record_count == 0 else 1
+    days_back = 1
 
     manifests = get_technique_data(days_back=days_back)
     if not manifests:
@@ -714,10 +1046,10 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
             except (ValueError, TypeError):
                 pass
 
-    if not invoice_no or not job_name:
+    if not invoice_no:
         raise HTTPException(
             status_code=422,
-            detail="Could not parse Invoice No or Job Name from the CSV. Check file format.",
+            detail="Could not parse Invoice No from the CSV. Check file format.",
         )
 
     def _trip_to_suffix(trip: str) -> str:
@@ -725,98 +1057,118 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
         parts = trip.split("T_")
         return str(int(parts[-1])) if len(parts) >= 2 else ""
 
+    def _is_prophecy_bol(bol_no: str) -> bool:
+        """Prophecy BOLs are 6-digit numbers starting with '14' (140000–149999).
+        The ALG CSV 'BOL No' column contains Post Office permit numbers (e.g. 401212)
+        which also exceed 140000, so we must check the prefix, not just the magnitude.
+        Only the Job Name column carries the actual Prophecy BOL.
+        """
+        try:
+            return str(int(bol_no)).startswith("14") and len(str(int(bol_no))) == 6
+        except (ValueError, TypeError):
+            return False
+
     matched_rec = None
     match_strategy: Optional[str] = None
 
-    if settings.USE_MOCK_DATA:
-        # Primary: match by invoice Z-number (set when Katie creates load in Prophecy).
-        for rec in _mock_state.values():
-            if rec.get("invoice_number") == invoice_no:
-                matched_rec = rec
-                match_strategy = "invoice_number"
-                break
-        # Fallback: match by Job Name → trip suffix.
-        if matched_rec is None:
-            for rec in _mock_state.values():
-                trip = rec.get("technique_trip") or ""
-                if trip and _trip_to_suffix(trip) == job_name:
-                    matched_rec = rec
-                    match_strategy = "job_name"
-                    break
-    else:
-        # Primary: match by invoice number.
-        matched_rec = (
-            db.query(BOLRecord)
-            .filter(BOLRecord.invoice_number == invoice_no)
-            .first()
-        )
-        if matched_rec is not None:
-            match_strategy = "invoice_number"
-        # Fallback: match by Job Name → trip suffix.
-        if matched_rec is None:
-            for row_obj in db.query(BOLRecord).all():
-                trip = row_obj.technique_trip or ""
-                if trip and _trip_to_suffix(trip) == job_name:
-                    matched_rec = row_obj
-                    match_strategy = "job_name"
-                    break
+    # Prophecy BOL lives in Job Name only — the BOL No column is always a permit number.
+    effective_prophecy_bol = job_name if job_name and _is_prophecy_bol(job_name) else None
 
-    # Strategy 2: Job Name may be the Prophecy BOL number (non-comingle only).
-    if matched_rec is None and not (cust_job_no or "").upper().startswith("CM"):
-        try:
-            bol_num = int(job_name)
+    if effective_prophecy_bol:
+        # ── Wolf/311 path ─────────────────────────────────────────────────────
+        # Job Name is a Prophecy BOL (14xxxx). No Technique trip for this load.
+        bol_num = int(effective_prophecy_bol)
+        if settings.USE_MOCK_DATA:
+            for rec in _mock_state.values():
+                if rec.get("bol_number") == bol_num:
+                    matched_rec = rec
+                    match_strategy = "prophecy_bol"
+                    break
+        else:
+            matched_rec = (
+                db.query(BOLRecord)
+                .filter(BOLRecord.bol_number == bol_num)
+                .first()
+            )
+            if matched_rec is not None:
+                match_strategy = "prophecy_bol"
+    else:
+        # ── Corp / Technique path ─────────────────────────────────────────────
+        # Job Name is the trip suffix (e.g. "110810" → TEC_T_0110810).
+
+        # 1. Already uploaded: match by Z-number.
+        if settings.USE_MOCK_DATA:
+            for rec in _mock_state.values():
+                if rec.get("invoice_number") == invoice_no:
+                    matched_rec = rec
+                    match_strategy = "invoice_number"
+                    break
+        else:
+            matched_rec = (
+                db.query(BOLRecord)
+                .filter(BOLRecord.invoice_number == invoice_no)
+                .first()
+            )
+            if matched_rec is not None:
+                match_strategy = "invoice_number"
+
+        # 2. Job Name as trip suffix.
+        if matched_rec is None and job_name:
             if settings.USE_MOCK_DATA:
                 for rec in _mock_state.values():
-                    if rec.get("bol_number") == bol_num:
+                    trip = rec.get("technique_trip") or ""
+                    if trip and _trip_to_suffix(trip) == job_name:
                         matched_rec = rec
-                        match_strategy = "bol_number"
+                        match_strategy = "job_name"
                         break
             else:
-                matched_rec = (
-                    db.query(BOLRecord)
-                    .filter(BOLRecord.bol_number == bol_num)
-                    .first()
-                )
-                if matched_rec is not None:
-                    match_strategy = "bol_number"
-        except (ValueError, TypeError):
-            pass
+                for row_obj in db.query(BOLRecord).filter(
+                    BOLRecord.technique_trip.isnot(None)
+                ).all():
+                    if _trip_to_suffix(row_obj.technique_trip or "") == job_name:
+                        matched_rec = row_obj
+                        match_strategy = "job_name"
+                        break
 
-    # Strategy 3: pallets + pieces match (last resort, non-comingle only).
-    # Requires both to match to reduce false positives. Skipped if ambiguous.
-    if matched_rec is None and not (cust_job_no or "").upper().startswith("CM") and total_pallets and total_pcs:
-        if settings.USE_MOCK_DATA:
-            candidates = [
-                rec for rec in _mock_state.values()
-                if rec.get("technique_pallets") == total_pallets
-                and rec.get("technique_pcs") == total_pcs
-                and not rec.get("invoice_number")
-                and rec.get("technique_trip") is not None
-            ]
-            if len(candidates) == 1:
-                matched_rec = candidates[0]
-                match_strategy = "pallets_pieces"
-                logger.warning("[INVOICE] Strategy pallets+pieces matched %s to %s — verify manually",
-                               invoice_no, matched_rec.get("technique_trip"))
-        else:
-            candidates = db.query(BOLRecord).filter(
-                BOLRecord.technique_pallets == total_pallets,
-                BOLRecord.technique_pcs == total_pcs,
-                BOLRecord.invoice_number.is_(None),
-                BOLRecord.technique_trip.isnot(None),
-            ).all()
-            if len(candidates) == 1:
-                matched_rec = candidates[0]
-                match_strategy = "pallets_pieces"
-                logger.warning("[INVOICE] Strategy pallets+pieces matched %s to %s — verify manually",
-                               invoice_no, matched_rec.technique_trip)
+        # 3. Pallets + pieces (last resort, non-comingle only).
+        if matched_rec is None and not (cust_job_no or "").upper().startswith("CM") \
+                and total_pallets and total_pcs:
+            if settings.USE_MOCK_DATA:
+                candidates = [
+                    rec for rec in _mock_state.values()
+                    if rec.get("technique_pallets") == total_pallets
+                    and rec.get("technique_pcs") == total_pcs
+                    and not rec.get("invoice_number")
+                    and rec.get("technique_trip") is not None
+                ]
+                if len(candidates) == 1:
+                    matched_rec = candidates[0]
+                    match_strategy = "pallets_pieces"
+                    logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
+                                   invoice_no, matched_rec.get("technique_trip"))
+            else:
+                candidates = db.query(BOLRecord).filter(
+                    BOLRecord.technique_pallets == total_pallets,
+                    BOLRecord.technique_pcs == total_pcs,
+                    BOLRecord.invoice_number.is_(None),
+                    BOLRecord.technique_trip.isnot(None),
+                ).all()
+                if len(candidates) == 1:
+                    matched_rec = candidates[0]
+                    match_strategy = "pallets_pieces"
+                    logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
+                                   invoice_no, matched_rec.technique_trip)
 
     if matched_rec is None:
-        auto_note = (
-            f"Comingle — no Technique match. Cust Job No: {cust_job_no}"
-            if (cust_job_no or "").upper().startswith("CM")
-            else f"No Technique trip for job name '{job_name}'. Validate manually."
-        )
+        is_wolf_stub = bool(effective_prophecy_bol)
+        stub_bol_number = int(effective_prophecy_bol) if is_wolf_stub else None
+        if is_wolf_stub:
+            auto_note = f"Wolf/311 load — Prophecy BOL {alg_bol_no}. No matching morning record found."
+        elif (cust_job_no or "").upper().startswith("CM"):
+            auto_note = f"Comingle — no Technique match. Cust Job No: {cust_job_no}"
+        else:
+            auto_note = f"No Technique trip for job name '{job_name}'. Validate manually."
+
         amount_dec_s = Decimal(str(round(total_billed, 2))) if total_billed is not None else None
         alg_weight_dec_s = Decimal(str(round(total_weight, 2))) if total_weight else None
         # access_prog requires Technique weight/ZIP data — not available for unmatched stubs.
@@ -828,7 +1180,7 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
                 "id": stub_id,
                 "technique_trip": None,
                 "manifest": None,
-                "bol_number": None,
+                "bol_number": stub_bol_number,
                 "inv_job_number": job_name,
                 "invoice_number": invoice_no,
                 "amount": amount_dec_s,
@@ -843,11 +1195,16 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
                 "weight_diff": None,
                 "pallet_diff": None,
                 "pcs_diff": None,
+                "prophecy_weight": None,
+                "prophecy_pallets": None,
+                "prophecy_pcs": None,
                 "notes": auto_note,
                 "status": "pending",
                 "flag_reason": None,
                 "match_strategy": "invoice_only",
                 "needs_sid_export": False,
+                "no_invoice": False,
+                "is_third_party": False,
                 "approved_at": None,
                 "approved_by": None,
                 "created_at": datetime.now(timezone.utc),
@@ -858,6 +1215,7 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
                 technique_weight  = Decimal("0"),
                 technique_pallets = 0,
                 technique_pcs     = 0,
+                bol_number        = stub_bol_number,
                 inv_job_number    = job_name,
                 invoice_number    = invoice_no,
                 amount            = amount_dec_s,
@@ -873,9 +1231,18 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
             )
             db.add(stub)
             db.commit()
+            # For Wolf/311 stubs: try to fill Prophecy quantities immediately.
+            if is_wolf_stub and stub_bol_number:
+                from backend.data_layer import get_prophecy_data as _get_prophecy_data
+                prop = _get_prophecy_data(stub_bol_number)
+                if prop:
+                    stub.prophecy_weight  = prop["prophecy_weight"]
+                    stub.prophecy_pallets = prop["prophecy_pallets"]
+                    stub.prophecy_pcs     = prop["prophecy_pcs"]
+                    db.commit()
         logger.info(
-            "[INVOICE] %s → no Technique match, stub created (job_name=%s, note=%s)",
-            invoice_no, job_name, auto_note,
+            "[INVOICE] %s → no match, stub created (bol=%s, note=%s)",
+            invoice_no, stub_bol_number, auto_note,
         )
         return {
             "matched": False,
@@ -891,7 +1258,7 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
             "amount": total_billed,
             "fsc_pct": fsc_rate_val,
             "fsc_cost": fsc_cost_val,
-            "message": f"Invoice {invoice_no} has no Technique match — stub record created. {auto_note}",
+            "message": f"Invoice {invoice_no} has no match — stub record created. {auto_note}",
         }
 
     amount_dec = Decimal(str(round(total_billed, 2))) if total_billed is not None else None
@@ -911,9 +1278,20 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
             return False
         return new in [p.strip() for p in existing.split(",")]
 
+    conflict_info = None
+
     if settings.USE_MOCK_DATA:
         existing_inv = matched_rec.get("invoice_number")
         already_done = _already_uploaded(existing_inv, invoice_no)
+        if existing_inv and not already_done:
+            conflict_info = {
+                "invoice_number": invoice_no,
+                "record_id": matched_rec.get("id"),
+                "matched_trip": matched_rec.get("technique_trip"),
+                "existing_invoice": existing_inv,
+                "existing_amount": float(matched_rec.get("amount") or 0),
+                "new_amount": total_billed or 0,
+            }
         matched_rec["invoice_number"] = _merge_invoice_numbers(existing_inv, invoice_no)
         if not already_done:
             if existing_inv and amount_dec:
@@ -933,25 +1311,39 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
             matched_rec["cost_pct"] = round(
                 float(matched_rec["amount"]) / float(matched_rec["access_prog"]), 6
             )
-        # Diffs: ALG invoice vs Technique quantities
-        alg_w = matched_rec.get("alg_weight")
-        tech_w = matched_rec.get("technique_weight")
-        if alg_w is not None and tech_w:
-            matched_rec["weight_diff"] = round(float(alg_w) - float(tech_w), 2)
+        # Diffs: ALG vs Prophecy for Wolf/311, ALG vs Technique for Corp.
+        alg_w   = matched_rec.get("alg_weight")
         alg_pal = matched_rec.get("alg_pallets")
-        tech_pal = matched_rec.get("technique_pallets")
-        if alg_pal is not None and tech_pal is not None:
-            matched_rec["pallet_diff"] = alg_pal - tech_pal
-        alg_p = matched_rec.get("alg_pcs")
-        tech_p = matched_rec.get("technique_pcs")
-        if alg_p is not None and tech_p is not None:
-            matched_rec["pcs_diff"] = alg_p - tech_p
+        alg_p   = matched_rec.get("alg_pcs")
+        if match_strategy == "prophecy_bol":
+            ref_w   = matched_rec.get("prophecy_weight")
+            ref_pal = matched_rec.get("prophecy_pallets")
+            ref_p   = matched_rec.get("prophecy_pcs")
+        else:
+            ref_w   = matched_rec.get("technique_weight")
+            ref_pal = matched_rec.get("technique_pallets")
+            ref_p   = matched_rec.get("technique_pcs")
+        if alg_w is not None and ref_w:
+            matched_rec["weight_diff"] = round(float(alg_w) - float(ref_w), 2)
+        if alg_pal is not None and ref_pal is not None:
+            matched_rec["pallet_diff"] = alg_pal - ref_pal
+        if alg_p is not None and ref_p is not None:
+            matched_rec["pcs_diff"] = alg_p - ref_p
         matched_rec["updated_at"] = datetime.now(timezone.utc)
         matched_trip = matched_rec.get("technique_trip")
         matched_manifest = matched_rec.get("manifest")
     else:
         existing_inv = matched_rec.invoice_number
         already_done = _already_uploaded(existing_inv, invoice_no)
+        if existing_inv and not already_done:
+            conflict_info = {
+                "invoice_number": invoice_no,
+                "record_id": str(matched_rec.id),
+                "matched_trip": matched_rec.technique_trip,
+                "existing_invoice": existing_inv,
+                "existing_amount": float(matched_rec.amount or 0),
+                "new_amount": total_billed or 0,
+            }
         matched_rec.invoice_number = _merge_invoice_numbers(existing_inv, invoice_no)
         if not already_done:
             if existing_inv and amount_dec:
@@ -980,15 +1372,32 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
             matched_rec.cost_pct = Decimal(
                 str(round(float(matched_rec.amount) / float(matched_rec.access_prog), 6))
             )
-        # Diffs: ALG invoice vs Technique quantities
-        if matched_rec.alg_weight is not None and matched_rec.technique_weight:
-            matched_rec.weight_diff = Decimal(str(round(
-                float(matched_rec.alg_weight) - float(matched_rec.technique_weight), 2
-            )))
-        if matched_rec.alg_pallets is not None and matched_rec.technique_pallets is not None:
-            matched_rec.pallet_diff = matched_rec.alg_pallets - matched_rec.technique_pallets
-        if matched_rec.alg_pcs is not None and matched_rec.technique_pcs is not None:
-            matched_rec.pcs_diff = matched_rec.alg_pcs - matched_rec.technique_pcs
+        # Wolf/311: fill Prophecy weight/pallets/pcs from ShipperPlus, then diff against Prophecy.
+        if match_strategy == "prophecy_bol" and effective_prophecy_bol:
+            from backend.data_layer import get_prophecy_data as _get_prophecy_data
+            prop = _get_prophecy_data(int(effective_prophecy_bol))
+            if prop:
+                matched_rec.prophecy_weight  = prop["prophecy_weight"]
+                matched_rec.prophecy_pallets = prop["prophecy_pallets"]
+                matched_rec.prophecy_pcs     = prop["prophecy_pcs"]
+                if matched_rec.alg_weight is not None and prop["prophecy_weight"]:
+                    matched_rec.weight_diff = Decimal(str(round(
+                        float(matched_rec.alg_weight) - float(prop["prophecy_weight"]), 2
+                    )))
+                if matched_rec.alg_pallets is not None and prop["prophecy_pallets"] is not None:
+                    matched_rec.pallet_diff = matched_rec.alg_pallets - prop["prophecy_pallets"]
+                if matched_rec.alg_pcs is not None and prop["prophecy_pcs"] is not None:
+                    matched_rec.pcs_diff = matched_rec.alg_pcs - prop["prophecy_pcs"]
+        else:
+            # Corp/Technique: diff against Technique quantities.
+            if matched_rec.alg_weight is not None and matched_rec.technique_weight:
+                matched_rec.weight_diff = Decimal(str(round(
+                    float(matched_rec.alg_weight) - float(matched_rec.technique_weight), 2
+                )))
+            if matched_rec.alg_pallets is not None and matched_rec.technique_pallets is not None:
+                matched_rec.pallet_diff = matched_rec.alg_pallets - matched_rec.technique_pallets
+            if matched_rec.alg_pcs is not None and matched_rec.technique_pcs is not None:
+                matched_rec.pcs_diff = matched_rec.alg_pcs - matched_rec.technique_pcs
         db.commit()
         db.refresh(matched_rec)
         matched_trip = matched_rec.technique_trip
@@ -1012,6 +1421,7 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
         "amount": total_billed,
         "fsc_pct": fsc_rate_val,
         "fsc_cost": fsc_cost_val,
+        "conflict": conflict_info,
         "message": f"Invoice {invoice_no} matched to trip {matched_trip} and updated.",
     }
 
@@ -1026,6 +1436,37 @@ async def upload_alg_invoice(
         raise HTTPException(status_code=400, detail="Only .csv files are accepted.")
     content = await file.read()
     return _process_invoice_csv(content, file.filename or "upload.csv", db)
+
+
+@app.get("/api/invoices/{invoice_number}/file", tags=["Invoices"])
+def get_invoice_file(invoice_number: str):
+    """
+    Serve the original invoice CSV file for a given Z-number.
+    Looks in INVOICE_FOLDER (live) or backend/test_data/ (mock).
+    Also checks a 'processed/' subfolder in case the file was moved after import.
+    """
+    if settings.USE_MOCK_DATA:
+        folder = os.path.join(os.path.dirname(__file__), "test_data")
+    else:
+        folder = settings.INVOICE_FOLDER
+
+    if not folder:
+        raise HTTPException(status_code=404, detail="No invoice folder configured (set INVOICE_FOLDER in .env)")
+
+    z = invoice_number.strip().upper()
+    candidates = [
+        os.path.join(folder, f"{z}.CSV"),
+        os.path.join(folder, f"{z}.csv"),
+        os.path.join(folder, "processed", f"{z}.CSV"),
+        os.path.join(folder, "processed", f"{z}.csv"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            filename = os.path.basename(path)
+            return FileResponse(path, media_type="text/csv", filename=filename,
+                                headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    raise HTTPException(status_code=404, detail=f"File not found for {invoice_number}. Checked: {folder}")
 
 
 @app.post("/api/invoices/poll-folder", tags=["Invoices"])
@@ -1176,7 +1617,10 @@ def export_prophecy_sid(db: Session = Depends(get_db)):
     if settings.USE_MOCK_DATA:
         approved = [
             r for r in _mock_state.values()
-            if r["status"] == "approved" and r.get("needs_sid_export", True)
+            if r["status"] == "approved"
+            and r.get("needs_sid_export", True)
+            and not r.get("is_third_party", False)
+            and not r.get("is_ignored", False)
         ]
         if not approved:
             raise HTTPException(
@@ -1200,6 +1644,8 @@ def export_prophecy_sid(db: Session = Depends(get_db)):
         .filter(
             BOLRecord.status == BOLStatus.APPROVED,
             BOLRecord.needs_sid_export == True,
+            BOLRecord.is_third_party == False,
+            BOLRecord.is_ignored == False,
         )
         .all()
     )
@@ -1310,12 +1756,13 @@ def export_approved_bols(
     if settings.USE_MOCK_DATA:
         # In mock mode return all approved records regardless of date —
         # mock data doesn't represent real daily batches.
-        approved = [r for r in _mock_state.values() if r["status"] == "approved"]
+        approved = [r for r in _mock_state.values() if r["status"] == "approved" and not r.get("is_ignored", False)]
     else:
         rows = (
             db.query(BOLRecord)
             .filter(
                 BOLRecord.status == BOLStatus.APPROVED,
+                BOLRecord.is_ignored == False,
                 BOLRecord.approved_at >= datetime(
                     target.year, target.month, target.day, tzinfo=timezone.utc
                 ),

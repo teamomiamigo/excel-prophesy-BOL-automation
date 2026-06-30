@@ -9,3 +9,4 @@ dist/
 .DS_Store
 *.log
 test_invoices_*/
+backend/test_data/processed/

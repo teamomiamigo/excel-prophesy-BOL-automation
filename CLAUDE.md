@@ -77,12 +77,22 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/bols/{id}/approve` | Approve a record; idempotent |
 | POST | `/api/bols/{id}/unapprove` | Revert an approved record back to pending |
 | POST | `/api/bols/{id}/flag` | Flag a record with a reason |
+| POST | `/api/bols/{id}/unflag` | Remove flag from a record |
+| POST | `/api/bols/{id}/mark-third-party` | Mark as third-party (customer pays direct); excludes from SID export |
+| POST | `/api/bols/{id}/unmark-third-party` | Revert third-party record back to pending queue |
+| POST | `/api/bols/{id}/ignore` | Mark record as ignored — stays in log, excluded from exports, reversible |
+| POST | `/api/bols/{id}/unignore` | Remove ignored flag |
+| POST | `/api/bols/{id}/reassign-invoice` | Move invoice to a different trip/BOL/manifest; body: `{ target, action: preview\|merge\|replace }` |
+| PATCH | `/api/bols/{id}/notes` | Auto-save notes field (called by frontend with 500ms debounce) |
 | POST | `/api/admin/pull` | Pull Technique manifests from AWP-SQL-PROD (disabled in mock mode) |
 | POST | `/api/admin/poll-email` | Poll O365 IMAP for unread ALG invoice emails → extract CSVs → process (live mode only) |
-| POST | `/api/invoices/upload` | Upload ALG invoice CSV (Z-number format) → match + update record |
+| POST | `/api/admin/reset-invoices` | Dev: clear invoice fields on all records + delete invoice-only stubs |
+| POST | `/api/invoices/upload` | Upload ALG invoice CSV (Z-number format) → match + update record; response includes `conflict` key if trip already had an invoice |
+| GET | `/api/invoices/{z}/file` | Serve original Z-number CSV from `INVOICE_FOLDER` (or `test_data/` in mock mode) |
+| POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` path for unprocessed CSVs → process each |
 | GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only) |
 | POST | `/api/export` | Generate accounting CSV and email to Mary + Katie |
-| GET | `/api/logs` | All records across all dates; optional `?start_date=` / `?end_date=` filters |
+| GET | `/api/logs` | All records across all dates; optional `?start_date=` / `?end_date=` / `?status=` filters |
 | GET | `/api/logs/export` | Download log as CSV; same date-range params as above |
 
 ---
@@ -174,7 +184,7 @@ All queries connect to AWP-SQL-PROD. TECH, SegGroup, and SQLAPPS3 are linked ser
 | `get_manifest_weights(manifests)` | ✅ Implemented | weight, pieces, pallets per manifest (separate query) |
 | `get_pallet_data_for_manifests(manifests)` | ✅ Implemented | pallet rows for SID export; `Dest ID` = `Locations.AccountNumber` (e.g. `SCF606`) — **field uncertain, see Open Question #2** |
 | `get_tariff_rate(zip3, weight)` | ✅ Implemented | `access_prog` = base rate × (1 + FSC) from PostgreSQL |
-| `get_prophecy_data(bol_number)` | ⬜ Stub | prop_reship, prophecy weight/pallets/pcs — needs Megha |
+| `get_prophecy_data(bol_number)` | ✅ Implemented | prophecy weight/pallets/pcs from ShipperPlus via SG360-TECH-PRD1 (primary) or SQLAPPS3 (fallback); pallet count formula needs Megha confirmation |
 | `get_alg_invoice(invoice_number)` | ⬜ Stub | Z-number, amount, alg weight/pal/pcs — workaround: manual CSV upload |
 
 **Weight split**: `get_technique_data()` does NOT return weight. The morning pull (`POST /api/admin/pull`) always calls both Query A (`get_technique_data`) + Query B (`get_manifest_weights`) and merges by manifest number.
@@ -213,9 +223,9 @@ Cost %:        stored as ratio 0.9881 = 98.81% (amount / access_prog)
 **Cost %** = `amount / access_prog` (actual ALG invoice ÷ expected Access program rate).
 
 Color thresholds:
-- Green: within 5% of 100% (0.95–1.05)
-- Yellow: 5–10% off (0.90–0.95 or 1.05–1.10)
-- Red: >10% off (<0.90 or >1.10)
+- Green: within 3% of 100% (0.97–1.03)
+- Orange: 3–6% off (0.94–0.97 or 1.03–1.06)
+- Red: >6% off (<0.94 or >1.06)
 
 Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — shown with sign but no hard threshold.
 
@@ -234,7 +244,10 @@ Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — show
 
 ```
 backend/main.py          — All routes in one file (Module 1 only; split by module when Module 2 ships)
-backend/data_layer.py    — The integration boundary; implement get_prophecy_data + get_alg_invoice to finish live mode
+backend/config.py        — Pydantic BaseSettings; loads .env with typed defaults for all keys (DB, SMTP,
+                           EIA API, IMAP, USE_MOCK_DATA). Single source of truth for config — no hardcoded
+                           values elsewhere.
+backend/data_layer.py    — The integration boundary; get_prophecy_data implemented; get_alg_invoice still stub (workaround: manual CSV upload)
 backend/mock_data.py     — 12 records at real scale; safe to delete when DB is live
 backend/email_parser.py  — O365 IMAP4_SSL polling (outlook.office365.com:993); marks emails read even
                            with no CSV attachment (prevents re-scan loop on next poll)
@@ -250,21 +263,23 @@ backend/test_data/       — Sample ALG invoice CSVs for testing the upload flow
 test_invoices_0622/      — 26 real Z-number CSVs from Tanya's June 22 email (e.g. Z557707.CSV).
                            Use for live-mode invoice upload testing. NOT committed — real production
                            data; add to .gitignore if not already excluded.
+documentation/           — Six .md spec files (Design & Workflow, Requirements & SQL Mapping, etc.).
+                           Reference for business rules and SQL source queries; not runtime code.
 frontend/src/App.jsx     — Owns all state + fetch/mutation handlers; passes data+callbacks down as props
 frontend/src/components/
-  SummaryBar.jsx         — Pending/approved/flagged counts strip
-  BOLTable.jsx           — Pending + flagged records table (wraps BOLRow)
-  BOLRow.jsx             — Single record row; Approve and Flag buttons
-  ApprovedSection.jsx    — Approved records table + SID export + Send to Accounting flow
-  FlagModal.jsx          — Modal overlay for entering a flag reason
-  LogSection.jsx         — Historical log viewer (separate tab)
+  SummaryBar.jsx              — Pending/approved/flagged counts strip
+  BOLTable.jsx                — Pending + flagged records table (wraps BOLRow)
+  BOLRow.jsx                  — Single record row; Approve, Flag, Third-party, Ignore buttons
+  ApprovedSection.jsx         — Approved records table + SID export + Send to Accounting flow
+  ThirdPartySection.jsx       — Third-party records (customer pays direct); excluded from SID export
+  FlagModal.jsx               — Modal overlay for entering a flag reason
+  ReassignInvoiceModal.jsx    — Modal for moving an invoice to a different trip (preview/merge/replace)
+  LogSection.jsx              — Historical log viewer (separate tab)
 ```
 
 ## Known bugs
 
-**`days_back` default is 10**, but invoices lag 11–18 days from despatch — matching fails unless `?days_back=20` is passed explicitly. The default needs to be raised in two places: `get_technique_data(days_back=10)` in `data_layer.py` and the `pull_technique_data()` route default in `main.py`. Until changed, pass `?days_back=20` on the `POST /api/admin/pull` call.
-
-**Duplicate `unapprove_bol` function in `main.py`**: The function is defined twice (identical bodies), at the same FastAPI route `POST /api/bols/{record_id}/unapprove`. Python silently replaces the first definition with the second; FastAPI registers two route entries that both resolve to the second definition. Behavior is currently correct by coincidence — remove the duplicate (lines ~253–286 are the second copy).
+**`days_back` is now hardcoded to 1** in `pull_technique_data()` in `main.py`. This is intentional for the daily pull workflow — morning pull always grabs today's manifests only.
 
 **Mock state** (`_mock_state` in `main.py`): in-memory dict initialized from `MOCK_BOLS` at startup. Mutations (approvals, flags, invoice uploads) survive the process lifetime but reset on every backend restart. Restart the backend to reset all records to their initial pending state during development.
 
