@@ -1,5 +1,5 @@
 
-*updated june 26 2026*
+*updated june 30 2026*
 *created june 24 2026*
 
 ---
@@ -132,14 +132,3 @@ calculated_cost = base_tariff × (1 + fsc_pct)
 |                                          |                                    |
 
 ---
-
-#### **Open Questions Regarding Documentation**
-1. How far back should manifests go? current window is 10 days. Invoices can come in 11–18 days after despatch. Should we pull 20–30 days to make sure nothing gets missed?
-2. How long does a record stay "pending" before it's considered stale? If a manifest has no invoice after 2 weeks, should it stay visible or be archived
-3. Comingle loads -- right now these appear at the bottom in their own section with no calculated cost. Is there a separate process for reviewing these, or...
-4. Date filtering for organization — should the default view show today only, or the last N days? What's most useful for the review?
-5. Accounting export format — is the current 18-column CSV format what Mary expects, or does she need it in a different layout?
-6. Any other information or design changes that you would like? Any processes that seem confusing?
-7. What would happen with the PDF files, do those still need to be moved around?
-8. Am I missing anything in your process that isn't a part of this method or any issues that you would probably encounter?
-9. Can you define again how the matching situation works and how that is moved over?

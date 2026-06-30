@@ -101,10 +101,27 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
         }
       </td>
 
-      {/* Technique quantities */}
-      <td style={{ ...TD_R, borderLeft: '2px solid #f3f4f6' }}>{fmtNum(bol.technique_weight)}</td>
-      <td style={TD_R}>{fmtNum(bol.technique_pallets)}</td>
-      <td style={TD_R}>{fmtNum(bol.technique_pcs)}</td>
+      {/* Technique quantities — substituted with Prophecy (indigo + P marker) for Wolf/311 rows */}
+      {(() => {
+        const isP = !bol.technique_trip && (bol.prophecy_weight != null || bol.prophecy_pallets != null);
+        const wgt = isP ? bol.prophecy_weight  : bol.technique_weight;
+        const pal = isP ? bol.prophecy_pallets : bol.technique_pallets;
+        const pcs = isP ? bol.prophecy_pcs     : bol.technique_pcs;
+        const P = isP ? <sup style={{ fontSize: 9, marginLeft: 2, opacity: 0.7 }}>P</sup> : null;
+        return (
+          <>
+            <td style={{ ...TD_R, borderLeft: '2px solid #f3f4f6', ...(isP ? { color: '#6366f1' } : {}) }}>
+              {fmtNum(wgt)}{wgt != null ? P : null}
+            </td>
+            <td style={{ ...TD_R, ...(isP ? { color: '#6366f1' } : {}) }}>
+              {fmtNum(pal)}{pal != null ? P : null}
+            </td>
+            <td style={{ ...TD_R, ...(isP ? { color: '#6366f1' } : {}) }}>
+              {fmtNum(pcs)}{pcs != null ? P : null}
+            </td>
+          </>
+        );
+      })()}
 
       {/* ALG invoice quantities — null until CSV is uploaded */}
       <td style={{ ...TD_R, borderLeft: '1px solid #f3f4f6', color: bol.alg_weight == null ? '#d1d5db' : undefined }}>
