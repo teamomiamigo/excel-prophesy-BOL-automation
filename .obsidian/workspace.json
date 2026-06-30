@@ -1,0 +1,203 @@
+{
+  "main": {
+    "id": "9d5fcfee9d575c14",
+    "type": "split",
+    "children": [
+      {
+        "id": "b5b9eb061a1f69d0",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "1109fc8b645eae6e",
+            "type": "leaf",
+            "state": {
+              "type": "empty",
+              "state": {},
+              "icon": "lucide-file",
+              "title": "New tab"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "c134377433fa5c7f",
+    "type": "split",
+    "children": [
+      {
+        "id": "f37aab8af26b3d51",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "bd7df4c7b1e3a2bf",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "befaffceeb7d7e79",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "52699808cc842438",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 200
+  },
+  "right": {
+    "id": "a3b8a838a45f0a54",
+    "type": "split",
+    "children": [
+      {
+        "id": "0129f545b07b0b65",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "3bbca9920aed3cc0",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "documentation/Design Implementation Plan.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for Design Implementation Plan"
+            }
+          },
+          {
+            "id": "d4a2d8c0b94a06ca",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "documentation/Design Implementation Plan.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from Design Implementation Plan"
+            }
+          },
+          {
+            "id": "8caf7a549c30dec8",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "ea9af96c4d4e7baa",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "fc43ce81948fb6e5",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "documentation/Design Implementation Plan.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of Design Implementation Plan"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "1109fc8b645eae6e",
+  "lastOpenFiles": [
+    "documentation/Developmental Documentation.md",
+    "documentation",
+    "documentation/Design and Workflow - BOL Reconciliation.md",
+    "SG360_BOL_Project_Context.md",
+    "SECURITY.md",
+    "backend/data_layer.py.tmp.46208.4f38380c90ae",
+    "backfill_prophecy_pallets.py",
+    "backfill_prophecy_pallets.py.tmp.46208.1b4a46f30403",
+    "backend/data_layer.py.tmp.46208.0492b3d4a08f",
+    "CLAUDE.md.tmp.46208.05a962228624",
+    "CLAUDE.md.tmp.46208.e8756b208cfe",
+    "CLAUDE.md.tmp.46208.c1d43e9903d3",
+    "documentation/Design and Workflow - BOL Reconciliation.md.tmp.46208.a61418fbfc50",
+    "backfill_wolf311_diffs.py.tmp.46208.d5067c31562b",
+    "documentation/SG360_BOL_Project_Context.md",
+    "documentation/SECURITY.md",
+    "documentation/Requirements and SQL Mapping.md",
+    "frontend/node_modules/@esbuild/win32-x64/README.md"
+  ]
+}
