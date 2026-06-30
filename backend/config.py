@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     SQLSERVER_USER: str = ""
     SQLSERVER_PASSWORD: str = ""
 
+    # Direct connection to SG360-TECH-PRD1 (ShipperPlus host).
+    # When set, get_prophecy_data() uses this instead of the SQLAPPS3 linked server.
+    TECH_PRD1_SERVER: str = "SG360-TECH-PRD1"
+    TECH_PRD1_USER: str = ""
+    TECH_PRD1_PASSWORD: str = ""
+
     ALLOWED_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 
     SMTP_HOST: str = "smtp.office365.com"

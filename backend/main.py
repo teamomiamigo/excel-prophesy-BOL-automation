@@ -780,8 +780,7 @@ def pull_technique_data(db: Session = Depends(get_db)):
 
     from backend.data_layer import get_technique_data, get_manifest_weights
 
-    record_count = db.query(BOLRecord).count()
-    days_back = 21 if record_count == 0 else 1
+    days_back = 1
 
     manifests = get_technique_data(days_back=days_back)
     if not manifests:
@@ -1047,10 +1046,10 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
             except (ValueError, TypeError):
                 pass
 
-    if not invoice_no or not job_name:
+    if not invoice_no:
         raise HTTPException(
             status_code=422,
-            detail="Could not parse Invoice No or Job Name from the CSV. Check file format.",
+            detail="Could not parse Invoice No from the CSV. Check file format.",
         )
 
     def _trip_to_suffix(trip: str) -> str:
@@ -1058,98 +1057,118 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
         parts = trip.split("T_")
         return str(int(parts[-1])) if len(parts) >= 2 else ""
 
+    def _is_prophecy_bol(bol_no: str) -> bool:
+        """Prophecy BOLs are 6-digit numbers starting with '14' (140000–149999).
+        The ALG CSV 'BOL No' column contains Post Office permit numbers (e.g. 401212)
+        which also exceed 140000, so we must check the prefix, not just the magnitude.
+        Only the Job Name column carries the actual Prophecy BOL.
+        """
+        try:
+            return str(int(bol_no)).startswith("14") and len(str(int(bol_no))) == 6
+        except (ValueError, TypeError):
+            return False
+
     matched_rec = None
     match_strategy: Optional[str] = None
 
-    if settings.USE_MOCK_DATA:
-        # Primary: match by invoice Z-number (set when Katie creates load in Prophecy).
-        for rec in _mock_state.values():
-            if rec.get("invoice_number") == invoice_no:
-                matched_rec = rec
-                match_strategy = "invoice_number"
-                break
-        # Fallback: match by Job Name → trip suffix.
-        if matched_rec is None:
-            for rec in _mock_state.values():
-                trip = rec.get("technique_trip") or ""
-                if trip and _trip_to_suffix(trip) == job_name:
-                    matched_rec = rec
-                    match_strategy = "job_name"
-                    break
-    else:
-        # Primary: match by invoice number.
-        matched_rec = (
-            db.query(BOLRecord)
-            .filter(BOLRecord.invoice_number == invoice_no)
-            .first()
-        )
-        if matched_rec is not None:
-            match_strategy = "invoice_number"
-        # Fallback: match by Job Name → trip suffix.
-        if matched_rec is None:
-            for row_obj in db.query(BOLRecord).all():
-                trip = row_obj.technique_trip or ""
-                if trip and _trip_to_suffix(trip) == job_name:
-                    matched_rec = row_obj
-                    match_strategy = "job_name"
-                    break
+    # Prophecy BOL lives in Job Name only — the BOL No column is always a permit number.
+    effective_prophecy_bol = job_name if job_name and _is_prophecy_bol(job_name) else None
 
-    # Strategy 2: Job Name may be the Prophecy BOL number (non-comingle only).
-    if matched_rec is None and not (cust_job_no or "").upper().startswith("CM"):
-        try:
-            bol_num = int(job_name)
+    if effective_prophecy_bol:
+        # ── Wolf/311 path ─────────────────────────────────────────────────────
+        # Job Name is a Prophecy BOL (14xxxx). No Technique trip for this load.
+        bol_num = int(effective_prophecy_bol)
+        if settings.USE_MOCK_DATA:
+            for rec in _mock_state.values():
+                if rec.get("bol_number") == bol_num:
+                    matched_rec = rec
+                    match_strategy = "prophecy_bol"
+                    break
+        else:
+            matched_rec = (
+                db.query(BOLRecord)
+                .filter(BOLRecord.bol_number == bol_num)
+                .first()
+            )
+            if matched_rec is not None:
+                match_strategy = "prophecy_bol"
+    else:
+        # ── Corp / Technique path ─────────────────────────────────────────────
+        # Job Name is the trip suffix (e.g. "110810" → TEC_T_0110810).
+
+        # 1. Already uploaded: match by Z-number.
+        if settings.USE_MOCK_DATA:
+            for rec in _mock_state.values():
+                if rec.get("invoice_number") == invoice_no:
+                    matched_rec = rec
+                    match_strategy = "invoice_number"
+                    break
+        else:
+            matched_rec = (
+                db.query(BOLRecord)
+                .filter(BOLRecord.invoice_number == invoice_no)
+                .first()
+            )
+            if matched_rec is not None:
+                match_strategy = "invoice_number"
+
+        # 2. Job Name as trip suffix.
+        if matched_rec is None and job_name:
             if settings.USE_MOCK_DATA:
                 for rec in _mock_state.values():
-                    if rec.get("bol_number") == bol_num:
+                    trip = rec.get("technique_trip") or ""
+                    if trip and _trip_to_suffix(trip) == job_name:
                         matched_rec = rec
-                        match_strategy = "bol_number"
+                        match_strategy = "job_name"
                         break
             else:
-                matched_rec = (
-                    db.query(BOLRecord)
-                    .filter(BOLRecord.bol_number == bol_num)
-                    .first()
-                )
-                if matched_rec is not None:
-                    match_strategy = "bol_number"
-        except (ValueError, TypeError):
-            pass
+                for row_obj in db.query(BOLRecord).filter(
+                    BOLRecord.technique_trip.isnot(None)
+                ).all():
+                    if _trip_to_suffix(row_obj.technique_trip or "") == job_name:
+                        matched_rec = row_obj
+                        match_strategy = "job_name"
+                        break
 
-    # Strategy 3: pallets + pieces match (last resort, non-comingle only).
-    # Requires both to match to reduce false positives. Skipped if ambiguous.
-    if matched_rec is None and not (cust_job_no or "").upper().startswith("CM") and total_pallets and total_pcs:
-        if settings.USE_MOCK_DATA:
-            candidates = [
-                rec for rec in _mock_state.values()
-                if rec.get("technique_pallets") == total_pallets
-                and rec.get("technique_pcs") == total_pcs
-                and not rec.get("invoice_number")
-                and rec.get("technique_trip") is not None
-            ]
-            if len(candidates) == 1:
-                matched_rec = candidates[0]
-                match_strategy = "pallets_pieces"
-                logger.warning("[INVOICE] Strategy pallets+pieces matched %s to %s — verify manually",
-                               invoice_no, matched_rec.get("technique_trip"))
-        else:
-            candidates = db.query(BOLRecord).filter(
-                BOLRecord.technique_pallets == total_pallets,
-                BOLRecord.technique_pcs == total_pcs,
-                BOLRecord.invoice_number.is_(None),
-                BOLRecord.technique_trip.isnot(None),
-            ).all()
-            if len(candidates) == 1:
-                matched_rec = candidates[0]
-                match_strategy = "pallets_pieces"
-                logger.warning("[INVOICE] Strategy pallets+pieces matched %s to %s — verify manually",
-                               invoice_no, matched_rec.technique_trip)
+        # 3. Pallets + pieces (last resort, non-comingle only).
+        if matched_rec is None and not (cust_job_no or "").upper().startswith("CM") \
+                and total_pallets and total_pcs:
+            if settings.USE_MOCK_DATA:
+                candidates = [
+                    rec for rec in _mock_state.values()
+                    if rec.get("technique_pallets") == total_pallets
+                    and rec.get("technique_pcs") == total_pcs
+                    and not rec.get("invoice_number")
+                    and rec.get("technique_trip") is not None
+                ]
+                if len(candidates) == 1:
+                    matched_rec = candidates[0]
+                    match_strategy = "pallets_pieces"
+                    logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
+                                   invoice_no, matched_rec.get("technique_trip"))
+            else:
+                candidates = db.query(BOLRecord).filter(
+                    BOLRecord.technique_pallets == total_pallets,
+                    BOLRecord.technique_pcs == total_pcs,
+                    BOLRecord.invoice_number.is_(None),
+                    BOLRecord.technique_trip.isnot(None),
+                ).all()
+                if len(candidates) == 1:
+                    matched_rec = candidates[0]
+                    match_strategy = "pallets_pieces"
+                    logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
+                                   invoice_no, matched_rec.technique_trip)
 
     if matched_rec is None:
-        auto_note = (
-            f"Comingle — no Technique match. Cust Job No: {cust_job_no}"
-            if (cust_job_no or "").upper().startswith("CM")
-            else f"No Technique trip for job name '{job_name}'. Validate manually."
-        )
+        is_wolf_stub = bool(effective_prophecy_bol)
+        stub_bol_number = int(effective_prophecy_bol) if is_wolf_stub else None
+        if is_wolf_stub:
+            auto_note = f"Wolf/311 load — Prophecy BOL {alg_bol_no}. No matching morning record found."
+        elif (cust_job_no or "").upper().startswith("CM"):
+            auto_note = f"Comingle — no Technique match. Cust Job No: {cust_job_no}"
+        else:
+            auto_note = f"No Technique trip for job name '{job_name}'. Validate manually."
+
         amount_dec_s = Decimal(str(round(total_billed, 2))) if total_billed is not None else None
         alg_weight_dec_s = Decimal(str(round(total_weight, 2))) if total_weight else None
         # access_prog requires Technique weight/ZIP data — not available for unmatched stubs.
@@ -1161,7 +1180,7 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
                 "id": stub_id,
                 "technique_trip": None,
                 "manifest": None,
-                "bol_number": None,
+                "bol_number": stub_bol_number,
                 "inv_job_number": job_name,
                 "invoice_number": invoice_no,
                 "amount": amount_dec_s,
@@ -1176,6 +1195,9 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
                 "weight_diff": None,
                 "pallet_diff": None,
                 "pcs_diff": None,
+                "prophecy_weight": None,
+                "prophecy_pallets": None,
+                "prophecy_pcs": None,
                 "notes": auto_note,
                 "status": "pending",
                 "flag_reason": None,
@@ -1193,6 +1215,7 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
                 technique_weight  = Decimal("0"),
                 technique_pallets = 0,
                 technique_pcs     = 0,
+                bol_number        = stub_bol_number,
                 inv_job_number    = job_name,
                 invoice_number    = invoice_no,
                 amount            = amount_dec_s,
@@ -1208,9 +1231,18 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
             )
             db.add(stub)
             db.commit()
+            # For Wolf/311 stubs: try to fill Prophecy quantities immediately.
+            if is_wolf_stub and stub_bol_number:
+                from backend.data_layer import get_prophecy_data as _get_prophecy_data
+                prop = _get_prophecy_data(stub_bol_number)
+                if prop:
+                    stub.prophecy_weight  = prop["prophecy_weight"]
+                    stub.prophecy_pallets = prop["prophecy_pallets"]
+                    stub.prophecy_pcs     = prop["prophecy_pcs"]
+                    db.commit()
         logger.info(
-            "[INVOICE] %s → no Technique match, stub created (job_name=%s, note=%s)",
-            invoice_no, job_name, auto_note,
+            "[INVOICE] %s → no match, stub created (bol=%s, note=%s)",
+            invoice_no, stub_bol_number, auto_note,
         )
         return {
             "matched": False,
@@ -1226,7 +1258,7 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
             "amount": total_billed,
             "fsc_pct": fsc_rate_val,
             "fsc_cost": fsc_cost_val,
-            "message": f"Invoice {invoice_no} has no Technique match — stub record created. {auto_note}",
+            "message": f"Invoice {invoice_no} has no match — stub record created. {auto_note}",
         }
 
     amount_dec = Decimal(str(round(total_billed, 2))) if total_billed is not None else None
@@ -1279,19 +1311,24 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
             matched_rec["cost_pct"] = round(
                 float(matched_rec["amount"]) / float(matched_rec["access_prog"]), 6
             )
-        # Diffs: ALG invoice vs Technique quantities
-        alg_w = matched_rec.get("alg_weight")
-        tech_w = matched_rec.get("technique_weight")
-        if alg_w is not None and tech_w:
-            matched_rec["weight_diff"] = round(float(alg_w) - float(tech_w), 2)
+        # Diffs: ALG vs Prophecy for Wolf/311, ALG vs Technique for Corp.
+        alg_w   = matched_rec.get("alg_weight")
         alg_pal = matched_rec.get("alg_pallets")
-        tech_pal = matched_rec.get("technique_pallets")
-        if alg_pal is not None and tech_pal is not None:
-            matched_rec["pallet_diff"] = alg_pal - tech_pal
-        alg_p = matched_rec.get("alg_pcs")
-        tech_p = matched_rec.get("technique_pcs")
-        if alg_p is not None and tech_p is not None:
-            matched_rec["pcs_diff"] = alg_p - tech_p
+        alg_p   = matched_rec.get("alg_pcs")
+        if match_strategy == "prophecy_bol":
+            ref_w   = matched_rec.get("prophecy_weight")
+            ref_pal = matched_rec.get("prophecy_pallets")
+            ref_p   = matched_rec.get("prophecy_pcs")
+        else:
+            ref_w   = matched_rec.get("technique_weight")
+            ref_pal = matched_rec.get("technique_pallets")
+            ref_p   = matched_rec.get("technique_pcs")
+        if alg_w is not None and ref_w:
+            matched_rec["weight_diff"] = round(float(alg_w) - float(ref_w), 2)
+        if alg_pal is not None and ref_pal is not None:
+            matched_rec["pallet_diff"] = alg_pal - ref_pal
+        if alg_p is not None and ref_p is not None:
+            matched_rec["pcs_diff"] = alg_p - ref_p
         matched_rec["updated_at"] = datetime.now(timezone.utc)
         matched_trip = matched_rec.get("technique_trip")
         matched_manifest = matched_rec.get("manifest")
@@ -1335,15 +1372,32 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
             matched_rec.cost_pct = Decimal(
                 str(round(float(matched_rec.amount) / float(matched_rec.access_prog), 6))
             )
-        # Diffs: ALG invoice vs Technique quantities
-        if matched_rec.alg_weight is not None and matched_rec.technique_weight:
-            matched_rec.weight_diff = Decimal(str(round(
-                float(matched_rec.alg_weight) - float(matched_rec.technique_weight), 2
-            )))
-        if matched_rec.alg_pallets is not None and matched_rec.technique_pallets is not None:
-            matched_rec.pallet_diff = matched_rec.alg_pallets - matched_rec.technique_pallets
-        if matched_rec.alg_pcs is not None and matched_rec.technique_pcs is not None:
-            matched_rec.pcs_diff = matched_rec.alg_pcs - matched_rec.technique_pcs
+        # Wolf/311: fill Prophecy weight/pallets/pcs from ShipperPlus, then diff against Prophecy.
+        if match_strategy == "prophecy_bol" and effective_prophecy_bol:
+            from backend.data_layer import get_prophecy_data as _get_prophecy_data
+            prop = _get_prophecy_data(int(effective_prophecy_bol))
+            if prop:
+                matched_rec.prophecy_weight  = prop["prophecy_weight"]
+                matched_rec.prophecy_pallets = prop["prophecy_pallets"]
+                matched_rec.prophecy_pcs     = prop["prophecy_pcs"]
+                if matched_rec.alg_weight is not None and prop["prophecy_weight"]:
+                    matched_rec.weight_diff = Decimal(str(round(
+                        float(matched_rec.alg_weight) - float(prop["prophecy_weight"]), 2
+                    )))
+                if matched_rec.alg_pallets is not None and prop["prophecy_pallets"] is not None:
+                    matched_rec.pallet_diff = matched_rec.alg_pallets - prop["prophecy_pallets"]
+                if matched_rec.alg_pcs is not None and prop["prophecy_pcs"] is not None:
+                    matched_rec.pcs_diff = matched_rec.alg_pcs - prop["prophecy_pcs"]
+        else:
+            # Corp/Technique: diff against Technique quantities.
+            if matched_rec.alg_weight is not None and matched_rec.technique_weight:
+                matched_rec.weight_diff = Decimal(str(round(
+                    float(matched_rec.alg_weight) - float(matched_rec.technique_weight), 2
+                )))
+            if matched_rec.alg_pallets is not None and matched_rec.technique_pallets is not None:
+                matched_rec.pallet_diff = matched_rec.alg_pallets - matched_rec.technique_pallets
+            if matched_rec.alg_pcs is not None and matched_rec.technique_pcs is not None:
+                matched_rec.pcs_diff = matched_rec.alg_pcs - matched_rec.technique_pcs
         db.commit()
         db.refresh(matched_rec)
         matched_trip = matched_rec.technique_trip

@@ -184,7 +184,7 @@ All queries connect to AWP-SQL-PROD. TECH, SegGroup, and SQLAPPS3 are linked ser
 | `get_manifest_weights(manifests)` | ✅ Implemented | weight, pieces, pallets per manifest (separate query) |
 | `get_pallet_data_for_manifests(manifests)` | ✅ Implemented | pallet rows for SID export; `Dest ID` = `Locations.AccountNumber` (e.g. `SCF606`) — **field uncertain, see Open Question #2** |
 | `get_tariff_rate(zip3, weight)` | ✅ Implemented | `access_prog` = base rate × (1 + FSC) from PostgreSQL |
-| `get_prophecy_data(bol_number)` | ⬜ Stub | prop_reship, prophecy weight/pallets/pcs — needs Megha |
+| `get_prophecy_data(bol_number)` | ✅ Implemented | prophecy weight/pallets/pcs from ShipperPlus via SG360-TECH-PRD1 (primary) or SQLAPPS3 (fallback); pallet count formula needs Megha confirmation |
 | `get_alg_invoice(invoice_number)` | ⬜ Stub | Z-number, amount, alg weight/pal/pcs — workaround: manual CSV upload |
 
 **Weight split**: `get_technique_data()` does NOT return weight. The morning pull (`POST /api/admin/pull`) always calls both Query A (`get_technique_data`) + Query B (`get_manifest_weights`) and merges by manifest number.
@@ -247,7 +247,7 @@ backend/main.py          — All routes in one file (Module 1 only; split by mod
 backend/config.py        — Pydantic BaseSettings; loads .env with typed defaults for all keys (DB, SMTP,
                            EIA API, IMAP, USE_MOCK_DATA). Single source of truth for config — no hardcoded
                            values elsewhere.
-backend/data_layer.py    — The integration boundary; implement get_prophecy_data + get_alg_invoice to finish live mode
+backend/data_layer.py    — The integration boundary; get_prophecy_data implemented; get_alg_invoice still stub (workaround: manual CSV upload)
 backend/mock_data.py     — 12 records at real scale; safe to delete when DB is live
 backend/email_parser.py  — O365 IMAP4_SSL polling (outlook.office365.com:993); marks emails read even
                            with no CSV attachment (prevents re-scan loop on next poll)
@@ -279,7 +279,7 @@ frontend/src/components/
 
 ## Known bugs
 
-**`days_back` default is 10**, but invoices lag 11–18 days from despatch — matching fails unless `?days_back=20` is passed explicitly. The default needs to be raised in two places: `get_technique_data(days_back=10)` in `data_layer.py` and the `pull_technique_data()` route default in `main.py`. Until changed, pass `?days_back=20` on the `POST /api/admin/pull` call.
+**`days_back` is now hardcoded to 1** in `pull_technique_data()` in `main.py`. This is intentional for the daily pull workflow — morning pull always grabs today's manifests only.
 
 **Mock state** (`_mock_state` in `main.py`): in-memory dict initialized from `MOCK_BOLS` at startup. Mutations (approvals, flags, invoice uploads) survive the process lifetime but reset on every backend restart. Restart the backend to reset all records to their initial pending state during development.
 
