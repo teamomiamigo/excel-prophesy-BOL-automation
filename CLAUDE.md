@@ -60,6 +60,10 @@ SMTP_USER=user@sg360.com
 SMTP_PASSWORD=
 ALG_SENDER_EMAIL=               # Tanya's email address — filters IMAP search to her messages only
 IMAP_MAILBOX=INBOX              # folder to poll (default INBOX)
+INVOICE_FOLDER=\\sg360-wbapp-prd\Logistics\AgentsInvoices\Invoices to Process
+TECH_PRD1_SERVER=SG360-TECH-PRD1  # direct ShipperPlus host (default); used by get_prophecy_data()
+TECH_PRD1_USER=                 # blank = Windows auth to SG360-TECH-PRD1
+TECH_PRD1_PASSWORD=
 ```
 
 **Live-mode extra dependencies** (not in `requirements.txt` — install separately when going live):
@@ -89,7 +93,7 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/admin/reset-invoices` | Dev: clear invoice fields on all records + delete invoice-only stubs |
 | POST | `/api/invoices/upload` | Upload ALG invoice CSV (Z-number format) → match + update record; response includes `conflict` key if trip already had an invoice |
 | GET | `/api/invoices/{z}/file` | Serve original Z-number CSV from `INVOICE_FOLDER` (or `test_data/` in mock mode) |
-| POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` path for unprocessed CSVs → process each |
+| POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` path for unprocessed CSVs → process each; files stay in place, dedup via DB `invoice_number` |
 | GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only) |
 | POST | `/api/export` | Generate accounting CSV and email to Mary + Katie |
 | GET | `/api/logs` | All records across all dates; optional `?start_date=` / `?end_date=` / `?status=` filters |
@@ -235,7 +239,11 @@ Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — show
 - `bol_number` nullable Integer
 - `Numeric(12,2)` for weights (up to 416,000 lbs)
 - `Numeric(10,2)` for dollar amounts
-- `Numeric(8,6)` for cost_pct ratio
+- `Numeric(8,6)` for cost_pct / fsc_pct ratios
+- `base_tariff` / `fsc_pct` (Numeric): rate breakdown tooltip; `access_prog = base_tariff × (1 + fsc_pct)`
+- `is_third_party` / `is_ignored` (Boolean): both exclude from SID + accounting exports; reversible
+- `needs_sid_export` (Boolean): True = Type A record (no BOL yet); False = Type B (BOL already in Prophecy)
+- `match_strategy` (String): how the invoice was matched — `"trip"`, `"bol"`, or null for stubs
 - `accounting_exported_at` nullable DateTime — set when "Send to Accounting" runs; exposed in Log tab
 - `approval_history` table for full audit trail
 - `users` table stubbed for future auth
@@ -256,6 +264,10 @@ backend/email_service.py — SMTP STARTTLS export; returns False (soft-fail, no 
 backend/csv_export.py    — Three exports: accounting CSV (18 cols), Prophecy SID (13 cols with underscore
                            names — any column name difference breaks Prophecy import),
                            generate_mock_sid_rows() for mock-mode SID
+backend/models.py        — All SQLAlchemy ORM models (BOLRecord, TariffRate, FuelSurchargeRate,
+                           ApprovalHistory, User) + all Pydantic schemas (BOLSummary, etc.).
+                           ⚠️ The FuelSurchargeRate docstring says "fsc_amount/100" — this is WRONG.
+                           The actual stored value is a decimal fraction (0.365 = 36.5%); do NOT divide by 100.
 backend/database.py      — SQLAlchemy engine; pool_pre_ping=True is required for RDS idle-timeout reconnect
 backend/test_data/       — Sample ALG invoice CSVs for testing the upload flow in mock mode
                            Z555226_test.csv → matches trip TEC_T_0109888 (BOL No 109888)

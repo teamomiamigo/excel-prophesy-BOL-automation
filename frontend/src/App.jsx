@@ -26,7 +26,8 @@ export default function App() {
   const [sidLoading, setSidLoading] = useState(false);
   const [invoiceUploading, setInvoiceUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(null);
-  const [uploadResults, setUploadResults] = useState(null); // { matched, unmatched, errors }
+  const [uploadResults, setUploadResults] = useState(null); // { matched, unmatched, errors, conflicts }
+  const [pollResults, setPollResults] = useState(null);     // same shape, from poll-folder
   const [unapprovingId, setUnapprovingId] = useState(null);
   const [unflaggingId, setUnflaggingId] = useState(null);
   const [markingThirdPartyId, setMarkingThirdPartyId] = useState(null);
@@ -252,12 +253,27 @@ export default function App() {
 
   async function handlePollFolder() {
     setPollFolderLoading(true);
+    setPollResults(null);
     try {
       const res = await fetch('/api/invoices/poll-folder', { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || `Folder poll failed (${res.status})`);
-      setSuccessMessage(data.message || 'Invoice folder checked.');
-      if ((data.found || 0) > 0) {
+
+      if ((data.found || 0) === 0) {
+        setSuccessMessage(data.message || 'No new invoice files found.');
+      } else {
+        const matched = [], unmatched = [], errors = [], conflicts = [];
+        for (const r of (data.processed || [])) {
+          if (r.error) {
+            errors.push({ name: r.filename || r.invoice_number || '?', msg: r.error });
+          } else if (r.matched && r.match_strategy !== 'invoice_only') {
+            matched.push({ name: r.invoice_number, invoice: r.invoice_number, trip: r.matched_trip, strategy: r.match_strategy });
+            if (r.conflict) conflicts.push(r.conflict);
+          } else {
+            unmatched.push({ name: r.invoice_number, invoice: r.invoice_number, jobName: r.job_name, note: r.message });
+          }
+        }
+        setPollResults({ matched, unmatched, errors, conflicts });
         await Promise.all([fetchPending(), fetchApproved()]);
       }
     } catch (err) {
@@ -562,6 +578,57 @@ export default function App() {
                       ⚠ {uploadResults.conflicts.length} invoice conflict{uploadResults.conflicts.length > 1 ? 's' : ''} — auto-merged, review recommended
                     </div>
                     {uploadResults.conflicts.map((c, i) => (
+                      <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 12, color: '#374151', marginBottom: 4 }}>
+                        <span style={{ fontWeight: 600, color: '#92400e' }}>{c.invoice_number}</span>
+                        <span>auto-merged with {c.matched_trip} (already had {c.existing_invoice})</span>
+                        <button
+                          onClick={() => setReassignTargetId(c.record_id)}
+                          style={{ marginLeft: 'auto', background: '#fff7ed', border: '1px solid #fed7aa', borderRadius: 4, padding: '2px 8px', fontSize: 11, fontWeight: 600, color: '#c2410c', cursor: 'pointer' }}
+                        >
+                          Reassign
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {pollResults && (pollResults.matched.length + pollResults.unmatched.length + pollResults.errors.length > 0) && (
+              <div style={{ marginBottom: 16, border: '1px solid #e5e7eb', borderRadius: 6, overflow: 'hidden', fontSize: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: '#f9fafb', borderBottom: '1px solid #e5e7eb' }}>
+                  <span style={{ fontWeight: 600, color: '#374151' }}>
+                    Pull Invoices Results — {pollResults.matched.length} matched &nbsp;·&nbsp; {pollResults.unmatched.length} unmatched &nbsp;·&nbsp; {pollResults.errors.length} errors
+                  </span>
+                  <button onClick={() => setPollResults(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#9ca3af', fontSize: 14, lineHeight: 1 }}>✕</button>
+                </div>
+                {pollResults.matched.map((r, i) => (
+                  <div key={i} style={{ display: 'flex', gap: 12, padding: '5px 12px', background: '#f0fdf4', borderBottom: '1px solid #dcfce7', alignItems: 'center' }}>
+                    <span style={{ color: '#16a34a', fontWeight: 700, minWidth: 14 }}>✓</span>
+                    <span style={{ fontWeight: 600, color: '#166534', minWidth: 90 }}>{r.invoice}</span>
+                    <span style={{ marginLeft: 'auto', color: '#6b7280' }}>→ {r.trip} <span style={{ background: '#dcfce7', color: '#166534', borderRadius: 3, padding: '1px 5px', fontSize: 11 }}>{r.strategy}</span></span>
+                  </div>
+                ))}
+                {pollResults.unmatched.map((r, i) => (
+                  <div key={i} style={{ display: 'flex', gap: 12, padding: '5px 12px', background: '#fffbeb', borderBottom: '1px solid #fef3c7', alignItems: 'center' }}>
+                    <span style={{ color: '#d97706', fontWeight: 700, minWidth: 14 }}>—</span>
+                    <span style={{ fontWeight: 600, color: '#92400e', minWidth: 90 }}>{r.invoice}</span>
+                    <span style={{ marginLeft: 'auto', color: '#6b7280', fontStyle: 'italic' }}>{r.note}</span>
+                  </div>
+                ))}
+                {pollResults.errors.map((r, i) => (
+                  <div key={i} style={{ display: 'flex', gap: 12, padding: '5px 12px', background: '#fef2f2', borderBottom: '1px solid #fecaca', alignItems: 'center' }}>
+                    <span style={{ color: '#dc2626', fontWeight: 700, minWidth: 14 }}>✕</span>
+                    <span style={{ color: '#374151' }}>{r.name}</span>
+                    <span style={{ marginLeft: 'auto', color: '#991b1b' }}>{r.msg}</span>
+                  </div>
+                ))}
+                {(pollResults.conflicts || []).length > 0 && (
+                  <div style={{ background: '#fffbeb', borderTop: '2px solid #fcd34d', padding: '8px 12px' }}>
+                    <div style={{ fontWeight: 700, color: '#92400e', marginBottom: 6, fontSize: 12 }}>
+                      ⚠ {pollResults.conflicts.length} invoice conflict{pollResults.conflicts.length > 1 ? 's' : ''} — auto-merged, review recommended
+                    </div>
+                    {pollResults.conflicts.map((c, i) => (
                       <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 12, color: '#374151', marginBottom: 4 }}>
                         <span style={{ fontWeight: 600, color: '#92400e' }}>{c.invoice_number}</span>
                         <span>auto-merged with {c.matched_trip} (already had {c.existing_invoice})</span>
