@@ -67,14 +67,16 @@ export default function LogSection() {
   const [error, setError] = useState(null);
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
+  const [senderFilter, setSenderFilter] = useState('');
 
-  async function fetchLogs(sd, ed) {
+  async function fetchLogs(sd, ed, sender) {
     setLoading(true);
     setError(null);
     try {
       const params = new URLSearchParams();
       if (sd) params.set('start_date', sd);
       if (ed) params.set('end_date', ed);
+      if (sender) params.set('invoice_sender', sender);
       const res = await fetch(`/api/logs?${params}`);
       if (!res.ok) throw new Error(`Server error ${res.status}`);
       setRecords(await res.json());
@@ -85,17 +87,25 @@ export default function LogSection() {
     }
   }
 
-  useEffect(() => { fetchLogs('', ''); }, []);
+  useEffect(() => { fetchLogs('', '', ''); }, []);
 
   function handleFilter(e) {
     e.preventDefault();
-    fetchLogs(startDate, endDate);
+    fetchLogs(startDate, endDate, senderFilter);
+  }
+
+  function handleClear() {
+    setStartDate('');
+    setEndDate('');
+    setSenderFilter('');
+    fetchLogs('', '', '');
   }
 
   function handleExport() {
     const params = new URLSearchParams();
     if (startDate) params.set('start_date', startDate);
     if (endDate) params.set('end_date', endDate);
+    if (senderFilter) params.set('invoice_sender', senderFilter);
     window.location.href = `/api/logs/export?${params}`;
   }
 
@@ -106,7 +116,14 @@ export default function LogSection() {
           Log — Approved Records ({records.length})
         </h2>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <form onSubmit={handleFilter} style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <form onSubmit={handleFilter} style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+            <input
+              type="text"
+              value={senderFilter}
+              onChange={e => setSenderFilter(e.target.value)}
+              placeholder="Sender (e.g. Tania)"
+              style={{ border: '1px solid #d1d5db', borderRadius: 4, padding: '4px 8px', fontSize: 12, width: 140 }}
+            />
             <input
               type="date"
               value={startDate}
@@ -135,10 +152,10 @@ export default function LogSection() {
             >
               Filter
             </button>
-            {(startDate || endDate) && (
+            {(startDate || endDate || senderFilter) && (
               <button
                 type="button"
-                onClick={() => { setStartDate(''); setEndDate(''); fetchLogs('', ''); }}
+                onClick={handleClear}
                 style={{
                   background: '#fff',
                   color: '#6b7280',
@@ -192,6 +209,7 @@ export default function LogSection() {
                 <th style={TH}>Trip</th>
                 <th style={TH}>Manifest</th>
                 <th style={TH}>BOL</th>
+                <th style={TH}>Invoice Sender</th>
                 <th style={TH}>Invoice #</th>
                 <th style={{ ...TH, textAlign: 'right' }}>Amount</th>
                 <th style={{ ...TH, textAlign: 'right' }}>Calc Cost</th>
@@ -212,6 +230,7 @@ export default function LogSection() {
                   <td style={{ ...TD, color: '#6b7280' }}>{r.technique_trip || '—'}</td>
                   <td style={TD}>{r.manifest || '—'}</td>
                   <td style={TD}>{r.bol_number ?? <span style={{ color: '#9ca3af' }}>—</span>}</td>
+                  <td style={{ ...TD, color: '#6b7280', fontSize: 12 }}>{r.invoice_email_sender || '—'}</td>
                   <td style={{ ...TD, fontWeight: 600 }}>{r.invoice_number || '—'}</td>
                   <td style={{ ...TD_R, fontWeight: 600 }}>{fmtMoney(r.amount)}</td>
                   <td style={TD_R}>{fmtMoney(r.access_prog)}</td>

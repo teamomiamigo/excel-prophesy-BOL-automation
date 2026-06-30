@@ -39,6 +39,10 @@ export default function App() {
   const [pullLoading, setPullLoading] = useState(false);
   const [pollFolderLoading, setPollFolderLoading] = useState(false);
   const [filterText, setFilterText] = useState('');
+  const [uploadSender, setUploadSender] = useState('');
+  const [uploadDate, setUploadDate] = useState('');
+  const [uploadTime, setUploadTime] = useState('');
+  const [showSenderFields, setShowSenderFields] = useState(false);
   const [sidExportedThisSession, setSidExportedThisSession] = useState(false);
 
   const thirdPartyBols     = pendingBols.filter(b => b.is_third_party);
@@ -176,6 +180,9 @@ export default function App() {
       setUploadProgress(`${i + 1} of ${files.length}`);
       const form = new FormData();
       form.append('file', files[i]);
+      if (uploadSender) form.append('invoice_sender', uploadSender);
+      if (uploadDate) form.append('invoice_date', uploadDate);
+      if (uploadTime) form.append('invoice_time', uploadTime);
       try {
         const res = await fetch('/api/invoices/upload', { method: 'POST', body: form });
         const data = await res.json().catch(() => ({}));
@@ -538,8 +545,49 @@ export default function App() {
                     onChange={handleInvoiceUpload}
                   />
                 </label>
+                <button
+                  type="button"
+                  onClick={() => setShowSenderFields(v => !v)}
+                  title="Add sender info for manual uploads"
+                  style={{
+                    background: showSenderFields ? '#fef3c7' : '#fff',
+                    color: '#92400e',
+                    border: '1px solid #fde68a',
+                    borderRadius: 5,
+                    padding: '4px 10px',
+                    fontSize: 12,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {showSenderFields ? '▲ Sender' : '▼ Sender'}
+                </button>
               </span>
             </div>
+            {showSenderFields && (
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '8px 14px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 6, marginBottom: 12, fontSize: 12 }}>
+                <span style={{ fontWeight: 600, color: '#92400e', whiteSpace: 'nowrap' }}>Sender info for manual upload:</span>
+                <input
+                  type="text"
+                  value={uploadSender}
+                  onChange={e => setUploadSender(e.target.value)}
+                  placeholder="Sender name (e.g. Tania)"
+                  style={{ border: '1px solid #d1d5db', borderRadius: 4, padding: '4px 8px', fontSize: 12, width: 160 }}
+                />
+                <input
+                  type="date"
+                  value={uploadDate}
+                  onChange={e => setUploadDate(e.target.value)}
+                  style={{ border: '1px solid #d1d5db', borderRadius: 4, padding: '4px 8px', fontSize: 12 }}
+                />
+                <input
+                  type="time"
+                  value={uploadTime}
+                  onChange={e => setUploadTime(e.target.value)}
+                  style={{ border: '1px solid #d1d5db', borderRadius: 4, padding: '4px 8px', fontSize: 12 }}
+                />
+                <span style={{ color: '#9ca3af' }}>Optional — leave blank if unknown</span>
+              </div>
+            )}
 
             {uploadResults && (uploadResults.matched.length + uploadResults.unmatched.length + uploadResults.errors.length > 0) && (
               <div style={{ marginBottom: 16, border: '1px solid #e5e7eb', borderRadius: 6, overflow: 'hidden', fontSize: 12 }}>

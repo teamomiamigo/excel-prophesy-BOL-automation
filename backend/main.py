@@ -9,7 +9,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from fastapi import FastAPI, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import FastAPI, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import text
@@ -44,8 +44,9 @@ async def lifespan(app: FastAPI):
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS fsc_pct NUMERIC(8,6)"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_third_party BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_ignored BOOLEAN NOT NULL DEFAULT FALSE"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS invoice_sent_at TIMESTAMP WITH TIME ZONE"))
             _conn.commit()
-        logger.info("DB column migration for base_tariff/fsc_pct/is_third_party/is_ignored complete.")
+        logger.info("DB column migration for base_tariff/fsc_pct/is_third_party/is_ignored/invoice_sent_at complete.")
     logger.info(
         "SG360 BOL API started. Mock mode: %s | Version: %s",
         settings.USE_MOCK_DATA,
@@ -956,7 +957,51 @@ def pull_technique_data(db: Session = Depends(get_db)):
 # Invoice CSV processing — shared by upload endpoint and email poller
 # ---------------------------------------------------------------------------
 
-def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
+def _parse_invoice_folder_name(name: str) -> "tuple[str, datetime] | None":
+    """
+    Parse a subfolder name like 'Tania 6-25-2026  4-16PM' into
+    (display_string, datetime).  Returns None if the name doesn't match.
+
+    Expected parts (split on whitespace, empty parts dropped):
+        [0] sender name   e.g. 'Tania'
+        [1] date          e.g. '6-25-2026'  (M-D-YYYY)
+        [2] time          e.g. '4-16PM'     (H-MMAM/PM)
+    """
+    parts = [p for p in name.split() if p]
+    if len(parts) < 3:
+        return None
+    sender = parts[0]
+    date_part = parts[1]
+    time_part = parts[2]
+    try:
+        dt_date = datetime.strptime(date_part, "%m-%d-%Y")
+    except ValueError:
+        return None
+    # Parse time: '4-16PM' or '11-30AM'
+    try:
+        ampm = time_part[-2:].upper()
+        hm = time_part[:-2].split("-")
+        hour, minute = int(hm[0]), int(hm[1])
+        if ampm == "PM" and hour != 12:
+            hour += 12
+        elif ampm == "AM" and hour == 12:
+            hour = 0
+        dt = dt_date.replace(hour=hour, minute=minute, tzinfo=timezone.utc)
+    except (ValueError, IndexError):
+        return None
+    # Display string: "Tania 6/25/2026 4:16PM" — built manually for cross-platform compatibility
+    h12 = hour % 12 or 12
+    display = f"{sender} {dt_date.month}/{dt_date.day}/{dt_date.year} {h12}:{minute:02d}{ampm}"
+    return display, dt
+
+
+def _process_invoice_csv(
+    content: bytes,
+    filename: str,
+    db: Session,
+    invoice_email_sender: "str | None" = None,
+    invoice_sent_at: "datetime | None" = None,
+) -> dict:
     """
     Parse an ALG invoice CSV and match it to a BOLRecord.
 
@@ -966,6 +1011,10 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
 
     Called by both the manual upload endpoint and the email-poll endpoint so
     both paths apply identical matching and calculation logic.
+
+    invoice_email_sender / invoice_sent_at: populated from the subfolder name
+    (e.g. 'Tania 6/25/2026 4:16PM' and datetime(2026,6,25,16,16,tzinfo=utc)).
+    Left null when invoked from a flat-file scan or without metadata.
     """
     text_content = content.decode("utf-8", errors="replace")
 
@@ -1197,6 +1246,8 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
                 "prophecy_weight": None,
                 "prophecy_pallets": None,
                 "prophecy_pcs": None,
+                "invoice_email_sender": invoice_email_sender,
+                "invoice_sent_at": invoice_sent_at,
                 "notes": auto_note,
                 "status": "pending",
                 "flag_reason": None,
@@ -1211,22 +1262,24 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
             }
         else:
             stub = BOLRecord(
-                technique_weight  = Decimal("0"),
-                technique_pallets = 0,
-                technique_pcs     = 0,
-                bol_number        = stub_bol_number,
-                inv_job_number    = job_name,
-                invoice_number    = invoice_no,
-                amount            = amount_dec_s,
-                alg_weight        = alg_weight_dec_s,
-                alg_pallets       = total_pallets or None,
-                alg_pcs           = total_pcs or None,
-                access_prog       = access_prog_s,
-                cost_pct          = cost_pct_s,
-                notes             = auto_note,
-                status            = BOLStatus.PENDING,
-                match_strategy    = "invoice_only",
-                needs_sid_export  = False,
+                technique_weight      = Decimal("0"),
+                technique_pallets     = 0,
+                technique_pcs         = 0,
+                bol_number            = stub_bol_number,
+                inv_job_number        = job_name,
+                invoice_number        = invoice_no,
+                invoice_email_sender  = invoice_email_sender,
+                invoice_sent_at       = invoice_sent_at,
+                amount                = amount_dec_s,
+                alg_weight            = alg_weight_dec_s,
+                alg_pallets           = total_pallets or None,
+                alg_pcs               = total_pcs or None,
+                access_prog           = access_prog_s,
+                cost_pct              = cost_pct_s,
+                notes                 = auto_note,
+                status                = BOLStatus.PENDING,
+                match_strategy        = "invoice_only",
+                needs_sid_export      = False,
             )
             db.add(stub)
             db.commit()
@@ -1306,6 +1359,10 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
                 matched_rec["alg_pcs"] = total_pcs or None
         matched_rec["match_strategy"] = match_strategy
         matched_rec["inv_job_number"] = job_name
+        if invoice_email_sender:
+            matched_rec["invoice_email_sender"] = invoice_email_sender
+        if invoice_sent_at:
+            matched_rec["invoice_sent_at"] = invoice_sent_at
         if matched_rec.get("amount") and matched_rec.get("access_prog"):
             matched_rec["cost_pct"] = round(
                 float(matched_rec["amount"]) / float(matched_rec["access_prog"]), 6
@@ -1358,6 +1415,10 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
                 matched_rec.alg_pcs = total_pcs or None
         matched_rec.match_strategy = match_strategy
         matched_rec.inv_job_number = job_name
+        if invoice_email_sender:
+            matched_rec.invoice_email_sender = invoice_email_sender
+        if invoice_sent_at:
+            matched_rec.invoice_sent_at = invoice_sent_at
         if pallet_tariff_sum > 0 and not already_done:
             if existing_inv:
                 matched_rec.access_prog  = (matched_rec.access_prog  or Decimal("0")) + pallet_tariff_sum
@@ -1429,12 +1490,46 @@ def _process_invoice_csv(content: bytes, filename: str, db: Session) -> dict:
 async def upload_alg_invoice(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    invoice_sender: Optional[str] = Form(None),
+    invoice_date: Optional[str] = Form(None),
+    invoice_time: Optional[str] = Form(None),
 ):
-    """Upload an ALG invoice CSV (Z-number format from Tanya)."""
+    """
+    Upload an ALG invoice CSV (Z-number format from Tanya).
+
+    Optional form fields for manual uploads:
+      invoice_sender  — sender name, e.g. "Tania"
+      invoice_date    — ISO date string, e.g. "2026-06-25"
+      invoice_time    — 24h time string, e.g. "16:16"
+    """
     if not (file.filename or "").lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv files are accepted.")
     content = await file.read()
-    return _process_invoice_csv(content, file.filename or "upload.csv", db)
+
+    # Build sender metadata from optional fields
+    sender_str: Optional[str] = None
+    sent_at: Optional[datetime] = None
+    if invoice_sender and invoice_date:
+        try:
+            d = datetime.strptime(invoice_date, "%Y-%m-%d")
+            if invoice_time:
+                t = datetime.strptime(invoice_time, "%H:%M")
+                sent_dt = d.replace(hour=t.hour, minute=t.minute, tzinfo=timezone.utc)
+                h12 = t.hour % 12 or 12
+                ampm = "AM" if t.hour < 12 else "PM"
+                time_display = f"{h12}:{t.minute:02d}{ampm}"
+            else:
+                sent_dt = d.replace(tzinfo=timezone.utc)
+                time_display = ""
+            sent_at = sent_dt
+            time_part = f" {time_display}" if time_display else ""
+            sender_str = f"{invoice_sender.strip()} {d.month}/{d.day}/{d.year}{time_part}"
+        except ValueError:
+            pass  # Bad date/time format — proceed without metadata
+
+    return _process_invoice_csv(content, file.filename or "upload.csv", db,
+                                 invoice_email_sender=sender_str,
+                                 invoice_sent_at=sent_at)
 
 
 @app.get("/api/invoices/{invoice_number}/file", tags=["Invoices"])
@@ -1514,25 +1609,40 @@ def poll_invoice_folder(db: Session = Depends(get_db)):
                           .all()
         }
 
-    candidates = [
-        f for f in os.listdir(folder)
-        if f.lower().endswith(".csv")
-        and os.path.isfile(os.path.join(folder, f))
-        and os.path.splitext(f)[0].upper() not in existing_invoices
-    ]
+    # Build a list of (csv_path, fname, sender_str, sent_at) tuples to process.
+    # Priority: named subfolders (sender metadata parsed from folder name) then
+    # flat CSVs in root (no metadata — backwards-compat for test_data/ and emergencies).
+    file_queue: list[tuple[str, str, "str | None", "datetime | None"]] = []
 
-    if not candidates:
+    for entry in os.listdir(folder):
+        entry_path = os.path.join(folder, entry)
+        if os.path.isdir(entry_path):
+            parsed = _parse_invoice_folder_name(entry)
+            sender_str, sent_at = (parsed[0], parsed[1]) if parsed else (None, None)
+            if parsed:
+                logger.info("[POLL-FOLDER] Subfolder '%s' → sender='%s'", entry, sender_str)
+            else:
+                logger.info("[POLL-FOLDER] Subfolder '%s' — name not parseable, no sender metadata", entry)
+            for fname in os.listdir(entry_path):
+                if fname.lower().endswith(".csv") and os.path.splitext(fname)[0].upper() not in existing_invoices:
+                    file_queue.append((os.path.join(entry_path, fname), fname, sender_str, sent_at))
+        elif entry.lower().endswith(".csv") and os.path.isfile(entry_path):
+            if os.path.splitext(entry)[0].upper() not in existing_invoices:
+                file_queue.append((entry_path, entry, None, None))
+
+    if not file_queue:
         return {"found": 0, "processed": [], "message": "No new invoice CSV files found in folder."}
 
     results = []
-    for fname in candidates:
-        fpath = os.path.join(folder, fname)
+    for fpath, fname, sender_str, sent_at in file_queue:
         try:
             with open(fpath, "rb") as fh:
                 content = fh.read()
-            result = _process_invoice_csv(content, fname, db)
+            result = _process_invoice_csv(content, fname, db,
+                                          invoice_email_sender=sender_str,
+                                          invoice_sent_at=sent_at)
             results.append(result)
-            logger.info("[POLL-FOLDER] Processed: %s", fname)
+            logger.info("[POLL-FOLDER] Processed: %s (sender=%s)", fname, sender_str)
         except HTTPException as exc:
             results.append({"error": exc.detail, "filename": fname, "matched": False})
             logger.warning("[POLL-FOLDER] HTTPException processing %s: %s", fname, exc.detail)
@@ -1692,10 +1802,13 @@ def get_logs(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     status: Optional[str] = "approved",
+    invoice_sender: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
     """
     Historical log of approved records (default). Pass ?status=all to include pending/flagged.
+    Optional ?invoice_sender= filters by partial match on invoice_email_sender.
+    Sorted by invoice received date (invoice_sent_at) newest first, then by record creation date.
     """
     if settings.USE_MOCK_DATA:
         all_records = list(_mock_state.values())
@@ -1704,15 +1817,29 @@ def get_logs(
         if start_date:
             all_records = [
                 r for r in all_records
-                if r.get("created_at") and r["created_at"].date() >= start_date
+                if r.get("invoice_sent_at") and r["invoice_sent_at"].date() >= start_date
+                or r.get("created_at") and r["created_at"].date() >= start_date
             ]
         if end_date:
             all_records = [
                 r for r in all_records
-                if r.get("created_at") and r["created_at"].date() <= end_date
+                if r.get("invoice_sent_at") and r["invoice_sent_at"].date() <= end_date
+                or r.get("created_at") and r["created_at"].date() <= end_date
             ]
+        if invoice_sender:
+            s = invoice_sender.lower()
+            all_records = [r for r in all_records if s in (r.get("invoice_email_sender") or "").lower()]
+        # Sort: invoice_sent_at desc (nulls last), then created_at desc
+        all_records.sort(
+            key=lambda r: (
+                r.get("invoice_sent_at") is None,
+                -(r["invoice_sent_at"].timestamp() if r.get("invoice_sent_at") else 0),
+                -(r["created_at"].timestamp() if r.get("created_at") else 0),
+            )
+        )
         return [_record_to_summary(r) for r in all_records]
 
+    from sqlalchemy import nullslast
     query = db.query(BOLRecord)
     if status and status != "all":
         try:
@@ -1720,10 +1847,21 @@ def get_logs(
         except ValueError:
             pass
     if start_date:
-        query = query.filter(BOLRecord.created_at >= datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc))
+        start_dt = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc)
+        query = query.filter(
+            (BOLRecord.invoice_sent_at >= start_dt) | (BOLRecord.invoice_sent_at.is_(None) & (BOLRecord.created_at >= start_dt))
+        )
     if end_date:
-        query = query.filter(BOLRecord.created_at <= datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, tzinfo=timezone.utc))
-    return query.order_by(BOLRecord.created_at.desc()).all()
+        end_dt = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, tzinfo=timezone.utc)
+        query = query.filter(
+            (BOLRecord.invoice_sent_at <= end_dt) | (BOLRecord.invoice_sent_at.is_(None) & (BOLRecord.created_at <= end_dt))
+        )
+    if invoice_sender:
+        query = query.filter(BOLRecord.invoice_email_sender.ilike(f"%{invoice_sender}%"))
+    return query.order_by(
+        nullslast(BOLRecord.invoice_sent_at.desc()),
+        BOLRecord.created_at.desc(),
+    ).all()
 
 
 @app.get("/api/logs/export", tags=["Logs"])

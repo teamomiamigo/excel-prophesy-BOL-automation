@@ -232,6 +232,7 @@ export default function ApprovedSection({
                 <th style={{ ...TH, textAlign: 'right' }}>Wgt</th>
                 <th style={{ ...TH, textAlign: 'right' }}>Pallets</th>
                 <th style={{ ...TH, textAlign: 'right' }}>PCS</th>
+                <th style={TH}>Invoice Sender</th>
                 <th style={TH}>Invoice #</th>
                 <th style={{ ...TH, textAlign: 'right' }}>Calc Cost</th>
                 <th style={{ ...TH, textAlign: 'right' }}>Amount</th>
@@ -270,6 +271,7 @@ export default function ApprovedSection({
                     <td style={TD_R}>{fmtNum(bol.technique_weight)}</td>
                     <td style={TD_R}>{fmtNum(bol.technique_pallets)}</td>
                     <td style={TD_R}>{fmtNum(bol.technique_pcs)}</td>
+                    <td style={{ ...TD, color: '#6b7280', fontSize: 12 }}>{bol.invoice_email_sender || '—'}</td>
                     <td style={{ ...TD, fontWeight: 600 }}>{bol.invoice_number || '—'}</td>
                     <td style={TD_R}>{fmtMoney(bol.access_prog)}</td>
                     <td style={{ ...TD_R, fontWeight: 600 }}>{fmtMoney(bol.amount)}</td>
