@@ -115,6 +115,7 @@ class BOLRecord(Base):
     # ALG invoice email (from Tanya each morning)
     invoice_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
     invoice_email_sender: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    invoice_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     inv_job_number: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     carrier: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
@@ -228,6 +229,7 @@ class BOLSummary(BaseModel):
     invoice_number: Optional[str] = None
     inv_job_number: Optional[str] = None
     invoice_email_sender: Optional[str] = None
+    invoice_sent_at: Optional[datetime] = None
     prop_reship: Optional[Decimal] = None
     access_prog: Optional[Decimal] = None
     amount: Optional[Decimal] = None

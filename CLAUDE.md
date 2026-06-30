@@ -269,6 +269,8 @@ backend/models.py        — All SQLAlchemy ORM models (BOLRecord, TariffRate, F
                            ⚠️ The FuelSurchargeRate docstring says "fsc_amount/100" — this is WRONG.
                            The actual stored value is a decimal fraction (0.365 = 36.5%); do NOT divide by 100.
 backend/database.py      — SQLAlchemy engine; pool_pre_ping=True is required for RDS idle-timeout reconnect
+backend/main.py lifespan — DB schema migrations are inline `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` calls
+                           at startup (no Alembic). Add new columns here, not as separate migration scripts.
 backend/test_data/       — Sample ALG invoice CSVs for testing the upload flow in mock mode
                            Z555226_test.csv → matches trip TEC_T_0109888 (BOL No 109888)
                            Z555227_test.csv → matches trip TEC_T_0109889 (BOL No 109889)

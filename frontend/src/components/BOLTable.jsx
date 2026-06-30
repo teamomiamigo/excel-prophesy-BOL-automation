@@ -48,6 +48,7 @@ function TableHead() {
         <th style={{ ...TH_STYLE, textAlign: 'right', borderLeft: '1px solid #333' }}>ΔWgt</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>ΔPal</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>ΔPCS</th>
+        <th style={TH_STYLE}>Invoice Sender</th>
         <th style={TH_STYLE}>Invoice #</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Calc Cost</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Amount</th>
