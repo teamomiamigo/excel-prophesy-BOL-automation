@@ -13,6 +13,7 @@ Apply these rules:
 | Situation | Action |
 |---|---|
 | A GitHub issue from the backlog is being closed out (bug fix or feature done) | Append a changelog entry to `documentation/Developmental Documentation.md`, using the template embedded in that file (`### YYYY-MM-DD — #NN short title` + **What** / **Why** / **Files** / **Gotcha**). Newest entry goes at the top of the Changelog section. Pull the issue number and title from the backlog/conversation context. |
+| A new standalone project document is added, or an existing one's purpose changes significantly (e.g. `ONBOARDING.md`) | Append a changelog entry to `documentation/Developmental Documentation.md` noting the doc's name, what it covers, and why it exists — same template as above, using a short descriptive title in place of an issue number if none applies |
 | Something worth knowing surfaces that isn't tied to closing one issue (a constraint, a non-obvious fact, a gotcha) | Add a short line under the Reference section of `documentation/Developmental Documentation.md` instead of a changelog entry |
 | Anything in `frontend/` changed but no issue is being closed this commit | Bump `*updated [date]*` at the top of `documentation/Design and Workflow - BOL Reconciliation.md` |
 | New API route, new `.env` key, known bug fixed or added | Update `CLAUDE.md` with a minimal inline change only |
