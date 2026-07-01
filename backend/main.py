@@ -45,8 +45,15 @@ async def lifespan(app: FastAPI):
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_third_party BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_ignored BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS invoice_sent_at TIMESTAMP WITH TIME ZONE"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS alg_fsc_pct NUMERIC(8,6)"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS alg_fsc_cost NUMERIC(10,2)"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS tariff_zone_approximate BOOLEAN NOT NULL DEFAULT FALSE"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS weight_source_fallback BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.commit()
-        logger.info("DB column migration for base_tariff/fsc_pct/is_third_party/is_ignored/invoice_sent_at complete.")
+        logger.info(
+            "DB column migration for base_tariff/fsc_pct/is_third_party/is_ignored/invoice_sent_at/"
+            "alg_fsc_pct/alg_fsc_cost/tariff_zone_approximate/weight_source_fallback complete."
+        )
     logger.info(
         "SG360 BOL API started. Mock mode: %s | Version: %s",
         settings.USE_MOCK_DATA,
@@ -995,6 +1002,100 @@ def _parse_invoice_folder_name(name: str) -> "tuple[str, datetime] | None":
     return display, dt
 
 
+def _apply_access_prog_calc(
+    matched_rec: "BOLRecord",
+    match_strategy: "str | None",
+    effective_prophecy_bol: "str | None",
+    alg_rate_by_zip3: dict,
+    alg_pallet_fallback: list,
+    fsc_rate_val: "float | None",
+    fsc_cost_val: "float | None",
+    _get_tariff_rate,
+    _diesel_price,
+    _fsc_pct,
+) -> None:
+    """
+    Compute access_prog/base_tariff/fsc_pct from SG360's OWN pallet data (independent of
+    ALG's invoice) and set them on matched_rec, along with alg_fsc_pct/alg_fsc_cost and the
+    tariff_zone_approximate/weight_source_fallback flags. Shared by _process_invoice_csv()
+    (called live on every invoice upload) and the one-off recompute script used to bring
+    pre-#21-fix records up to date without needing a fresh invoice upload.
+
+    See CLAUDE.md's "access_prog calculation" section for the full rationale/priority order.
+    """
+    _effective_fsc_pct = Decimal(str(fsc_rate_val)) if fsc_rate_val is not None else _fsc_pct
+    matched_rec.alg_fsc_pct = Decimal(str(fsc_rate_val)) if fsc_rate_val is not None else None
+    matched_rec.alg_fsc_cost = Decimal(str(round(fsc_cost_val, 2))) if fsc_cost_val is not None else None
+
+    own_pallets: list[tuple[str, float]] = []  # (zip3, weight)
+    if match_strategy == "prophecy_bol" and effective_prophecy_bol:
+        from backend.data_layer import get_prophecy_pallet_data as _get_prophecy_pallet_data
+        for prow in _get_prophecy_pallet_data(int(effective_prophecy_bol)):
+            dest_id = prow.get("destination_id")
+            dest_zip = prow.get("destination_zip")
+            zip3 = dest_id[3:6] if dest_id and len(dest_id) >= 6 else (dest_zip[:3] if dest_zip else None)
+            weight = float(prow.get("weight") or 0)
+            if zip3 and weight > 0:
+                own_pallets.append((zip3, weight))
+    elif matched_rec.manifest:
+        from backend.data_layer import get_pallet_data_for_manifests as _get_pallet_data_for_manifests
+        for prow in _get_pallet_data_for_manifests([matched_rec.manifest]):
+            dest_id = prow.get("Dest_ID") or ""
+            weight = float(prow.get("Wgt") or 0)
+            if len(dest_id) >= 6 and weight > 0:
+                own_pallets.append((dest_id[3:6], weight))
+
+    new_tariff_sum = Decimal("0")
+    new_base_sum = Decimal("0")
+    any_approximate = False
+    if own_pallets:
+        # Real independent estimate: our own weight, per-zone rate resolved in priority
+        # order — our rate card, then this invoice's own rate for that zone (better than
+        # a numeric guess when our card has a gap), then a nearest-zone fallback as a
+        # last resort.
+        for zip3, weight in own_pallets:
+            tariff = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
+            if tariff and tariff.get("is_exact_zone_match"):
+                new_tariff_sum += tariff["access_prog"]
+                new_base_sum += tariff.get("base_tariff") or Decimal("0")
+                continue
+            alg_rate = alg_rate_by_zip3.get(zip3)
+            if alg_rate is not None:
+                base = Decimal(str(round(alg_rate * weight / 100.0, 2)))
+                with_fsc = base * (Decimal("1") + _effective_fsc_pct) if _effective_fsc_pct is not None else base
+                new_base_sum += base
+                new_tariff_sum += with_fsc
+                logger.info("[TARIFF] zip3=%s: no exact rate-card match, used this invoice's own rate %.2f", zip3, alg_rate)
+                continue
+            if tariff:
+                new_tariff_sum += tariff["access_prog"]
+                new_base_sum += tariff.get("base_tariff") or Decimal("0")
+            any_approximate = True
+        matched_rec.weight_source_fallback = False
+    else:
+        # No own pallet data available (manifest/BOL not found, not yet synced) — fall
+        # back to ALG's own invoiced weight, but flag it so this is visibly distinguishable
+        # from a real independent estimate.
+        for zip3, weight in alg_pallet_fallback:
+            tariff = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
+            if tariff:
+                new_tariff_sum += tariff["access_prog"]
+                new_base_sum += tariff.get("base_tariff") or Decimal("0")
+                if not tariff.get("is_exact_zone_match"):
+                    any_approximate = True
+        matched_rec.weight_source_fallback = True
+
+    matched_rec.tariff_zone_approximate = any_approximate
+    if new_tariff_sum > 0:
+        # Recomputed fresh from our own manifest/BOL data each time (not accumulated
+        # per-invoice) — our own weight doesn't change across multiple Z-invoices for the
+        # same trip, unlike the old ALG-weight-based calc which needed to add each
+        # invoice's own partial line items.
+        matched_rec.access_prog = new_tariff_sum
+        matched_rec.base_tariff = new_base_sum if new_base_sum > 0 else None
+        matched_rec.fsc_pct = _effective_fsc_pct
+
+
 def _process_invoice_csv(
     content: bytes,
     filename: str,
@@ -1029,9 +1130,11 @@ def _process_invoice_csv(
     fsc_cost_val: Optional[float] = None
     total_billed: Optional[float] = None
     cust_job_no: Optional[str] = None
-    pallet_tariff_sum = Decimal("0")
-    pallet_base_tariff_sum = Decimal("0")
-    pallet_fsc_pct_last: Optional[Decimal] = None
+    # Buffered from ALG's own CSV line items — used as a rate-card-gap fallback (a zone this
+    # invoice actually billed is better than guessing a "nearest zone") and as a last-resort
+    # weight source when our own pallet data (Technique/Prophecy) isn't available at all.
+    alg_rate_by_zip3: dict[str, float] = {}
+    alg_pallet_fallback: list[tuple[str, float]] = []
 
     if not settings.USE_MOCK_DATA:
         from backend.data_layer import get_tariff_rate as _get_tariff_rate
@@ -1083,14 +1186,12 @@ def _process_invoice_csv(
             raw_zip = (row.get("Zip") or "").strip()
             try:
                 gross_wt = float(row.get("GrossWt") or 0)
+                rate_val = float(row.get("Rate") or 0)
                 if raw_zip and gross_wt > 0:
-                    tariff = _get_tariff_rate(raw_zip[:3], gross_wt,
-                                              _diesel_price=_diesel_price, _fsc_pct=_fsc_pct)
-                    if tariff:
-                        pallet_tariff_sum += tariff["access_prog"]
-                        pallet_base_tariff_sum += tariff.get("base_tariff") or Decimal("0")
-                        if pallet_fsc_pct_last is None and tariff.get("fsc_pct") is not None:
-                            pallet_fsc_pct_last = tariff["fsc_pct"]
+                    zip3 = raw_zip[:3]
+                    alg_pallet_fallback.append((zip3, gross_wt))
+                    if rate_val > 0:
+                        alg_rate_by_zip3.setdefault(zip3, rate_val)
             except (ValueError, TypeError):
                 pass
 
@@ -1419,15 +1520,12 @@ def _process_invoice_csv(
             matched_rec.invoice_email_sender = invoice_email_sender
         if invoice_sent_at:
             matched_rec.invoice_sent_at = invoice_sent_at
-        if pallet_tariff_sum > 0 and not already_done:
-            if existing_inv:
-                matched_rec.access_prog  = (matched_rec.access_prog  or Decimal("0")) + pallet_tariff_sum
-                matched_rec.base_tariff  = (matched_rec.base_tariff  or Decimal("0")) + pallet_base_tariff_sum
-            else:
-                matched_rec.access_prog = pallet_tariff_sum
-                matched_rec.base_tariff = pallet_base_tariff_sum if pallet_base_tariff_sum > 0 else None
-            if pallet_fsc_pct_last is not None:
-                matched_rec.fsc_pct = pallet_fsc_pct_last
+        if not already_done:
+            _apply_access_prog_calc(
+                matched_rec, match_strategy, effective_prophecy_bol,
+                alg_rate_by_zip3, alg_pallet_fallback, fsc_rate_val, fsc_cost_val,
+                _get_tariff_rate, _diesel_price, _fsc_pct,
+            )
         if matched_rec.amount and matched_rec.access_prog:
             matched_rec.cost_pct = Decimal(
                 str(round(float(matched_rec.amount) / float(matched_rec.access_prog), 6))

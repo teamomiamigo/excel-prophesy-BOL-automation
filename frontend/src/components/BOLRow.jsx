@@ -165,8 +165,15 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
       <td style={TD_R}
         title={bol.base_tariff != null && bol.fsc_pct != null
           ? `Base: ${fmtMoney(bol.base_tariff)} × FSC (${(parseFloat(bol.fsc_pct) * 100).toFixed(1)}%) = ${fmtMoney(bol.access_prog)}`
+            + (bol.weight_source_fallback ? ' — estimate uses ALG\'s invoiced weight; our own pallet data was unavailable' : '')
+            + (bol.tariff_zone_approximate ? ' — one or more zones used a nearest-zone rate guess, not an exact match' : '')
           : undefined}
-      >{fmtMoney(bol.access_prog)}</td>
+      >
+        {fmtMoney(bol.access_prog)}
+        {(bol.weight_source_fallback || bol.tariff_zone_approximate) && (
+          <span style={{ marginLeft: 4, fontSize: 10, background: '#fef3c7', color: '#92400e', borderRadius: 3, padding: '1px 5px', fontWeight: 700, letterSpacing: '0.02em' }}>~EST</span>
+        )}
+      </td>
       <td style={{ ...TD_R, fontWeight: 600 }}>{fmtMoney(bol.amount)}</td>
 
       <td style={{ ...TD_R, ...getCostPctStyle(bol.cost_pct) }}>

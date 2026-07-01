@@ -133,6 +133,16 @@ class BOLRecord(Base):
     # Rate breakdown for tooltip: base_tariff × (1 + fsc_pct) = access_prog
     base_tariff: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     fsc_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    # ALG's own reported FSC for this invoice (from the "Fuel Surcharge" CSV footer row) —
+    # used to compute fsc_pct/access_prog instead of an EIA-diesel-derived guess.
+    alg_fsc_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    alg_fsc_cost: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    # True when any pallet's tariff lookup had to fall back to nearest-zone matching
+    # (no exact zip3 in tariff_rates, and this invoice didn't bill that zone either).
+    tariff_zone_approximate: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # True when our own pallet-level weight data (Technique/VisualMail or Prophecy) was
+    # unavailable and access_prog fell back to ALG's self-reported invoice weight.
+    weight_source_fallback: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Quantity comparisons — Technique vs ALG invoice (populated on upload)
     prophecy_weight: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
@@ -236,6 +246,10 @@ class BOLSummary(BaseModel):
     cost_pct: Optional[Decimal] = None
     base_tariff: Optional[Decimal] = None
     fsc_pct: Optional[Decimal] = None
+    alg_fsc_pct: Optional[Decimal] = None
+    alg_fsc_cost: Optional[Decimal] = None
+    tariff_zone_approximate: bool = False
+    weight_source_fallback: bool = False
     prophecy_weight: Optional[Decimal] = None
     weight_diff: Optional[Decimal] = None
     prophecy_pallets: Optional[int] = None
