@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Prerequisites**: Python 3.11+, Node.js 18+, PostgreSQL 15+ (only needed when `USE_MOCK_DATA=False`).
+
 ## Commands
 
 **Start both servers (recommended):**
@@ -40,6 +42,15 @@ Omit flags to use the default source paths under `c:\nikhilm\billing-freight-aut
 There are no automated tests. Verify changes manually via the dashboard at `http://localhost:3000` and the FastAPI docs at `http://localhost:8000/docs`.
 
 **Vite dev proxy:** The frontend calls bare `/api/*` paths. Vite proxies them to `http://localhost:8000`. Never hardcode `localhost:8000` in frontend code — the proxy handles it.
+
+**Launching the app for verification:** use the `run` skill (`.claude/skills/run`) — it starts both servers, waits for health checks, and screenshots the dashboard.
+
+## Security notes (see `documentation/SECURITY.md` for full detail)
+
+- `.env` never gets committed; real credentials live only there. `.env.example`-style placeholders are fine to commit.
+- All production DB access is intended to be read-only (SELECT-only service account) — the app writes only to its own PostgreSQL database.
+- Don't push directly to `main` once Katie is using the app day-to-day; land changes through a branch/PR.
+- No production data (real BOL/invoice exports) belongs in the repo — `test_invoices_*/` is gitignored for this reason.
 
 ## .env quick-start
 
@@ -279,6 +290,9 @@ test_invoices_0622/      — 26 real Z-number CSVs from Tanya's June 22 email (e
                            data; add to .gitignore if not already excluded.
 documentation/           — Six .md spec files (Design & Workflow, Requirements & SQL Mapping, etc.).
                            Reference for business rules and SQL source queries; not runtime code.
+                           Developmental Documentation.md is the running dev changelog — one entry
+                           per closed GitHub issue, appended by the `commit` skill. Read it for
+                           recent history that isn't yet folded into this file.
 frontend/src/App.jsx     — Owns all state + fetch/mutation handlers; passes data+callbacks down as props
 frontend/src/components/
   SummaryBar.jsx              — Pending/approved/flagged counts strip
