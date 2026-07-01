@@ -695,7 +695,7 @@ export default function App() {
 
             <BOLTable
               bols={visiblePendingBols}
-              loading={loadingPending}
+              loading={loadingPending && pendingBols.length === 0}
               approvingId={approvingId}
               unflaggingId={unflaggingId}
               markingThirdPartyId={markingThirdPartyId}
@@ -721,7 +721,7 @@ export default function App() {
 
             <ApprovedSection
               approvedBols={approvedBols}
-              loading={loadingApproved}
+              loading={loadingApproved && approvedBols.length === 0}
               sendLoading={sendLoading}
               sidLoading={sidLoading}
               sidExportedThisSession={sidExportedThisSession}
