@@ -169,26 +169,63 @@ def list_approved_bols(
     export_date: Optional[date] = None,
     db: Session = Depends(get_db),
 ):
-    """Approved records for today (or export_date if provided)."""
-    target = export_date or date.today()
+    """
+    Approved records not yet marked as sent to accounting (accounting_exported_at IS NULL).
+    Pass export_date=YYYY-MM-DD to retrieve records approved on a specific date instead
+    (used for historical CSV exports).
+    """
+    if settings.USE_MOCK_DATA:
+        return [_record_to_summary(r) for r in _mock_state.values()
+                if r["status"] == "approved" and r.get("accounting_exported_at") is None]
+
+    if export_date:
+        rows = (
+            db.query(BOLRecord)
+            .filter(
+                BOLRecord.status == BOLStatus.APPROVED,
+                BOLRecord.approved_at >= datetime(
+                    export_date.year, export_date.month, export_date.day, tzinfo=timezone.utc
+                ),
+            )
+            .all()
+        )
+    else:
+        rows = (
+            db.query(BOLRecord)
+            .filter(
+                BOLRecord.status == BOLStatus.APPROVED,
+                BOLRecord.accounting_exported_at.is_(None),
+            )
+            .all()
+        )
+    return rows
+
+
+@app.post("/api/bols/mark-accounting-sent", tags=["BOLs"])
+def mark_accounting_sent(body: dict, db: Session = Depends(get_db)):
+    """
+    Mark a list of records as sent to accounting by setting accounting_exported_at = now().
+    Called after Katie confirms she has sent the email from Outlook.
+    """
+    record_ids: list[str] = body.get("record_ids", [])
+    if not record_ids:
+        raise HTTPException(status_code=400, detail="record_ids is required")
+
+    now_ts = datetime.now(timezone.utc)
 
     if settings.USE_MOCK_DATA:
-        # In mock mode return all approved records regardless of date —
-        # mock data doesn't represent real daily batches.
-        return [_record_to_summary(r) for r in _mock_state.values()
-                if r["status"] == "approved"]
+        count = 0
+        for rid in record_ids:
+            if rid in _mock_state:
+                _mock_state[rid]["accounting_exported_at"] = now_ts
+                count += 1
+        return {"marked": count, "timestamp": now_ts.isoformat()}
 
-    rows = (
-        db.query(BOLRecord)
-        .filter(
-            BOLRecord.status == BOLStatus.APPROVED,
-            BOLRecord.approved_at >= datetime(
-                target.year, target.month, target.day, tzinfo=timezone.utc
-            ),
-        )
-        .all()
-    )
-    return rows
+    rows = db.query(BOLRecord).filter(BOLRecord.id.in_(record_ids)).all()
+    for row in rows:
+        row.accounting_exported_at = now_ts
+    db.commit()
+    return {"marked": len(rows), "timestamp": now_ts.isoformat()}
 
 
 @app.post(
@@ -951,6 +988,57 @@ def pull_technique_data(db: Session = Depends(get_db)):
     if rematched:
         msg += f" Re-matched {rematched} invoice stub(s)."
     return {"records_loaded": loaded, "rematched": rematched, "date": date.today().isoformat(), "message": msg}
+
+
+@app.post("/api/admin/refetch-bols", tags=["Admin"])
+def refetch_bols_for_manifests(body: dict, db: Session = Depends(get_db)):
+    """
+    Re-query get_technique_data() filtered to specific manifest numbers and update
+    bol_number on matching records. Use after Katie imports the SID file into Prophecy
+    and creates load numbers — this pulls those new BOL numbers back into the app.
+    Not available in mock mode.
+    """
+    manifest_numbers: list[str] = body.get("manifest_numbers", [])
+    if not manifest_numbers:
+        raise HTTPException(status_code=400, detail="manifest_numbers is required")
+
+    if settings.USE_MOCK_DATA:
+        raise HTTPException(status_code=400, detail="Re-fetch BOLs is not available in mock mode.")
+
+    from backend.data_layer import get_technique_data as _get_technique_data
+    try:
+        all_manifests = _get_technique_data(days_back=30)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Technique query failed: {exc}")
+
+    manifest_set = set(manifest_numbers)
+    manifest_map = {m["manifest"]: m for m in all_manifests if m["manifest"] in manifest_set}
+
+    updated = []
+    unchanged = []
+    for manifest_num in manifest_numbers:
+        row = db.query(BOLRecord).filter(BOLRecord.manifest == manifest_num).first()
+        if not row:
+            unchanged.append({"manifest": manifest_num, "reason": "record not found in DB"})
+            continue
+        m = manifest_map.get(manifest_num)
+        if not m:
+            unchanged.append({"manifest": manifest_num, "reason": "not found in recent Technique pull"})
+            continue
+        load_id = m.get("load_id") or 0
+        pooled_id = m.get("pooled_to_load_id") or 0
+        new_bol = load_id if load_id > 0 else (pooled_id if pooled_id > 0 else None)
+        if new_bol and row.bol_number != new_bol:
+            row.bol_number = new_bol
+            row.needs_sid_export = False
+            updated.append({"manifest": manifest_num, "bol_number": new_bol})
+        else:
+            unchanged.append({"manifest": manifest_num, "bol_number": row.bol_number, "reason": "no change"})
+
+    if updated:
+        db.commit()
+    logger.info("[REFETCH-BOLS] Updated %d BOL number(s) for %d manifest(s)", len(updated), len(manifest_numbers))
+    return {"updated": updated, "unchanged": unchanged}
 
 
 # ---------------------------------------------------------------------------
