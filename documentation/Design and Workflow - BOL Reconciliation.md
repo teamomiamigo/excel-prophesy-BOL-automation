@@ -29,18 +29,18 @@ Katie can also upload CSVs manually via **Upload Invoices**, with an optional se
 **Step 3 — Reviewing**
 Katie opens the dashboard. For each record she sees:
 
-| Field | Source | Purpose |
-| ----- | ------ | ------- |
-| Trip / Manifest | Technique (SQL) | Identifies the shipment |
-| BOL Number | Prophecy / auto-fill | Needed for accounting export |
-| Invoice Sender | Folder name | Which batch this invoice came from |
-| Invoice # | ALG Invoice (Z-number) | Links to original CSV |
-| Tech Wgt / Pal / PCS | VisualMail | What SG360 shipped |
-| ALG Wgt / Pal / PCS | ALG Invoice | What ALG recorded |
-| Wgt / Pal / PCS Diff | Calculated | Discrepancy flags |
-| Calculated Cost | Tariff + FSC | What SG360 expected to pay |
-| Invoice Amount | ALG Invoice | What ALG actually charged |
-| **Cost %** | Calculated | **The key metric** |
+| Field                | Source                              | Purpose                            |
+| -------------------- | ----------------------------------- | ---------------------------------- |
+| Trip / Manifest      | Technique (SQL)                     | Identifies the shipment            |
+| BOL Number           | Prophecy / auto-fill from Technique | Needed for accounting export       |
+| Invoice Sender       | Folder name                         | Which batch this invoice came from |
+| Invoice #            | ALG Invoice (Z-number)              | Links to original CSV              |
+| Tech Wgt / Pal / PCS | VisualMail                          | What SG360 shipped                 |
+| ALG Wgt / Pal / PCS  | ALG Invoice                         | What ALG recorded                  |
+| Wgt / Pal / PCS Diff | Calculated                          | Discrepancy flags                  |
+| Calculated Cost      | Tariff + FSC                        | What SG360 expected to pay         |
+| Invoice Amount       | ALG Invoice                         | What ALG actually charged          |
+| **Cost %**           | Calculated                          | **The key metric**                 |
 
 Cost % color thresholds:
 - 🟢 Green (97–103%) — looks right, approve

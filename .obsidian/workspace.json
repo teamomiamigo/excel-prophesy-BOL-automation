@@ -11,10 +11,14 @@
             "id": "1109fc8b645eae6e",
             "type": "leaf",
             "state": {
-              "type": "empty",
-              "state": {},
+              "type": "markdown",
+              "state": {
+                "file": "documentation/Design and Workflow - BOL Reconciliation.md",
+                "mode": "source",
+                "source": false
+              },
               "icon": "lucide-file",
-              "title": "New tab"
+              "title": "Design and Workflow - BOL Reconciliation"
             }
           }
         ]
@@ -181,22 +185,22 @@
   },
   "active": "1109fc8b645eae6e",
   "lastOpenFiles": [
-    "frontend/vite.config.js.timestamp-1782849757229-e370d42f3e3c88.mjs",
-    "start.ps1.tmp.14320.1b66fda2fe4d",
-    "backend/main.py.tmp.14320.0167446595dc",
-    "frontend/vite.config.js.timestamp-1782848648040-fae6b068f88978.mjs",
-    "frontend/vite.config.js.timestamp-1782848163129-948c60c450dd7.mjs",
-    "frontend/vite.config.js.timestamp-1782845903535-8e2c3ac25b51d8.mjs",
-    "CLAUDE.md.tmp.41864.2471ed08edb0",
-    "frontend/src/App.jsx.tmp.41864.a2fb70e7e817",
-    "frontend/src/App.jsx.tmp.41864.051fc3eb8198",
-    "backend/main.py.tmp.41864.acb747d453bf",
-    "backend/main.py.tmp.41864.2302a893cc63",
+    "frontend/vite.config.js.timestamp-1782918181433-026d5b8c8b46a.mjs",
+    "documentation/Design and Workflow - BOL Reconciliation.md.tmp.52876.f38bb1a389f1",
+    "documentation/Developmental Documentation.md",
+    "backend/main.py.tmp.21864.233607c28a7f",
+    "frontend/src/App.jsx.tmp.21864.700195096d15",
+    "frontend/src/components/LogSection.jsx.tmp.21864.d9985b515b2b",
+    "frontend/src/components/LogSection.jsx.tmp.21864.29a77b79a381",
+    "frontend/src/components/ApprovedSection.jsx.tmp.21864.c570ce1e2384",
+    "backend/mock_data.py.tmp.21864.01cd967069ff",
+    "backend/main.py.tmp.21864.98270fb3e0e5",
+    "backend/main.py.tmp.21864.86d05e074f52",
+    "backend/main.py.tmp.21864.ec459d6c1a3b",
     "documentation/SG360_BOL_Project_Context.md",
     "documentation/SECURITY.md",
     "documentation/Requirements and SQL Mapping.md",
     "documentation/Design and Workflow - BOL Reconciliation.md",
-    "documentation/Developmental Documentation.md",
     "SG360_BOL_Project_Context.md",
     "SECURITY.md",
     "frontend/node_modules/@esbuild/win32-x64/README.md"
