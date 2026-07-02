@@ -105,7 +105,9 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/invoices/upload` | Upload ALG invoice CSV (Z-number format) → match + update record; response includes `conflict` key if trip already had an invoice |
 | GET | `/api/invoices/{z}/file` | Serve original Z-number CSV from `INVOICE_FOLDER` (or `test_data/` in mock mode) |
 | POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` path for unprocessed CSVs → process each; files stay in place, dedup via DB `invoice_number` |
-| GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only) |
+| GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only); also stamps `sid_exported_at` on each included record |
+| POST | `/api/bols/{id}/export-prophecy-sid` | Per-record SID export — pushes one pending Type A record to Prophecy without waiting for a batch approval; same CSV logic as the bulk route, scoped to one manifest |
+| POST | `/api/bols/{id}/refresh-bol` | Check Prophecy for a BOL on one record's manifest without a full Technique pull; reuses `get_technique_data()` filtered to one manifest — ~10s live (hits AWP-SQL-PROD), near-instant if the record already has a BOL |
 | POST | `/api/export` | Generate accounting CSV and email to Mary + Katie |
 | GET | `/api/logs` | All records across all dates; optional `?start_date=` / `?end_date=` / `?status=` filters |
 | GET | `/api/logs/export` | Download log as CSV; same date-range params as above |
@@ -136,7 +138,6 @@ The source file being replaced: `c:\nikhilm\billing-freight-automation\Technique
 | # | Question | Who to ask | Status |
 |---|---|---|---|
 | 3 | **ALG invoice format**: Tanya can send CSV (format confirmed from Z556229.CSV). `POST /api/invoices/upload` accepts it. Ask Phil to switch Tanya to CSV delivery. | Phil / Tanya | ✅ CSV format confirmed |
-| 8 | **Prophecy BOL sync**: After Katie imports SID file + creates loads, how do we query Prophecy DB for the resulting BOL numbers? Need connection string + table schema. | Megha | ❓ Open — needed for EOD BOL sync |
 | 11 | **`tariff_rates` coverage gaps**: Confirmed (2026-07-01, against a real invoice) that at least 3 destination zones (253, 231, 235) are entirely absent from the source rate card, and zone 282 has two conflicting rates for two different facilities (disambiguated by a `Drop Ship Site Key` column in the source spreadsheet, which ALG's own invoices reference via their `SiteKey` column — not currently used in our lookup). `access_prog` now falls back to that same invoice's own billed rate for a gap zone before guessing a nearest zone, which covers the common case, but the rate card itself should still be completed. | Marge / Phil | ❓ Open — less urgent now that ALG's own invoiced rate is a working interim fallback |
 
 **Resolved June 22 meeting:**
@@ -148,6 +149,7 @@ The source file being replaced: `c:\nikhilm\billing-freight-automation\Technique
 **Resolved 2026-07-01 (verified live against AWP-SQL-PROD):**
 - **Q2/Q7 Destination → ZIP**: `Locations.AccountNumber` via the Pallet→Locations join (e.g. `SCF606` → `606`) is confirmed correct — independently re-run against AWP-SQL-PROD and returns correct per-pallet destination/weight data. Marge's alternate suggestion (`DestinationID`) is not needed. `get_pallet_data_for_manifests()`'s SQL is unchanged and confirmed correct.
 - **Q10 VisualMail SELECT permission**: `get_manifest_weights()` and `get_pallet_data_for_manifests()` both succeed live today — the permission is granted (or this was never actually blocking). Both are now load-bearing for `access_prog` (see below), not just SID export.
+- **Q8 Prophecy BOL sync**: Already implemented, was just undocumented. `get_technique_data()`'s existing LEFT JOIN to `SQLAPPS3.ShipperPlus_Segerdahl.dbo.shipments` returns `load_id`/`pooled_to_load_id` for every manifest — `pull_technique_data()` (and now the per-record `POST /api/bols/{id}/refresh-bol`) already pick these up automatically via the shared `_apply_bol_status()` helper. No new connection string or schema needed. Live round-trip (real SID export → Katie imports into Prophecy → BOL appears) verified by the user directly, not by an automated test — see `documentation/Developmental Documentation.md`.
 
 **Design decisions (June 22):**
 - `prop_reship` column intentionally hidden from dashboard (Prophecy uses wrong 2006 tariff; Katie was manually typing it).
@@ -271,6 +273,7 @@ Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — show
 - `needs_sid_export` (Boolean): True = Type A record (no BOL yet); False = Type B (BOL already in Prophecy)
 - `match_strategy` (String): how the invoice was matched — `"trip"`, `"bol"`, or null for stubs
 - `accounting_exported_at` nullable DateTime — set when "Send to Accounting" runs; exposed in Log tab
+- `sid_exported_at` nullable DateTime — set when a record's SID CSV is downloaded (bulk `GET /api/export/prophecy-sid` or per-record `POST /api/bols/{id}/export-prophecy-sid`); previously existed but was never written until 2026-07-02
 - `approval_history` table for full audit trail
 - `users` table stubbed for future auth
 

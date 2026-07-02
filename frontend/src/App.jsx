@@ -44,6 +44,9 @@ export default function App() {
   const [uploadTime, setUploadTime] = useState('');
   const [showSenderFields, setShowSenderFields] = useState(false);
   const [sidExportedThisSession, setSidExportedThisSession] = useState(false);
+  const [exportingSidId, setExportingSidId] = useState(null);
+  const [checkingBolId, setCheckingBolId] = useState(null);
+  const [refreshLoading, setRefreshLoading] = useState(false);
 
   const thirdPartyBols     = pendingBols.filter(b => b.is_third_party);
   const visiblePendingBols = pendingBols.filter(b => !b.is_third_party);
@@ -166,6 +169,60 @@ export default function App() {
       setError(err.message);
     } finally {
       setSidLoading(false);
+    }
+  }
+
+  async function handleExportRecordToProphecy(recordId) {
+    setExportingSidId(recordId);
+    try {
+      const res = await fetch(`/api/bols/${recordId}/export-prophecy-sid`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `SID export failed (${res.status})`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const disposition = res.headers.get('Content-Disposition') || '';
+      const match = disposition.match(/filename="([^"]+)"/);
+      a.href = url;
+      a.download = match ? match[1] : 'SG360_Prophecy_SID.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setSuccessMessage('Prophecy SID file downloaded for this record — import it into Prophecy to create the load number.');
+      await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setExportingSidId(null);
+    }
+  }
+
+  async function handleCheckBol(recordId) {
+    setCheckingBolId(recordId);
+    try {
+      const res = await fetch(`/api/bols/${recordId}/refresh-bol`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Check BOL failed (${res.status})`);
+      setSuccessMessage(data.message || (data.updated ? 'BOL found.' : 'No BOL yet.'));
+      if (data.updated) await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setCheckingBolId(null);
+    }
+  }
+
+  async function handleRefresh() {
+    setRefreshLoading(true);
+    try {
+      await Promise.all([fetchPending(), fetchApproved()]);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRefreshLoading(false);
     }
   }
 
@@ -491,6 +548,23 @@ export default function App() {
               <span>{summary.readyToReview} ready &nbsp;·&nbsp; {summary.manifestOnly} manifest only &nbsp;·&nbsp; {summary.invoiceOnly} invoice only &nbsp;·&nbsp; {summary.approvedToday} approved</span>
               <span style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
                 <button
+                  onClick={handleRefresh}
+                  disabled={refreshLoading}
+                  title="Refresh pending and approved records from this dashboard's own data (no live Technique pull)"
+                  style={{
+                    background: refreshLoading ? '#e5e7eb' : '#f9fafb',
+                    color: refreshLoading ? '#9ca3af' : '#374151',
+                    border: '1px solid #d1d5db',
+                    borderRadius: 5,
+                    padding: '4px 12px',
+                    fontWeight: 600,
+                    fontSize: 12,
+                    cursor: refreshLoading ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {refreshLoading ? 'Refreshing…' : '⟳ Refresh'}
+                </button>
+                <button
                   onClick={handlePull}
                   disabled={pullLoading}
                   title="Pull latest manifests from Technique"
@@ -700,6 +774,8 @@ export default function App() {
               unflaggingId={unflaggingId}
               markingThirdPartyId={markingThirdPartyId}
               ignoringId={ignoringId}
+              exportingSidId={exportingSidId}
+              checkingBolId={checkingBolId}
               filterText={filterText}
               onFilterChange={setFilterText}
               onApprove={handleApprove}
@@ -709,6 +785,8 @@ export default function App() {
               onMarkThirdParty={handleMarkThirdParty}
               onReassignOpen={id => setReassignTargetId(id)}
               onIgnore={handleIgnore}
+              onExportSid={handleExportRecordToProphecy}
+              onCheckBol={handleCheckBol}
             />
 
             <ThirdPartySection

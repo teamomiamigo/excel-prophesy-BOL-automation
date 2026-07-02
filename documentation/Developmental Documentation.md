@@ -1,4 +1,4 @@
-*updated 2026-07-01*
+*updated 2026-07-02*
 
 Running log of development work on this branch — what changed, why, and anything non-obvious for the next person (human dev or Claude Code) touching this code. Pairs with `CLAUDE.md` (architecture/business rules, kept current) and the GitHub issue backlog (what's queued up next).
 
@@ -11,6 +11,12 @@ Stable technical notes that don't belong to one changelog entry — add here whe
 ## Changelog
 
 One entry per closed issue. Newest on top.
+
+### 2026-07-02 — #34 / #35 Per-record Prophecy export, per-record BOL check, top-level Refresh (docs fix for #22)
+**What:** Added two per-record actions on pending Type A rows (Actions column, `BOLRow.jsx`): "SID" exports that one record's Prophecy SID CSV without waiting for a batch approval (`POST /api/bols/{id}/export-prophecy-sid`, reusing the exact same `get_pallet_data_for_manifests()`/`generate_sid_csv()` logic as the bulk export — verified byte-identical output for the same manifest), and "↻ BOL" checks Prophecy for a BOL number on just that manifest (`POST /api/bols/{id}/refresh-bol`). Added a top-level "⟳ Refresh" button that re-fetches pending/approved records from our own DB only (`fetchPending()` + `fetchApproved()`) — no live Technique/AWP-SQL-PROD hit, unlike "Pull Manifests". Also implemented `sid_exported_at`, which existed as a column since early on but was never actually written anywhere — now stamped by both the bulk and per-record export routes.
+**Why:** Katie needed to push one urgent record to Prophecy without batching, and check whether a BOL came back without re-running the full morning pull. Investigating this surfaced that CLAUDE.md's Open Question #8 ("how do we get BOL numbers back from Prophecy?") was stale — the mechanism (`get_technique_data()`'s ShipperPlus join) already existed via `pull_technique_data()`, just undocumented and not available per-record.
+**Files:** backend/main.py (`_apply_bol_status()` extracted as a shared helper, two new routes, `sid_exported_at` write added to the bulk route), frontend/src/components/BOLRow.jsx, frontend/src/App.jsx, CLAUDE.md (resolved Q8)
+**Gotcha:** `refresh-bol`'s live-query path (record has no BOL yet) takes ~10-11s in practice — it reuses `get_technique_data(days_back=21)` unchanged rather than a new single-manifest-scoped SQL query, trading speed for zero risk of a subtly wrong new query. Short-circuits near-instantly when the record already has a BOL. Issue #22 ("verify end-to-end") is NOT closed by this entry — the actual live round-trip (real SID export → user imports into Prophecy → "↻ BOL" confirms it) is being verified by the user directly, not by an automated test.
 
 ### 2026-07-01 — #31 / #36 Remove incorrect Prophecy badges + merge Invoice Only into main table
 **What:** Reordered invoice-matching priority in `_process_invoice_csv()` so exact Technique-trip matches (Z-number, then Job-Name-as-trip-suffix) are always tried before treating Job Name as a Prophecy BOL number — a real trip whose numeric suffix happens to start with "14" (e.g. `140237`) was being misclassified as a Wolf/311 Prophecy load, incorrectly showing the indigo "P" marker. Also removed the separate "Invoice Only" and "Comingle" collapsible sections in `BOLTable.jsx` — all pending records (manifest-only, invoice-only, comingle) now render in one flat table, sorted by effective date (`invoice_sent_at` if known, else `created_at`).

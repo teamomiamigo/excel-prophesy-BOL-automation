@@ -767,6 +767,26 @@ def reset_all_invoices(db: Session = Depends(get_db)):
     return {"stubs_deleted": stub_count, "records_cleared": len(technique_rows)}
 
 
+def _apply_bol_status(row: "BOLRecord", technique_row: dict) -> None:
+    """
+    Set bol_number/needs_sid_export from a Technique/ShipperPlus query row's
+    load_id/pooled_to_load_id. Type A (no BOL yet, needs_sid_export=True) vs
+    Type B (load_id/pooled_to_load_id > 0 — a BOL already exists in Prophecy).
+    Shared by the bulk pull (pull_technique_data) and the per-record BOL check
+    (POST /api/bols/{id}/refresh-bol) so both apply identical logic.
+    """
+    load_id = technique_row.get("load_id") or 0
+    pooled_id = technique_row.get("pooled_to_load_id") or 0
+    if load_id > 0 or pooled_id > 0:
+        row.needs_sid_export = False
+        if load_id > 0 and not row.bol_number:
+            row.bol_number = load_id
+        elif pooled_id > 0 and not row.bol_number:
+            row.bol_number = pooled_id
+    else:
+        row.needs_sid_export = True
+
+
 @app.post("/api/admin/pull", tags=["Admin"])
 def pull_technique_data(db: Session = Depends(get_db)):
     """
@@ -854,16 +874,7 @@ def pull_technique_data(db: Session = Depends(get_db)):
 
         # Type A = no load yet (needs SID export to Prophecy to create BOL)
         # Type B = load_id > 0 (BOL already exists in Prophecy/ShipperPlus; store it)
-        load_id = m.get("load_id") or 0
-        pooled_id = m.get("pooled_to_load_id") or 0
-        if load_id > 0 or pooled_id > 0:
-            row.needs_sid_export = False
-            if load_id > 0 and not row.bol_number:
-                row.bol_number = load_id
-            elif pooled_id > 0 and not row.bol_number:
-                row.bol_number = pooled_id
-        else:
-            row.needs_sid_export = True
+        _apply_bol_status(row, m)
 
         # Prophecy pieces from Query A (ShipperPlus join) — save if non-zero
         proph_pcs = m.get("prophecy_pcs") or 0
@@ -1854,6 +1865,9 @@ def export_prophecy_sid(db: Session = Depends(get_db)):
             )
         pallet_rows = generate_mock_sid_rows(approved)
         csv_bytes = generate_sid_csv(pallet_rows)
+        now = datetime.now(timezone.utc)
+        for r in approved:
+            r["sid_exported_at"] = now
         logger.info("[SID] Mock export: %d pallet rows for %d Type-A records → %s",
                     len(pallet_rows), len(approved), filename)
         return Response(
@@ -1889,6 +1903,10 @@ def export_prophecy_sid(db: Session = Depends(get_db)):
         )
 
     csv_bytes = generate_sid_csv(pallet_rows)
+    now = datetime.now(timezone.utc)
+    for r in approved_rows:
+        r.sid_exported_at = now
+    db.commit()
     logger.info("[SID] Exported %d pallet rows for %d manifests → %s", len(pallet_rows), len(manifests), filename)
 
     return Response(
@@ -1896,6 +1914,112 @@ def export_prophecy_sid(db: Session = Depends(get_db)):
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.post("/api/bols/{record_id}/export-prophecy-sid", tags=["Export"])
+def export_prophecy_sid_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
+    """
+    Generate a Prophecy SID import CSV for a single record's manifest —
+    the per-record equivalent of GET /api/export/prophecy-sid, for pushing
+    one urgent Type A record to Prophecy without waiting to batch-approve
+    and export everything at once. Available on pending (not-yet-approved)
+    Type A records, per Katie's workflow: check it as soon as she's reviewed
+    one record, rather than only after a full batch approval.
+    """
+    filename_suffix = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+    if settings.USE_MOCK_DATA:
+        rec = _mock_state.get(str(record_id))
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Record not found.")
+        if not rec.get("needs_sid_export", True):
+            raise HTTPException(status_code=422, detail="This record already has a BOL — nothing to export.")
+        pallet_rows = generate_mock_sid_rows([rec])
+        csv_bytes = generate_sid_csv(pallet_rows)
+        rec["sid_exported_at"] = datetime.now(timezone.utc)
+        trip = rec.get("technique_trip") or "record"
+        filename = f"SG360_Prophecy_SID_{trip}_{filename_suffix}.csv"
+        logger.info("[SID] Mock per-record export: %s → %s", trip, filename)
+        return Response(
+            content=csv_bytes,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    from backend.data_layer import get_pallet_data_for_manifests
+
+    rec = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Record not found.")
+    if not rec.needs_sid_export:
+        raise HTTPException(status_code=422, detail="This record already has a BOL — nothing to export.")
+    if not rec.manifest:
+        raise HTTPException(status_code=422, detail="This record has no manifest number to export.")
+
+    pallet_rows = get_pallet_data_for_manifests([rec.manifest])
+    if not pallet_rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No pallet data found in VisualMail for manifest {rec.manifest}.",
+        )
+
+    csv_bytes = generate_sid_csv(pallet_rows)
+    rec.sid_exported_at = datetime.now(timezone.utc)
+    db.commit()
+
+    filename = f"SG360_Prophecy_SID_{rec.technique_trip or rec.manifest}_{filename_suffix}.csv"
+    logger.info("[SID] Exported %d pallet rows for manifest %s → %s", len(pallet_rows), rec.manifest, filename)
+
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/bols/{record_id}/refresh-bol", tags=["Admin"])
+def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
+    """
+    Check whether Prophecy now has a BOL (load_id/pooled_to_load_id) for one
+    specific record's manifest, without re-running the full Technique pull
+    across every manifest. Meant for the round-trip: Katie exports a SID file
+    for one record, imports it into Prophecy, then uses this to confirm the
+    BOL number came back — instead of waiting for tomorrow's full pull.
+
+    Reuses get_technique_data() unchanged (proven, already-working query) and
+    filters the result to this one manifest, rather than a new hand-written
+    single-manifest SQL query — heavier than strictly necessary, but zero risk
+    of a subtly wrong new query. Revisit if this proves too slow in practice.
+    """
+    if settings.USE_MOCK_DATA:
+        raise HTTPException(
+            status_code=400,
+            detail="Refresh-BOL is disabled in mock mode. Set USE_MOCK_DATA=False in .env.",
+        )
+
+    rec = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Record not found.")
+    if not rec.manifest:
+        raise HTTPException(status_code=422, detail="This record has no manifest number to check.")
+    if not rec.needs_sid_export:
+        return {"updated": False, "bol_number": rec.bol_number, "message": "This record already has a BOL."}
+
+    from backend.data_layer import get_technique_data
+
+    manifests = get_technique_data(days_back=21)
+    match = next((m for m in manifests if m.get("manifest") == rec.manifest), None)
+    if match is None:
+        return {"updated": False, "bol_number": None, "message": "Manifest not found in Technique — try again later."}
+
+    before = rec.bol_number
+    _apply_bol_status(rec, match)
+    db.commit()
+
+    if rec.bol_number and rec.bol_number != before:
+        logger.info("[REFRESH-BOL] %s → BOL %s", rec.manifest, rec.bol_number)
+        return {"updated": True, "bol_number": rec.bol_number, "message": f"BOL {rec.bol_number} found."}
+    return {"updated": False, "bol_number": rec.bol_number, "message": "No BOL in Prophecy yet — check again later."}
 
 
 @app.get("/api/logs", response_model=list[BOLSummary], tags=["Logs"])

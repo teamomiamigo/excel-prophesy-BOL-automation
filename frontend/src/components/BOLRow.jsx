@@ -43,7 +43,7 @@ const TD = {
 
 const TD_R = { ...TD, textAlign: 'right' };
 
-export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isIgnoring, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore }) {
+export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isIgnoring, isExportingSid, isCheckingBol, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore, onExportSid, onCheckBol }) {
   const [hovered, setHovered] = useState(false);
   const [notesValue, setNotesValue] = useState(bol.notes || '');
   const [saveFlash, setSaveFlash] = useState(false);
@@ -214,9 +214,9 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
         </div>
       </td>
 
-      {/* Actions — fixed 3-slot grid so every row has identical column width */}
+      {/* Actions — fixed 5-slot grid so every row has identical column width */}
       <td style={{ ...TD, textAlign: 'center' }}>
-        <div style={{ display: 'grid', gridTemplateColumns: '80px 36px 36px', gap: 4, alignItems: 'center', justifyContent: 'center' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '80px 36px 36px 36px 42px', gap: 4, alignItems: 'center', justifyContent: 'center' }}>
           {/* Slot 1: Approve */}
           <button
             onClick={onApprove}
@@ -320,6 +320,55 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
             )
           ) : (
             <div style={{ width: '100%' }} />
+          )}
+          {/* Slot 4 + 5: Export to Prophecy / Check BOL — only for pending Type A records
+              (no BOL yet, has a manifest, not third-party/ignored) */}
+          {bol.needs_sid_export && bol.manifest && !bol.is_third_party && !bol.is_ignored ? (
+            <>
+              <button
+                onClick={onExportSid}
+                disabled={isExportingSid}
+                title="Export this record's Prophecy SID file (one manifest)"
+                style={{
+                  background: isExportingSid ? '#dbeafe' : '#eff6ff',
+                  color: '#1e40af',
+                  border: '1px solid #bfdbfe',
+                  borderRadius: 4,
+                  padding: '4px 0',
+                  width: '100%',
+                  fontSize: 11,
+                  fontWeight: 700,
+                  cursor: isExportingSid ? 'not-allowed' : 'pointer',
+                  opacity: isExportingSid ? 0.7 : 1,
+                }}
+              >
+                {isExportingSid ? '…' : 'SID'}
+              </button>
+              <button
+                onClick={onCheckBol}
+                disabled={isCheckingBol}
+                title="Check Prophecy for a BOL number on this manifest"
+                style={{
+                  background: isCheckingBol ? '#e5e7eb' : '#f9fafb',
+                  color: '#374151',
+                  border: '1px solid #d1d5db',
+                  borderRadius: 4,
+                  padding: '4px 0',
+                  width: '100%',
+                  fontSize: 11,
+                  fontWeight: 600,
+                  cursor: isCheckingBol ? 'not-allowed' : 'pointer',
+                  opacity: isCheckingBol ? 0.7 : 1,
+                }}
+              >
+                {isCheckingBol ? '…' : '↻ BOL'}
+              </button>
+            </>
+          ) : (
+            <>
+              <div style={{ width: '100%' }} />
+              <div style={{ width: '100%' }} />
+            </>
           )}
         </div>
       </td>
