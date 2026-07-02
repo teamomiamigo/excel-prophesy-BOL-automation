@@ -40,6 +40,7 @@ export default function App() {
   const [pullLoading, setPullLoading] = useState(false);
   const [pollFolderLoading, setPollFolderLoading] = useState(false);
   const [filterText, setFilterText] = useState('');
+  const [sort, setSort] = useState({ column: null, direction: 'default' });
   const [uploadSender, setUploadSender] = useState('');
   const [uploadDate, setUploadDate] = useState('');
   const [uploadTime, setUploadTime] = useState('');
@@ -90,6 +91,18 @@ export default function App() {
 
   function clearSelection() {
     setSelectedIds(new Set());
+  }
+
+  // -------------------------------------------------------------------------
+  // Sorting (issue #33 — sortable columns)
+  // -------------------------------------------------------------------------
+
+  function handleSort(column) {
+    setSort(prev => {
+      if (prev.column !== column) return { column, direction: 'asc' };
+      if (prev.direction === 'asc') return { column, direction: 'desc' };
+      return { column: null, direction: 'default' };
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -964,6 +977,8 @@ export default function App() {
               selectedIds={selectedIds}
               onToggleSelect={toggleSelect}
               onToggleSelectAll={toggleSelectAll}
+              sort={sort}
+              onSort={handleSort}
               onApprove={handleApprove}
               onFlagOpen={setFlagTarget}
               onUnflag={handleUnflag}

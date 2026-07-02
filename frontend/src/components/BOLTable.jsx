@@ -24,7 +24,49 @@ const TH_GROUP = {
   color: '#d1d5db',
 };
 
-function TableHead({ allSelected, someSelected, onToggleSelectAll }) {
+const sortableThStyle = { ...TH_STYLE, cursor: 'pointer', userSelect: 'none' };
+
+function sortIndicator(sort, column) {
+  if (sort.column !== column) return <span style={{ opacity: 0.35, marginLeft: 4 }}>⇅</span>;
+  return <span style={{ marginLeft: 4 }}>{sort.direction === 'asc' ? '▲' : '▼'}</span>;
+}
+
+// Sort accessors + comparator (issue #33 — sortable columns)
+const SORT_ACCESSORS = {
+  trip:     { get: b => b.technique_trip, numeric: false },
+  manifest: { get: b => b.manifest,       numeric: false },
+  bol:      { get: b => b.bol_number,     numeric: true  },
+  invoice:  { get: b => b.invoice_number, numeric: false },
+};
+
+function makeComparator(accessor, direction, isNumeric) {
+  const dir = direction === 'desc' ? -1 : 1;
+  return (a, b) => {
+    const av = accessor(a), bv = accessor(b);
+    const aNull = av == null, bNull = bv == null;
+    if (aNull && bNull) return 0;
+    if (aNull) return 1;   // nulls always last, regardless of direction
+    if (bNull) return -1;
+    return dir * (isNumeric ? av - bv : String(av).localeCompare(String(bv)));
+  };
+}
+
+function defaultComparator(a, b) {
+  const av = a.invoice_sent_at, bv = b.invoice_sent_at;
+  const aNull = av == null, bNull = bv == null;
+  if (aNull && bNull) return 0;
+  if (aNull) return 1;
+  if (bNull) return -1;
+  return new Date(bv) - new Date(av); // newest first
+}
+
+function getComparator(sort) {
+  if (!sort.column) return defaultComparator;
+  const { get, numeric } = SORT_ACCESSORS[sort.column];
+  return makeComparator(get, sort.direction, numeric);
+}
+
+function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort }) {
   return (
     <thead>
       <tr>
@@ -44,9 +86,9 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll }) {
         <th colSpan={4} style={TH_STYLE} />
       </tr>
       <tr>
-        <th style={TH_STYLE}>Trip</th>
-        <th style={TH_STYLE}>Manifest</th>
-        <th style={TH_STYLE}>BOL</th>
+        <th style={sortableThStyle} onClick={() => onSort('trip')} title="Sort by Trip #">Trip{sortIndicator(sort, 'trip')}</th>
+        <th style={sortableThStyle} onClick={() => onSort('manifest')} title="Sort by Manifest #">Manifest{sortIndicator(sort, 'manifest')}</th>
+        <th style={sortableThStyle} onClick={() => onSort('bol')} title="Sort by BOL #">BOL{sortIndicator(sort, 'bol')}</th>
         <th style={TH_STYLE}>Order #</th>
         <th style={{ ...TH_STYLE, textAlign: 'right', borderLeft: '2px solid #333' }}>Wgt</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Pal</th>
@@ -58,7 +100,7 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll }) {
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>ΔPal</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>ΔPCS</th>
         <th style={TH_STYLE}>Invoice Sender</th>
-        <th style={TH_STYLE}>Invoice #</th>
+        <th style={sortableThStyle} onClick={() => onSort('invoice')} title="Sort by Invoice #">Invoice #{sortIndicator(sort, 'invoice')}</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Calc Cost</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Amount</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Cost %</th>
@@ -71,7 +113,7 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll }) {
 
 export default function BOLTable({
   bols, loading, approvingId, unflaggingId, markingThirdPartyId, ignoringId, exportingSidId, checkingBolId,
-  filterText, onFilterChange, selectedIds, onToggleSelect, onToggleSelectAll,
+  filterText, onFilterChange, selectedIds, onToggleSelect, onToggleSelectAll, sort, onSort,
   onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore, onExportSid, onCheckBol,
 }) {
   const lower = (filterText || '').toLowerCase();
@@ -80,14 +122,12 @@ export default function BOLTable({
     b.bol_number != null ? String(b.bol_number) : '',
   ].some(v => (v || '').toLowerCase().includes(lower));
 
-  // One flat table, no category grouping — sorted by effective date (invoice date when
-  // known, otherwise when we first saw the record). A proper user-facing sort (issue #33)
-  // will replace this; this is just a sensible default until then.
-  const effectiveDate = b => b.invoice_sent_at || b.created_at;
+  // One flat table, no category grouping — sorted by Trip/Manifest/BOL/Invoice # (click a
+  // header to cycle asc/desc/default), or by invoice_sent_at descending (default, nulls last).
   const visibleBols = bols
     .filter(matchesBol)
     .slice()
-    .sort((a, b) => new Date(effectiveDate(a)) - new Date(effectiveDate(b)));
+    .sort(getComparator(sort));
   const totalVisible = visibleBols.length;
   const visibleIds = visibleBols.map(b => b.id);
   const allSelected = visibleIds.length > 0 && visibleIds.every(id => selectedIds.has(id));
@@ -178,6 +218,8 @@ export default function BOLTable({
               allSelected={allSelected}
               someSelected={someSelected}
               onToggleSelectAll={() => onToggleSelectAll(visibleIds)}
+              sort={sort}
+              onSort={onSort}
             />
             <tbody>
               {visibleBols.map(bol => <BOLRow {...rowProps(bol)} />)}
