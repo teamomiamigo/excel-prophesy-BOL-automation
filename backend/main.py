@@ -45,8 +45,15 @@ async def lifespan(app: FastAPI):
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_third_party BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_ignored BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS invoice_sent_at TIMESTAMP WITH TIME ZONE"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS alg_fsc_pct NUMERIC(8,6)"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS alg_fsc_cost NUMERIC(10,2)"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS tariff_zone_approximate BOOLEAN NOT NULL DEFAULT FALSE"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS weight_source_fallback BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.commit()
-        logger.info("DB column migration for base_tariff/fsc_pct/is_third_party/is_ignored/invoice_sent_at complete.")
+        logger.info(
+            "DB column migration for base_tariff/fsc_pct/is_third_party/is_ignored/invoice_sent_at/"
+            "alg_fsc_pct/alg_fsc_cost/tariff_zone_approximate/weight_source_fallback complete."
+        )
     logger.info(
         "SG360 BOL API started. Mock mode: %s | Version: %s",
         settings.USE_MOCK_DATA,
@@ -797,6 +804,26 @@ def reset_all_invoices(db: Session = Depends(get_db)):
     return {"stubs_deleted": stub_count, "records_cleared": len(technique_rows)}
 
 
+def _apply_bol_status(row: "BOLRecord", technique_row: dict) -> None:
+    """
+    Set bol_number/needs_sid_export from a Technique/ShipperPlus query row's
+    load_id/pooled_to_load_id. Type A (no BOL yet, needs_sid_export=True) vs
+    Type B (load_id/pooled_to_load_id > 0 — a BOL already exists in Prophecy).
+    Shared by the bulk pull (pull_technique_data) and the per-record BOL check
+    (POST /api/bols/{id}/refresh-bol) so both apply identical logic.
+    """
+    load_id = technique_row.get("load_id") or 0
+    pooled_id = technique_row.get("pooled_to_load_id") or 0
+    if load_id > 0 or pooled_id > 0:
+        row.needs_sid_export = False
+        if load_id > 0 and not row.bol_number:
+            row.bol_number = load_id
+        elif pooled_id > 0 and not row.bol_number:
+            row.bol_number = pooled_id
+    else:
+        row.needs_sid_export = True
+
+
 @app.post("/api/admin/pull", tags=["Admin"])
 def pull_technique_data(db: Session = Depends(get_db)):
     """
@@ -884,16 +911,7 @@ def pull_technique_data(db: Session = Depends(get_db)):
 
         # Type A = no load yet (needs SID export to Prophecy to create BOL)
         # Type B = load_id > 0 (BOL already exists in Prophecy/ShipperPlus; store it)
-        load_id = m.get("load_id") or 0
-        pooled_id = m.get("pooled_to_load_id") or 0
-        if load_id > 0 or pooled_id > 0:
-            row.needs_sid_export = False
-            if load_id > 0 and not row.bol_number:
-                row.bol_number = load_id
-            elif pooled_id > 0 and not row.bol_number:
-                row.bol_number = pooled_id
-        else:
-            row.needs_sid_export = True
+        _apply_bol_status(row, m)
 
         # Prophecy pieces from Query A (ShipperPlus join) — save if non-zero
         proph_pcs = m.get("prophecy_pcs") or 0
@@ -1083,6 +1101,100 @@ def _parse_invoice_folder_name(name: str) -> "tuple[str, datetime] | None":
     return display, dt
 
 
+def _apply_access_prog_calc(
+    matched_rec: "BOLRecord",
+    match_strategy: "str | None",
+    effective_prophecy_bol: "str | None",
+    alg_rate_by_zip3: dict,
+    alg_pallet_fallback: list,
+    fsc_rate_val: "float | None",
+    fsc_cost_val: "float | None",
+    _get_tariff_rate,
+    _diesel_price,
+    _fsc_pct,
+) -> None:
+    """
+    Compute access_prog/base_tariff/fsc_pct from SG360's OWN pallet data (independent of
+    ALG's invoice) and set them on matched_rec, along with alg_fsc_pct/alg_fsc_cost and the
+    tariff_zone_approximate/weight_source_fallback flags. Shared by _process_invoice_csv()
+    (called live on every invoice upload) and the one-off recompute script used to bring
+    pre-#21-fix records up to date without needing a fresh invoice upload.
+
+    See CLAUDE.md's "access_prog calculation" section for the full rationale/priority order.
+    """
+    _effective_fsc_pct = Decimal(str(fsc_rate_val)) if fsc_rate_val is not None else _fsc_pct
+    matched_rec.alg_fsc_pct = Decimal(str(fsc_rate_val)) if fsc_rate_val is not None else None
+    matched_rec.alg_fsc_cost = Decimal(str(round(fsc_cost_val, 2))) if fsc_cost_val is not None else None
+
+    own_pallets: list[tuple[str, float]] = []  # (zip3, weight)
+    if match_strategy == "prophecy_bol" and effective_prophecy_bol:
+        from backend.data_layer import get_prophecy_pallet_data as _get_prophecy_pallet_data
+        for prow in _get_prophecy_pallet_data(int(effective_prophecy_bol)):
+            dest_id = prow.get("destination_id")
+            dest_zip = prow.get("destination_zip")
+            zip3 = dest_id[3:6] if dest_id and len(dest_id) >= 6 else (dest_zip[:3] if dest_zip else None)
+            weight = float(prow.get("weight") or 0)
+            if zip3 and weight > 0:
+                own_pallets.append((zip3, weight))
+    elif matched_rec.manifest:
+        from backend.data_layer import get_pallet_data_for_manifests as _get_pallet_data_for_manifests
+        for prow in _get_pallet_data_for_manifests([matched_rec.manifest]):
+            dest_id = prow.get("Dest_ID") or ""
+            weight = float(prow.get("Wgt") or 0)
+            if len(dest_id) >= 6 and weight > 0:
+                own_pallets.append((dest_id[3:6], weight))
+
+    new_tariff_sum = Decimal("0")
+    new_base_sum = Decimal("0")
+    any_approximate = False
+    if own_pallets:
+        # Real independent estimate: our own weight, per-zone rate resolved in priority
+        # order — our rate card, then this invoice's own rate for that zone (better than
+        # a numeric guess when our card has a gap), then a nearest-zone fallback as a
+        # last resort.
+        for zip3, weight in own_pallets:
+            tariff = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
+            if tariff and tariff.get("is_exact_zone_match"):
+                new_tariff_sum += tariff["access_prog"]
+                new_base_sum += tariff.get("base_tariff") or Decimal("0")
+                continue
+            alg_rate = alg_rate_by_zip3.get(zip3)
+            if alg_rate is not None:
+                base = Decimal(str(round(alg_rate * weight / 100.0, 2)))
+                with_fsc = base * (Decimal("1") + _effective_fsc_pct) if _effective_fsc_pct is not None else base
+                new_base_sum += base
+                new_tariff_sum += with_fsc
+                logger.info("[TARIFF] zip3=%s: no exact rate-card match, used this invoice's own rate %.2f", zip3, alg_rate)
+                continue
+            if tariff:
+                new_tariff_sum += tariff["access_prog"]
+                new_base_sum += tariff.get("base_tariff") or Decimal("0")
+            any_approximate = True
+        matched_rec.weight_source_fallback = False
+    else:
+        # No own pallet data available (manifest/BOL not found, not yet synced) — fall
+        # back to ALG's own invoiced weight, but flag it so this is visibly distinguishable
+        # from a real independent estimate.
+        for zip3, weight in alg_pallet_fallback:
+            tariff = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
+            if tariff:
+                new_tariff_sum += tariff["access_prog"]
+                new_base_sum += tariff.get("base_tariff") or Decimal("0")
+                if not tariff.get("is_exact_zone_match"):
+                    any_approximate = True
+        matched_rec.weight_source_fallback = True
+
+    matched_rec.tariff_zone_approximate = any_approximate
+    if new_tariff_sum > 0:
+        # Recomputed fresh from our own manifest/BOL data each time (not accumulated
+        # per-invoice) — our own weight doesn't change across multiple Z-invoices for the
+        # same trip, unlike the old ALG-weight-based calc which needed to add each
+        # invoice's own partial line items.
+        matched_rec.access_prog = new_tariff_sum
+        matched_rec.base_tariff = new_base_sum if new_base_sum > 0 else None
+        matched_rec.fsc_pct = _effective_fsc_pct
+
+
 def _process_invoice_csv(
     content: bytes,
     filename: str,
@@ -1117,9 +1229,11 @@ def _process_invoice_csv(
     fsc_cost_val: Optional[float] = None
     total_billed: Optional[float] = None
     cust_job_no: Optional[str] = None
-    pallet_tariff_sum = Decimal("0")
-    pallet_base_tariff_sum = Decimal("0")
-    pallet_fsc_pct_last: Optional[Decimal] = None
+    # Buffered from ALG's own CSV line items — used as a rate-card-gap fallback (a zone this
+    # invoice actually billed is better than guessing a "nearest zone") and as a last-resort
+    # weight source when our own pallet data (Technique/Prophecy) isn't available at all.
+    alg_rate_by_zip3: dict[str, float] = {}
+    alg_pallet_fallback: list[tuple[str, float]] = []
 
     if not settings.USE_MOCK_DATA:
         from backend.data_layer import get_tariff_rate as _get_tariff_rate
@@ -1171,14 +1285,12 @@ def _process_invoice_csv(
             raw_zip = (row.get("Zip") or "").strip()
             try:
                 gross_wt = float(row.get("GrossWt") or 0)
+                rate_val = float(row.get("Rate") or 0)
                 if raw_zip and gross_wt > 0:
-                    tariff = _get_tariff_rate(raw_zip[:3], gross_wt,
-                                              _diesel_price=_diesel_price, _fsc_pct=_fsc_pct)
-                    if tariff:
-                        pallet_tariff_sum += tariff["access_prog"]
-                        pallet_base_tariff_sum += tariff.get("base_tariff") or Decimal("0")
-                        if pallet_fsc_pct_last is None and tariff.get("fsc_pct") is not None:
-                            pallet_fsc_pct_last = tariff["fsc_pct"]
+                    zip3 = raw_zip[:3]
+                    alg_pallet_fallback.append((zip3, gross_wt))
+                    if rate_val > 0:
+                        alg_rate_by_zip3.setdefault(zip3, rate_val)
             except (ValueError, TypeError):
                 pass
 
@@ -1206,13 +1318,53 @@ def _process_invoice_csv(
 
     matched_rec = None
     match_strategy: Optional[str] = None
+    effective_prophecy_bol: Optional[str] = None
 
-    # Prophecy BOL lives in Job Name only — the BOL No column is always a permit number.
-    effective_prophecy_bol = job_name if job_name and _is_prophecy_bol(job_name) else None
+    # Try exact, reliable matches first — a real match always beats a "Job Name looks like
+    # a Prophecy BOL number" guess, since ordinary trip suffixes can coincidentally fall in
+    # the same 140000-149999 numeric range as real Prophecy BOLs (see _is_prophecy_bol).
+    # Job Name normally carries the trip suffix (e.g. "110810" → TEC_T_0110810); for a
+    # genuine Wolf/311 load with no Technique trip, it instead carries the Prophecy BOL
+    # itself — that's only checked below, after ruling out a real trip match.
 
-    if effective_prophecy_bol:
-        # ── Wolf/311 path ─────────────────────────────────────────────────────
-        # Job Name is a Prophecy BOL (14xxxx). No Technique trip for this load.
+    # 1. Already uploaded: match by Z-number.
+    if settings.USE_MOCK_DATA:
+        for rec in _mock_state.values():
+            if rec.get("invoice_number") == invoice_no:
+                matched_rec = rec
+                match_strategy = "invoice_number"
+                break
+    else:
+        matched_rec = (
+            db.query(BOLRecord)
+            .filter(BOLRecord.invoice_number == invoice_no)
+            .first()
+        )
+        if matched_rec is not None:
+            match_strategy = "invoice_number"
+
+    # 2. Job Name as trip suffix.
+    if matched_rec is None and job_name:
+        if settings.USE_MOCK_DATA:
+            for rec in _mock_state.values():
+                trip = rec.get("technique_trip") or ""
+                if trip and _trip_to_suffix(trip) == job_name:
+                    matched_rec = rec
+                    match_strategy = "job_name"
+                    break
+        else:
+            for row_obj in db.query(BOLRecord).filter(
+                BOLRecord.technique_trip.isnot(None)
+            ).all():
+                if _trip_to_suffix(row_obj.technique_trip or "") == job_name:
+                    matched_rec = row_obj
+                    match_strategy = "job_name"
+                    break
+
+    # 3. Job Name as a Prophecy BOL (Wolf/311 — no Technique trip for this load). Only
+    # reached once steps 1-2 have ruled out this being an ordinary trip suffix.
+    if matched_rec is None and job_name and _is_prophecy_bol(job_name):
+        effective_prophecy_bol = job_name
         bol_num = int(effective_prophecy_bol)
         if settings.USE_MOCK_DATA:
             for rec in _mock_state.values():
@@ -1228,72 +1380,35 @@ def _process_invoice_csv(
             )
             if matched_rec is not None:
                 match_strategy = "prophecy_bol"
-    else:
-        # ── Corp / Technique path ─────────────────────────────────────────────
-        # Job Name is the trip suffix (e.g. "110810" → TEC_T_0110810).
 
-        # 1. Already uploaded: match by Z-number.
+    # 4. Pallets + pieces (last resort, non-comingle only).
+    if matched_rec is None and not (cust_job_no or "").upper().startswith("CM") \
+            and total_pallets and total_pcs:
         if settings.USE_MOCK_DATA:
-            for rec in _mock_state.values():
-                if rec.get("invoice_number") == invoice_no:
-                    matched_rec = rec
-                    match_strategy = "invoice_number"
-                    break
+            candidates = [
+                rec for rec in _mock_state.values()
+                if rec.get("technique_pallets") == total_pallets
+                and rec.get("technique_pcs") == total_pcs
+                and not rec.get("invoice_number")
+                and rec.get("technique_trip") is not None
+            ]
+            if len(candidates) == 1:
+                matched_rec = candidates[0]
+                match_strategy = "pallets_pieces"
+                logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
+                               invoice_no, matched_rec.get("technique_trip"))
         else:
-            matched_rec = (
-                db.query(BOLRecord)
-                .filter(BOLRecord.invoice_number == invoice_no)
-                .first()
-            )
-            if matched_rec is not None:
-                match_strategy = "invoice_number"
-
-        # 2. Job Name as trip suffix.
-        if matched_rec is None and job_name:
-            if settings.USE_MOCK_DATA:
-                for rec in _mock_state.values():
-                    trip = rec.get("technique_trip") or ""
-                    if trip and _trip_to_suffix(trip) == job_name:
-                        matched_rec = rec
-                        match_strategy = "job_name"
-                        break
-            else:
-                for row_obj in db.query(BOLRecord).filter(
-                    BOLRecord.technique_trip.isnot(None)
-                ).all():
-                    if _trip_to_suffix(row_obj.technique_trip or "") == job_name:
-                        matched_rec = row_obj
-                        match_strategy = "job_name"
-                        break
-
-        # 3. Pallets + pieces (last resort, non-comingle only).
-        if matched_rec is None and not (cust_job_no or "").upper().startswith("CM") \
-                and total_pallets and total_pcs:
-            if settings.USE_MOCK_DATA:
-                candidates = [
-                    rec for rec in _mock_state.values()
-                    if rec.get("technique_pallets") == total_pallets
-                    and rec.get("technique_pcs") == total_pcs
-                    and not rec.get("invoice_number")
-                    and rec.get("technique_trip") is not None
-                ]
-                if len(candidates) == 1:
-                    matched_rec = candidates[0]
-                    match_strategy = "pallets_pieces"
-                    logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
-                                   invoice_no, matched_rec.get("technique_trip"))
-            else:
-                candidates = db.query(BOLRecord).filter(
-                    BOLRecord.technique_pallets == total_pallets,
-                    BOLRecord.technique_pcs == total_pcs,
-                    BOLRecord.invoice_number.is_(None),
-                    BOLRecord.technique_trip.isnot(None),
-                ).all()
-                if len(candidates) == 1:
-                    matched_rec = candidates[0]
-                    match_strategy = "pallets_pieces"
-                    logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
-                                   invoice_no, matched_rec.technique_trip)
+            candidates = db.query(BOLRecord).filter(
+                BOLRecord.technique_pallets == total_pallets,
+                BOLRecord.technique_pcs == total_pcs,
+                BOLRecord.invoice_number.is_(None),
+                BOLRecord.technique_trip.isnot(None),
+            ).all()
+            if len(candidates) == 1:
+                matched_rec = candidates[0]
+                match_strategy = "pallets_pieces"
+                logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
+                               invoice_no, matched_rec.technique_trip)
 
     if matched_rec is None:
         is_wolf_stub = bool(effective_prophecy_bol)
@@ -1507,15 +1622,12 @@ def _process_invoice_csv(
             matched_rec.invoice_email_sender = invoice_email_sender
         if invoice_sent_at:
             matched_rec.invoice_sent_at = invoice_sent_at
-        if pallet_tariff_sum > 0 and not already_done:
-            if existing_inv:
-                matched_rec.access_prog  = (matched_rec.access_prog  or Decimal("0")) + pallet_tariff_sum
-                matched_rec.base_tariff  = (matched_rec.base_tariff  or Decimal("0")) + pallet_base_tariff_sum
-            else:
-                matched_rec.access_prog = pallet_tariff_sum
-                matched_rec.base_tariff = pallet_base_tariff_sum if pallet_base_tariff_sum > 0 else None
-            if pallet_fsc_pct_last is not None:
-                matched_rec.fsc_pct = pallet_fsc_pct_last
+        if not already_done:
+            _apply_access_prog_calc(
+                matched_rec, match_strategy, effective_prophecy_bol,
+                alg_rate_by_zip3, alg_pallet_fallback, fsc_rate_val, fsc_cost_val,
+                _get_tariff_rate, _diesel_price, _fsc_pct,
+            )
         if matched_rec.amount and matched_rec.access_prog:
             matched_rec.cost_pct = Decimal(
                 str(round(float(matched_rec.amount) / float(matched_rec.access_prog), 6))
@@ -1841,6 +1953,9 @@ def export_prophecy_sid(db: Session = Depends(get_db)):
             )
         pallet_rows = generate_mock_sid_rows(approved)
         csv_bytes = generate_sid_csv(pallet_rows)
+        now = datetime.now(timezone.utc)
+        for r in approved:
+            r["sid_exported_at"] = now
         logger.info("[SID] Mock export: %d pallet rows for %d Type-A records → %s",
                     len(pallet_rows), len(approved), filename)
         return Response(
@@ -1876,6 +1991,10 @@ def export_prophecy_sid(db: Session = Depends(get_db)):
         )
 
     csv_bytes = generate_sid_csv(pallet_rows)
+    now = datetime.now(timezone.utc)
+    for r in approved_rows:
+        r.sid_exported_at = now
+    db.commit()
     logger.info("[SID] Exported %d pallet rows for %d manifests → %s", len(pallet_rows), len(manifests), filename)
 
     return Response(
@@ -1883,6 +2002,112 @@ def export_prophecy_sid(db: Session = Depends(get_db)):
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.post("/api/bols/{record_id}/export-prophecy-sid", tags=["Export"])
+def export_prophecy_sid_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
+    """
+    Generate a Prophecy SID import CSV for a single record's manifest —
+    the per-record equivalent of GET /api/export/prophecy-sid, for pushing
+    one urgent Type A record to Prophecy without waiting to batch-approve
+    and export everything at once. Available on pending (not-yet-approved)
+    Type A records, per Katie's workflow: check it as soon as she's reviewed
+    one record, rather than only after a full batch approval.
+    """
+    filename_suffix = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+    if settings.USE_MOCK_DATA:
+        rec = _mock_state.get(str(record_id))
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Record not found.")
+        if not rec.get("needs_sid_export", True):
+            raise HTTPException(status_code=422, detail="This record already has a BOL — nothing to export.")
+        pallet_rows = generate_mock_sid_rows([rec])
+        csv_bytes = generate_sid_csv(pallet_rows)
+        rec["sid_exported_at"] = datetime.now(timezone.utc)
+        trip = rec.get("technique_trip") or "record"
+        filename = f"SG360_Prophecy_SID_{trip}_{filename_suffix}.csv"
+        logger.info("[SID] Mock per-record export: %s → %s", trip, filename)
+        return Response(
+            content=csv_bytes,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    from backend.data_layer import get_pallet_data_for_manifests
+
+    rec = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Record not found.")
+    if not rec.needs_sid_export:
+        raise HTTPException(status_code=422, detail="This record already has a BOL — nothing to export.")
+    if not rec.manifest:
+        raise HTTPException(status_code=422, detail="This record has no manifest number to export.")
+
+    pallet_rows = get_pallet_data_for_manifests([rec.manifest])
+    if not pallet_rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No pallet data found in VisualMail for manifest {rec.manifest}.",
+        )
+
+    csv_bytes = generate_sid_csv(pallet_rows)
+    rec.sid_exported_at = datetime.now(timezone.utc)
+    db.commit()
+
+    filename = f"SG360_Prophecy_SID_{rec.technique_trip or rec.manifest}_{filename_suffix}.csv"
+    logger.info("[SID] Exported %d pallet rows for manifest %s → %s", len(pallet_rows), rec.manifest, filename)
+
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/bols/{record_id}/refresh-bol", tags=["Admin"])
+def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
+    """
+    Check whether Prophecy now has a BOL (load_id/pooled_to_load_id) for one
+    specific record's manifest, without re-running the full Technique pull
+    across every manifest. Meant for the round-trip: Katie exports a SID file
+    for one record, imports it into Prophecy, then uses this to confirm the
+    BOL number came back — instead of waiting for tomorrow's full pull.
+
+    Reuses get_technique_data() unchanged (proven, already-working query) and
+    filters the result to this one manifest, rather than a new hand-written
+    single-manifest SQL query — heavier than strictly necessary, but zero risk
+    of a subtly wrong new query. Revisit if this proves too slow in practice.
+    """
+    if settings.USE_MOCK_DATA:
+        raise HTTPException(
+            status_code=400,
+            detail="Refresh-BOL is disabled in mock mode. Set USE_MOCK_DATA=False in .env.",
+        )
+
+    rec = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Record not found.")
+    if not rec.manifest:
+        raise HTTPException(status_code=422, detail="This record has no manifest number to check.")
+    if not rec.needs_sid_export:
+        return {"updated": False, "bol_number": rec.bol_number, "message": "This record already has a BOL."}
+
+    from backend.data_layer import get_technique_data
+
+    manifests = get_technique_data(days_back=21)
+    match = next((m for m in manifests if m.get("manifest") == rec.manifest), None)
+    if match is None:
+        return {"updated": False, "bol_number": None, "message": "Manifest not found in Technique — try again later."}
+
+    before = rec.bol_number
+    _apply_bol_status(rec, match)
+    db.commit()
+
+    if rec.bol_number and rec.bol_number != before:
+        logger.info("[REFRESH-BOL] %s → BOL %s", rec.manifest, rec.bol_number)
+        return {"updated": True, "bol_number": rec.bol_number, "message": f"BOL {rec.bol_number} found."}
+    return {"updated": False, "bol_number": rec.bol_number, "message": "No BOL in Prophecy yet — check again later."}
 
 
 @app.get("/api/logs", response_model=list[BOLSummary], tags=["Logs"])

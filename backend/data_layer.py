@@ -369,6 +369,79 @@ def get_prophecy_data(bol_number: int) -> Optional[dict]:
         return None
 
 
+# Per-row (not aggregated) — used to independently calculate access_prog for Wolf/311
+# loads the same way get_pallet_data_for_manifests() does for Technique trips.
+_PROPHECY_PALLET_QUERY = """
+SELECT oh.destination_id, oh.destination_zip, oh.weight
+FROM SQLAPPS3.ShipperPlus_Segerdahl.dbo.Shipments AS s
+INNER JOIN SQLAPPS3.ShipperPlus_Segerdahl.dbo.order_headers AS oh
+    ON s.shipment_id = oh.shipment_id
+WHERE s.pooled_to_load_id = ?
+   OR (ISNULL(s.pooled_to_load_id, 0) = 0 AND s.load_id = ?)
+"""
+
+_PROPHECY_PALLET_DIRECT_QUERY = """
+SELECT oh.destination_id, oh.destination_zip, oh.weight
+FROM dbo.Shipments AS s
+INNER JOIN dbo.order_headers AS oh
+    ON s.shipment_id = oh.shipment_id
+WHERE s.pooled_to_load_id = ?
+   OR (ISNULL(s.pooled_to_load_id, 0) = 0 AND s.load_id = ?)
+"""
+
+
+def get_prophecy_pallet_data(bol_number: int) -> list[dict]:
+    """
+    Fetch per-row destination + weight for a Prophecy BOL from ShipperPlus order_headers —
+    the Wolf/311 equivalent of get_pallet_data_for_manifests(), used to independently
+    calculate access_prog from SG360's own data instead of ALG's invoiced weight.
+
+    destination_id is SCF/NDC-prefixed (e.g. "SCF080") like VisualMail's Locations.AccountNumber —
+    confirmed live to hold that format, though it's sometimes NULL; destination_zip (raw 5-digit
+    ZIP) is always populated and used as a fallback for the zip3.
+
+    Returns a list of {"destination_id": str|None, "destination_zip": str, "weight": Decimal}.
+    Returns [] if no rows found or the query fails (caller should fall back to ALG's own weight).
+    """
+    from backend.config import settings
+
+    def _run_query(conn, query):
+        cursor = conn.cursor()
+        cursor.execute(query, (bol_number, bol_number))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    def _to_result(rows):
+        return [
+            {
+                "destination_id": row[0],
+                "destination_zip": row[1],
+                "weight": Decimal(str(row[2])) if row[2] else Decimal("0"),
+            }
+            for row in rows
+        ]
+
+    if settings.TECH_PRD1_USER and settings.TECH_PRD1_PASSWORD:
+        try:
+            rows = _run_query(_get_tech_prd1_connection(), _PROPHECY_PALLET_DIRECT_QUERY)
+            if rows:
+                return _to_result(rows)
+            logger.warning("[PROPHECY] No pallet rows on PRD1 for BOL %s — trying SQLAPPS3", bol_number)
+        except Exception as exc:
+            logger.warning("[PROPHECY] PRD1 pallet query failed for BOL %s (%s) — falling back to SQLAPPS3", bol_number, exc)
+
+    try:
+        rows = _run_query(_get_connection(), _PROPHECY_PALLET_QUERY)
+        if not rows:
+            logger.warning("[PROPHECY] No pallet rows found for BOL %s", bol_number)
+            return []
+        return _to_result(rows)
+    except Exception as exc:
+        logger.error("[PROPHECY] SQLAPPS3 pallet query also failed for BOL %s: %s", bol_number, exc)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Tariff / Access rates  (seeded from CSV via backend/seed_rates.py)
 # ---------------------------------------------------------------------------
@@ -470,7 +543,8 @@ def get_tariff_rate(destination_zip3: str, weight: float,
     _diesel_price / _fsc_pct: pass pre-fetched values to avoid one EIA API call per
     pallet row. If omitted, fetched from EIA on each call.
 
-    Returns: {"access_prog": Decimal, "matched_zone": str}
+    Returns: {"access_prog": Decimal, "base_tariff": Decimal, "fsc_pct": Decimal,
+              "is_exact_zone_match": bool}
     Returns None if no active tariff row found even with nearest-zone fallback.
     """
     from backend.database import SessionLocal
@@ -530,6 +604,7 @@ def get_tariff_rate(destination_zip3: str, weight: float,
             "access_prog": Decimal(str(round(float(access_prog), 2))),
             "base_tariff": Decimal(str(round(base_tariff, 2))),
             "fsc_pct":     fsc_pct,
+            "is_exact_zone_match": matched_zone == zip3,
         }
     finally:
         db.close()

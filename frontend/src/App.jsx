@@ -6,6 +6,7 @@ import ApprovedSection from './components/ApprovedSection.jsx';
 import FlagModal from './components/FlagModal.jsx';
 import ReassignInvoiceModal from './components/ReassignInvoiceModal.jsx';
 import LogSection from './components/LogSection.jsx';
+import BulkActionToolbar from './components/BulkActionToolbar.jsx';
 
 // When Module 2 ships: extract fetch helpers to src/api/bolsApi.js
 // and move this state/logic to src/pages/BolReconciliation.jsx
@@ -22,7 +23,6 @@ export default function App() {
   const [flagTarget, setFlagTarget] = useState(null);
   const [flagSubmitting, setFlagSubmitting] = useState(false);
 
-  const [sendLoading, setSendLoading] = useState(false);
   const [sidLoading, setSidLoading] = useState(false);
   const [invoiceUploading, setInvoiceUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(null);
@@ -39,11 +39,19 @@ export default function App() {
   const [pullLoading, setPullLoading] = useState(false);
   const [pollFolderLoading, setPollFolderLoading] = useState(false);
   const [filterText, setFilterText] = useState('');
+  const [sort, setSort] = useState({ column: null, direction: 'default' });
   const [uploadSender, setUploadSender] = useState('');
   const [uploadDate, setUploadDate] = useState('');
   const [uploadTime, setUploadTime] = useState('');
   const [showSenderFields, setShowSenderFields] = useState(false);
   const [sidExportedThisSession, setSidExportedThisSession] = useState(false);
+  const [exportingSidId, setExportingSidId] = useState(null);
+  const [checkingBolId, setCheckingBolId] = useState(null);
+  const [refreshLoading, setRefreshLoading] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [bulkActionLoading, setBulkActionLoading] = useState(false);
+  const [bulkFlagOpen, setBulkFlagOpen] = useState(false);
+  const [bulkResults, setBulkResults] = useState(null); // { action, succeeded, total, skipped }
 
   const thirdPartyBols     = pendingBols.filter(b => b.is_third_party);
   const visiblePendingBols = pendingBols.filter(b => !b.is_third_party);
@@ -54,6 +62,47 @@ export default function App() {
     readyToReview: visiblePendingBols.filter(b => b.technique_trip != null && b.amount != null).length,
     approvedToday: approvedBols.length,
   };
+
+  // -------------------------------------------------------------------------
+  // Selection (issue #32 — multi-select bulk actions)
+  // -------------------------------------------------------------------------
+
+  function toggleSelect(id) {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleSelectAll(visibleIds) {
+    setSelectedIds(prev => {
+      const allSelected = visibleIds.length > 0 && visibleIds.every(id => prev.has(id));
+      const next = new Set(prev);
+      if (allSelected) {
+        visibleIds.forEach(id => next.delete(id));
+      } else {
+        visibleIds.forEach(id => next.add(id));
+      }
+      return next;
+    });
+  }
+
+  function clearSelection() {
+    setSelectedIds(new Set());
+  }
+
+  // -------------------------------------------------------------------------
+  // Sorting (issue #33 — sortable columns)
+  // -------------------------------------------------------------------------
+
+  function handleSort(column) {
+    setSort(prev => {
+      if (prev.column !== column) return { column, direction: 'asc' };
+      if (prev.direction === 'asc') return { column, direction: 'desc' };
+      return { column: null, direction: 'default' };
+    });
+  }
 
   // -------------------------------------------------------------------------
   // Fetch helpers
@@ -166,6 +215,185 @@ export default function App() {
       setError(err.message);
     } finally {
       setSidLoading(false);
+    }
+  }
+
+  async function handleExportRecordToProphecy(recordId) {
+    setExportingSidId(recordId);
+    try {
+      const res = await fetch(`/api/bols/${recordId}/export-prophecy-sid`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `SID export failed (${res.status})`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const disposition = res.headers.get('Content-Disposition') || '';
+      const match = disposition.match(/filename="([^"]+)"/);
+      a.href = url;
+      a.download = match ? match[1] : 'SG360_Prophecy_SID.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setSuccessMessage('Prophecy SID file downloaded for this record — import it into Prophecy to create the load number.');
+      await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setExportingSidId(null);
+    }
+  }
+
+  async function handleCheckBol(recordId) {
+    setCheckingBolId(recordId);
+    try {
+      const res = await fetch(`/api/bols/${recordId}/refresh-bol`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Check BOL failed (${res.status})`);
+      setSuccessMessage(data.message || (data.updated ? 'BOL found.' : 'No BOL yet.'));
+      if (data.updated) await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setCheckingBolId(null);
+    }
+  }
+
+  async function handleRefresh() {
+    setRefreshLoading(true);
+    try {
+      await Promise.all([fetchPending(), fetchApproved()]);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRefreshLoading(false);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Bulk actions (issue #32) — fire the same per-record endpoints used by the
+  // individual action buttons, once per eligible selected record, then a
+  // single refresh. Eligibility mirrors each action's per-row button
+  // condition in BOLRow.jsx.
+  // -------------------------------------------------------------------------
+
+  function selectedRecords() {
+    return visiblePendingBols.filter(b => selectedIds.has(b.id));
+  }
+
+  async function handleBulkApprove() {
+    const targets = selectedRecords(); // no eligibility restriction — matches per-row Approve
+    if (!targets.length) return;
+    setBulkActionLoading(true);
+    try {
+      const results = await Promise.allSettled(
+        targets.map(b => fetch(`/api/bols/${b.id}/approve`, { method: 'POST' }))
+      );
+      const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
+      setBulkResults({ action: 'approved', succeeded, total: targets.length, skipped: 0 });
+      await Promise.all([fetchPending(), fetchApproved()]);
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBulkActionLoading(false);
+    }
+  }
+
+  function openBulkFlag() {
+    if (!selectedRecords().length) return;
+    setBulkFlagOpen(true);
+  }
+
+  async function handleBulkFlagSubmit(reason) {
+    const all = selectedRecords();
+    const eligible = all.filter(b => b.status !== 'flagged');
+    const skipped = all.length - eligible.length;
+    setFlagSubmitting(true);
+    try {
+      const results = await Promise.allSettled(
+        eligible.map(b => fetch(`/api/bols/${b.id}/flag`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason }),
+        }))
+      );
+      const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
+      setBulkFlagOpen(false);
+      setBulkResults({ action: 'flagged', succeeded, total: all.length, skipped });
+      await Promise.all([fetchPending(), fetchApproved()]);
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setFlagSubmitting(false);
+    }
+  }
+
+  async function handleBulkMarkThirdParty() {
+    const all = selectedRecords();
+    const eligible = all.filter(b => !b.amount && !b.bol_number && !b.is_third_party);
+    const skipped = all.length - eligible.length;
+    if (!all.length) return;
+    setBulkActionLoading(true);
+    try {
+      const results = await Promise.allSettled(
+        eligible.map(b => fetch(`/api/bols/${b.id}/mark-third-party`, { method: 'POST' }))
+      );
+      const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
+      setBulkResults({ action: 'marked third-party', succeeded, total: all.length, skipped });
+      await fetchPending();
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBulkActionLoading(false);
+    }
+  }
+
+  async function handleBulkIgnore() {
+    const all = selectedRecords();
+    const eligible = all.filter(b => b.technique_trip == null && b.invoice_number && !b.is_ignored);
+    const skipped = all.length - eligible.length;
+    if (!all.length) return;
+    setBulkActionLoading(true);
+    try {
+      const results = await Promise.allSettled(
+        eligible.map(b => fetch(`/api/bols/${b.id}/ignore`, { method: 'POST' }))
+      );
+      const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
+      setBulkResults({ action: 'ignored', succeeded, total: all.length, skipped });
+      await fetchPending();
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBulkActionLoading(false);
+    }
+  }
+
+  async function handleBulkExportSid() {
+    const all = selectedRecords();
+    const eligible = all.filter(b => b.needs_sid_export && b.manifest && !b.is_third_party && !b.is_ignored);
+    const skipped = all.length - eligible.length;
+    if (!all.length) return;
+    setBulkActionLoading(true);
+    try {
+      // Sequential, not Promise.all — reduces (doesn't fully eliminate) the chance
+      // the browser blocks/prompts on multiple simultaneous downloads. Reuses the
+      // exact per-record handler from #35 unchanged, so each file is identical to
+      // what clicking that record's own SID button would produce.
+      for (const b of eligible) {
+        await handleExportRecordToProphecy(b.id);
+      }
+      setBulkResults({ action: 'SID-exported', succeeded: eligible.length, total: all.length, skipped });
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBulkActionLoading(false);
     }
   }
 
@@ -471,6 +699,30 @@ export default function App() {
           </div>
         )}
 
+        {/* Bulk action results */}
+        {bulkResults && (
+          <div style={{
+            background: bulkResults.skipped > 0 ? '#fffbeb' : '#f0fdf4',
+            border: `1px solid ${bulkResults.skipped > 0 ? '#fde68a' : '#bbf7d0'}`,
+            borderRadius: 6,
+            padding: '10px 16px',
+            marginBottom: 16,
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            color: bulkResults.skipped > 0 ? '#92400e' : '#166534',
+          }}>
+            <span>
+              {bulkResults.succeeded} of {bulkResults.total} records {bulkResults.action}
+              {bulkResults.skipped > 0 && ` — ${bulkResults.skipped} skipped (not eligible)`}
+            </span>
+            <button
+              onClick={() => setBulkResults(null)}
+              style={{ background: 'none', border: 'none', color: 'inherit', fontSize: 16, padding: '0 4px' }}
+            >×</button>
+          </div>
+        )}
+
         {activeTab === 'dashboard' && (
           <>
             <SummaryBar
@@ -501,6 +753,23 @@ export default function App() {
               <span>·</span>
               <span>{summary.readyToReview} ready &nbsp;·&nbsp; {summary.manifestOnly} manifest only &nbsp;·&nbsp; {summary.invoiceOnly} invoice only &nbsp;·&nbsp; {summary.approvedToday} approved</span>
               <span style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+                <button
+                  onClick={handleRefresh}
+                  disabled={refreshLoading}
+                  title="Refresh pending and approved records from this dashboard's own data (no live Technique pull)"
+                  style={{
+                    background: refreshLoading ? '#e5e7eb' : '#f9fafb',
+                    color: refreshLoading ? '#9ca3af' : '#374151',
+                    border: '1px solid #d1d5db',
+                    borderRadius: 5,
+                    padding: '4px 12px',
+                    fontWeight: 600,
+                    fontSize: 12,
+                    cursor: refreshLoading ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {refreshLoading ? 'Refreshing…' : '⟳ Refresh'}
+                </button>
                 <button
                   onClick={handlePull}
                   disabled={pullLoading}
@@ -706,13 +975,20 @@ export default function App() {
 
             <BOLTable
               bols={visiblePendingBols}
-              loading={loadingPending}
+              loading={loadingPending && pendingBols.length === 0}
               approvingId={approvingId}
               unflaggingId={unflaggingId}
               markingThirdPartyId={markingThirdPartyId}
               ignoringId={ignoringId}
+              exportingSidId={exportingSidId}
+              checkingBolId={checkingBolId}
               filterText={filterText}
               onFilterChange={setFilterText}
+              selectedIds={selectedIds}
+              onToggleSelect={toggleSelect}
+              onToggleSelectAll={toggleSelectAll}
+              sort={sort}
+              onSort={handleSort}
               onApprove={handleApprove}
               onFlagOpen={setFlagTarget}
               onUnflag={handleUnflag}
@@ -720,6 +996,8 @@ export default function App() {
               onMarkThirdParty={handleMarkThirdParty}
               onReassignOpen={id => setReassignTargetId(id)}
               onIgnore={handleIgnore}
+              onExportSid={handleExportRecordToProphecy}
+              onCheckBol={handleCheckBol}
             />
 
             <ThirdPartySection
@@ -732,7 +1010,7 @@ export default function App() {
 
             <ApprovedSection
               approvedBols={approvedBols}
-              loading={loadingApproved}
+              loading={loadingApproved && approvedBols.length === 0}
               sidLoading={sidLoading}
               sidExportedThisSession={sidExportedThisSession}
               unapprovingId={unapprovingId}
@@ -756,6 +1034,15 @@ export default function App() {
         />
       )}
 
+      {bulkFlagOpen && (
+        <FlagModal
+          count={selectedRecords().length}
+          submitting={flagSubmitting}
+          onClose={() => setBulkFlagOpen(false)}
+          onSubmit={handleBulkFlagSubmit}
+        />
+      )}
+
       {reassignTargetId && (
         <ReassignInvoiceModal
           bol={pendingBols.find(b => b.id === reassignTargetId) || null}
@@ -765,6 +1052,17 @@ export default function App() {
           onIgnore={handleIgnore}
         />
       )}
+
+      <BulkActionToolbar
+        count={selectedIds.size}
+        loading={bulkActionLoading}
+        onApprove={handleBulkApprove}
+        onFlag={openBulkFlag}
+        onMarkThirdParty={handleBulkMarkThirdParty}
+        onIgnore={handleBulkIgnore}
+        onExportSid={handleBulkExportSid}
+        onClear={clearSelection}
+      />
     </div>
   );
 }

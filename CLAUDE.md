@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Prerequisites**: Python 3.11+, Node.js 18+, PostgreSQL 15+ (only needed when `USE_MOCK_DATA=False`).
+
 ## Commands
 
 **Start both servers (recommended):**
@@ -40,6 +42,15 @@ Omit flags to use the default source paths under `c:\nikhilm\billing-freight-aut
 There are no automated tests. Verify changes manually via the dashboard at `http://localhost:3000` and the FastAPI docs at `http://localhost:8000/docs`.
 
 **Vite dev proxy:** The frontend calls bare `/api/*` paths. Vite proxies them to `http://localhost:8000`. Never hardcode `localhost:8000` in frontend code — the proxy handles it.
+
+**Launching the app for verification:** use the `run` skill (`.claude/skills/run`) — it starts both servers, waits for health checks, and screenshots the dashboard.
+
+## Security notes (see `documentation/SECURITY.md` for full detail)
+
+- `.env` never gets committed; real credentials live only there. `.env.example`-style placeholders are fine to commit.
+- All production DB access is intended to be read-only (SELECT-only service account) — the app writes only to its own PostgreSQL database.
+- Don't push directly to `main` once Katie is using the app day-to-day; land changes through a branch/PR.
+- No production data (real BOL/invoice exports) belongs in the repo — `test_invoices_*/` is gitignored for this reason.
 
 ## .env quick-start
 
@@ -96,7 +107,9 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/invoices/upload` | Upload ALG invoice CSV (Z-number format) → match + update record; response includes `conflict` key if trip already had an invoice |
 | GET | `/api/invoices/{z}/file` | Serve original Z-number CSV from `INVOICE_FOLDER` (or `test_data/` in mock mode) |
 | POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` path for unprocessed CSVs → process each; files stay in place, dedup via DB `invoice_number` |
-| GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only) |
+| GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only); also stamps `sid_exported_at` on each included record |
+| POST | `/api/bols/{id}/export-prophecy-sid` | Per-record SID export — pushes one pending Type A record to Prophecy without waiting for a batch approval; same CSV logic as the bulk route, scoped to one manifest |
+| POST | `/api/bols/{id}/refresh-bol` | Check Prophecy for a BOL on one record's manifest without a full Technique pull; reuses `get_technique_data()` filtered to one manifest — ~10s live (hits AWP-SQL-PROD), near-instant if the record already has a BOL |
 | POST | `/api/export` | Generate accounting CSV and email to Mary + Katie |
 | GET | `/api/logs` | All records across all dates; optional `?start_date=` / `?end_date=` / `?status=` filters |
 | GET | `/api/logs/export` | Download log as CSV; same date-range params as above |
@@ -126,17 +139,19 @@ The source file being replaced: `c:\nikhilm\billing-freight-automation\Technique
 
 | # | Question | Who to ask | Status |
 |---|---|---|---|
-| 2 | **Destination → ZIP field in VisualMail**: Current code parses `Locations.AccountNumber` (e.g. `SCF606` → `606`) for tariff zone lookup. Marge (June 22) said the ZIP is "not in the Manifest table" and pointed to a field called `DestinationID`. Unclear if this is the same field via the Pallet→Locations join or a different one. Do NOT change `get_pallet_data_for_manifests()` SQL until confirmed. Email sent to Marge June 22. | Marge | ❓ Open |
 | 3 | **ALG invoice format**: Tanya can send CSV (format confirmed from Z556229.CSV). `POST /api/invoices/upload` accepts it. Ask Phil to switch Tanya to CSV delivery. | Phil / Tanya | ✅ CSV format confirmed |
-| 8 | **Prophecy BOL sync**: After Katie imports SID file + creates loads, how do we query Prophecy DB for the resulting BOL numbers? Need connection string + table schema. | Megha | ❓ Open — needed for EOD BOL sync |
-| 10 | **VisualMail SELECT permission on AWD-SQL-WH4**: `get_pallet_data_for_manifests()` and `get_manifest_weights()` fail with Msg 229 (SELECT permission denied on VisualMail). Affects pallet destination ZIP lookup and SID export in live mode. Does NOT block mock mode. | Megha | ❓ Open — ask Megha to grant SELECT on VisualMail to service account |
+| 11 | **`tariff_rates` coverage gaps**: Confirmed (2026-07-01, against a real invoice) that at least 3 destination zones (253, 231, 235) are entirely absent from the source rate card, and zone 282 has two conflicting rates for two different facilities (disambiguated by a `Drop Ship Site Key` column in the source spreadsheet, which ALG's own invoices reference via their `SiteKey` column — not currently used in our lookup). `access_prog` now falls back to that same invoice's own billed rate for a gap zone before guessing a nearest zone, which covers the common case, but the rate card itself should still be completed. | Marge / Phil | ❓ Open — less urgent now that ALG's own invoiced rate is a working interim fallback |
 
 **Resolved June 22 meeting:**
 - **Q1 FSC unit**: Percentage of base freight. DB stores `fsc_amount=0.365` → 36.5% surcharge (decimal fraction, NOT 36.5). `get_fsc_rate()` returns `fsc_amount` directly. Applied as `access_prog = base_tariff × (1 + fsc_pct)`.
-- **Q2/Q7 Destination → ZIP**: Tariff lookup is **per-pallet**. Confirmed approach: `SCF`/`NDC` prefix + 3-digit zone (e.g. `SCF606` → `606`). **Exact VisualMail field uncertain** — current code uses `Locations.AccountNumber` via Pallet→Locations join, but Marge (June 22) indicated the field may be `DestinationID` in the Manifest table. See Open Question #2. See `get_pallet_data_for_manifests()`.
-- **Q4 Diesel source**: EIA weekly on-highway diesel (`EMD_EPD2D_PTE_NUS_DPG`). Requires `EIA_API_KEY` in `.env`. `get_current_diesel_price()` in `data_layer.py`.
+- **Q4 Diesel source**: EIA weekly on-highway diesel (`EMD_EPD2D_PTE_NUS_DPG`). Requires `EIA_API_KEY` in `.env`. `get_current_diesel_price()` in `data_layer.py`. As of 2026-07-01, only used as a fallback — `access_prog` prefers the FSC rate parsed directly off the matched ALG invoice (see below).
 - **Q5 Z-number flow**: Katie creates load in Prophecy manually (Import → Consolidate → Re-rate → Create Load). Load number = BOL number. Our SID export feeds this import step.
 - **Q6 AWP-SQL-PROD**: Access confirmed live.
+
+**Resolved 2026-07-01 (verified live against AWP-SQL-PROD):**
+- **Q2/Q7 Destination → ZIP**: `Locations.AccountNumber` via the Pallet→Locations join (e.g. `SCF606` → `606`) is confirmed correct — independently re-run against AWP-SQL-PROD and returns correct per-pallet destination/weight data. Marge's alternate suggestion (`DestinationID`) is not needed. `get_pallet_data_for_manifests()`'s SQL is unchanged and confirmed correct.
+- **Q10 VisualMail SELECT permission**: `get_manifest_weights()` and `get_pallet_data_for_manifests()` both succeed live today — the permission is granted (or this was never actually blocking). Both are now load-bearing for `access_prog` (see below), not just SID export.
+- **Q8 Prophecy BOL sync**: Already implemented, was just undocumented. `get_technique_data()`'s existing LEFT JOIN to `SQLAPPS3.ShipperPlus_Segerdahl.dbo.shipments` returns `load_id`/`pooled_to_load_id` for every manifest — `pull_technique_data()` (and now the per-record `POST /api/bols/{id}/refresh-bol`) already pick these up automatically via the shared `_apply_bol_status()` helper. No new connection string or schema needed. Live round-trip (real SID export → Katie imports into Prophecy → BOL appears) verified by the user directly, not by an automated test — see `documentation/Developmental Documentation.md`.
 
 **Design decisions (June 22):**
 - `prop_reship` column intentionally hidden from dashboard (Prophecy uses wrong 2006 tariff; Katie was manually typing it).
@@ -178,18 +193,26 @@ Both source files are on disk at `c:\nikhilm\billing-freight-automation\`. Run `
 
 **EP ZIP lookup chain:** Tariff CSV `EP ZIP = "3-d 606"` → `seed_rates.py` strips `"3-d "` → stores `ep_zip3 = "606"` in PostgreSQL → live mode: VisualMail `Locations.AccountNumber = "SCF606"` → code parses `dest_id[3:] = "606"` → matches `ep_zip3`. Mock mode: `access_prog` is hardcoded; no lookup occurs.
 
-**EIA API** (`EIA_API_KEY` in `.env`): fetches the current weekly diesel price to select the right FSC band. The FSC matrix itself comes from the xlsx above — EIA is only needed for today's price. Without the key, FSC is skipped and `access_prog` stores base tariff only.
+**EIA API** (`EIA_API_KEY` in `.env`): fetches the current weekly diesel price. As of 2026-07-01 this is a **fallback only** — `access_prog` prefers the FSC rate parsed directly off the matched ALG invoice (see below), since the real invoice is always already in hand by the time `access_prog` is computed. EIA is used only when a CSV's Fuel Surcharge footer row can't be parsed.
+
+**`access_prog` calculation (rewritten 2026-07-01, issue #21):** Computed once per matched invoice in `_process_invoice_csv()`, from SG360's **own** pallet-level data — not ALG's invoiced weight — so it's an actually-independent estimate that can catch a real weight discrepancy instead of silently replaying ALG's own numbers back through our rate card:
+1. Get our own per-pallet `(zone, weight)`: `get_pallet_data_for_manifests()` for Corp/Technique trips, `get_prophecy_pallet_data()` for Wolf/311 (Prophecy-matched) loads.
+2. Per pallet, resolve the rate in priority order: (a) exact `ep_zip3` match in `tariff_rates`; (b) if no exact match, this same invoice's own billed rate for that zone (real data beats a numeric guess when the rate card has a gap); (c) nearest-zone fallback in `tariff_rates` as a last resort — sets `tariff_zone_approximate = true` on the record.
+3. FSC comes from the invoice's own "Fuel Surcharge" footer row (`alg_fsc_pct`/`alg_fsc_cost` columns), not EIA, per above.
+4. If our own pallet data is unavailable at all (manifest/BOL not found, not yet synced), falls back to the old ALG-weight-based calc and sets `weight_source_fallback = true`.
+`access_prog`/`base_tariff`/`fsc_pct` are recomputed fresh from our own data on every invoice upload for a trip (not accumulated per-invoice like `amount` — our own weight doesn't change just because a second Z-invoice arrived).
 
 ### Live SQL queries — `data_layer.py` (AWP-SQL-PROD)
 
-All queries connect to AWP-SQL-PROD. TECH, SegGroup, and SQLAPPS3 are linked servers accessible from there. Requires `pip install pyodbc "sqlalchemy[mssql]"`. ⚠️ SELECT permission on VisualMail currently denied on AWD-SQL-WH4 — see Open Question #10.
+All queries connect to AWP-SQL-PROD. TECH, SegGroup, and SQLAPPS3 are linked servers accessible from there. Requires `pip install pyodbc "sqlalchemy[mssql]"`.
 
 | Function | Status | Returns |
 |---|---|---|
 | `get_technique_data(days_back)` | ✅ Implemented | trip, manifest, pallets, VM pieces — **no weight** |
 | `get_manifest_weights(manifests)` | ✅ Implemented | weight, pieces, pallets per manifest (separate query) |
-| `get_pallet_data_for_manifests(manifests)` | ✅ Implemented | pallet rows for SID export; `Dest ID` = `Locations.AccountNumber` (e.g. `SCF606`) — **field uncertain, see Open Question #2** |
-| `get_tariff_rate(zip3, weight)` | ✅ Implemented | `access_prog` = base rate × (1 + FSC) from PostgreSQL |
+| `get_pallet_data_for_manifests(manifests)` | ✅ Implemented | per-pallet rows for SID export **and** for `access_prog` (below); `Dest ID` = `Locations.AccountNumber` (e.g. `SCF606`) — confirmed correct, see Open Questions |
+| `get_prophecy_pallet_data(bol_number)` | ✅ Implemented | per-order-header rows from ShipperPlus `order_headers` (`destination_id`/`destination_zip`, `weight`) — the Wolf/311 equivalent of `get_pallet_data_for_manifests()`, used for `access_prog` on Prophecy-matched loads |
+| `get_tariff_rate(zip3, weight)` | ✅ Implemented | one pallet's `access_prog` = base rate × (1 + FSC); also returns `is_exact_zone_match` |
 | `get_prophecy_data(bol_number)` | ✅ Implemented | prophecy weight/pallets/pcs from ShipperPlus via SG360-TECH-PRD1 (primary) or SQLAPPS3 (fallback); pallet count formula needs Megha confirmation |
 | `get_alg_invoice(invoice_number)` | ⬜ Stub | Z-number, amount, alg weight/pal/pcs — workaround: manual CSV upload |
 
@@ -197,11 +220,12 @@ All queries connect to AWP-SQL-PROD. TECH, SegGroup, and SQLAPPS3 are linked ser
 
 **ALG quantity fields** (`alg_weight`, `alg_pallets`, `alg_pcs` on `BOLRecord`): null until a CSV is uploaded via `POST /api/invoices/upload`. `weight_diff`, `pallet_diff`, `pcs_diff` are computed at upload time and stored; they are not recalculated on re-pull.
 
-**Invoice matching — `_process_invoice_csv()` in `main.py` (~line 620):** shared by manual upload and email polling.
+**Invoice matching — `_process_invoice_csv()` in `main.py` (~line 1005):** shared by manual upload and email polling. Tried in this order — exact matches always before the Prophecy-BOL guess (fixed 2026-07-01, issue #31: a real trip whose numeric suffix coincidentally starts with "14" was being misclassified as a Wolf/311 load before this reorder):
 1. **Z-number**: CSV Z-number → `invoice_number` field on `BOLRecord`
-2. **Job Name**: CSV "Job Name" field → trip DespatchID suffix (`str(int(trip.split('T_')[-1]))`, e.g. `TEC_T_0397246` → `"397246"`)
-3. **BOL number**: CSV "BOL No" → `bol_number` field (for non-comingle loads only)
-4. **No match**: create stub record (invoice-only, `technique_trip` is null)
+2. **Job Name as trip suffix**: CSV "Job Name" field → trip DespatchID suffix (`str(int(trip.split('T_')[-1]))`, e.g. `TEC_T_0397246` → `"397246"`)
+3. **Job Name as Prophecy BOL** (Wolf/311 — no Technique trip for this load): only checked once steps 1-2 rule out a real trip match. `BOL No` is a Post Office permit number, never used for matching.
+4. **Pallets + pieces** (last resort, non-comingle only, exact count match against a single unmatched record — logs a warning to verify manually)
+5. **No match**: create stub record (invoice-only, `technique_trip` is null)
 
 **Comingle invoices** (CSV "Cust Job No" starts with `"CM"`): always create a stub with `access_prog=null` and `cost_pct=null`. These are comingle loads that have no Technique record to match against — label them "Comingle — no Technique match". Non-comingle unmatched stubs also get `access_prog=null` / `cost_pct=null`.
 
@@ -235,6 +259,8 @@ Color thresholds:
 
 Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — shown with sign but no hard threshold.
 
+**`tariff_zone_approximate`** / **`weight_source_fallback`** (Boolean, on `BOLRecord`): when either is true, Cost % for that record carries a caveat — a rate had to be approximated, or our own pallet data wasn't available and the calc fell back to ALG's self-reported weight. Surfaced in the dashboard as a `~EST` badge next to Calculated Cost.
+
 ## Database schema highlights
 
 - UUID surrogate PKs everywhere
@@ -243,10 +269,13 @@ Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — show
 - `Numeric(10,2)` for dollar amounts
 - `Numeric(8,6)` for cost_pct / fsc_pct ratios
 - `base_tariff` / `fsc_pct` (Numeric): rate breakdown tooltip; `access_prog = base_tariff × (1 + fsc_pct)`
+- `alg_fsc_pct` / `alg_fsc_cost` (Numeric): ALG's own reported FSC rate/cost for the matched invoice, parsed from the CSV's "Fuel Surcharge" row — this is what feeds `fsc_pct` now, not EIA
+- `tariff_zone_approximate` / `weight_source_fallback` (Boolean, default False): flag when `access_prog` had to approximate a rate or fall back to ALG's own weight — see "Key variance metric"
 - `is_third_party` / `is_ignored` (Boolean): both exclude from SID + accounting exports; reversible
 - `needs_sid_export` (Boolean): True = Type A record (no BOL yet); False = Type B (BOL already in Prophecy)
 - `match_strategy` (String): how the invoice was matched — `"trip"`, `"bol"`, or null for stubs
 - `accounting_exported_at` nullable DateTime — set when "Send to Accounting" runs; exposed in Log tab
+- `sid_exported_at` nullable DateTime — set when a record's SID CSV is downloaded (bulk `GET /api/export/prophecy-sid` or per-record `POST /api/bols/{id}/export-prophecy-sid`); previously existed but was never written until 2026-07-02
 - `approval_history` table for full audit trail
 - `users` table stubbed for future auth
 
@@ -279,8 +308,12 @@ backend/test_data/       — Sample ALG invoice CSVs for testing the upload flow
 test_invoices_0622/      — 26 real Z-number CSVs from Tanya's June 22 email (e.g. Z557707.CSV).
                            Use for live-mode invoice upload testing. NOT committed — real production
                            data; add to .gitignore if not already excluded.
-documentation/           — Six .md spec files (Design & Workflow, Requirements & SQL Mapping, etc.).
-                           Reference for business rules and SQL source queries; not runtime code.
+documentation/           — Five .md spec files (Design & Workflow, Requirements & SQL Mapping,
+                           SECURITY.md, SG360_BOL_Project_Context.md, etc.). Reference for business
+                           rules and SQL source queries; not runtime code. Developmental Documentation.md
+                           is the running dev changelog — one entry per closed GitHub issue, appended
+                           by the `commit` skill. Read it for recent history that isn't yet folded
+                           into this file.
 frontend/src/App.jsx     — Owns all state + fetch/mutation handlers; passes data+callbacks down as props
 frontend/src/components/
   SummaryBar.jsx              — Pending/approved/flagged counts strip
