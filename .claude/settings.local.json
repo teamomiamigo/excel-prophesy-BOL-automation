@@ -22,7 +22,19 @@
       "Bash(gh issue *)",
       "PowerShell(gh --version)",
       "PowerShell(gh issue list --state open --limit 100)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Bash(python3 -c ' *)",
+      "Bash(cat > *)",
+      "Bash(sed -i \"s/^db.commit\\(\\)/if not DRY_RUN:\\\\n    db.commit\\(\\)/; 1i DRY_RUN = True\" /tmp/recompute_access_prog.py)",
+      "Bash(python3 /tmp/recompute_access_prog.py)",
+      "Bash(python3 /tmp/investigate_outlier.py)",
+      "Bash(python3 /tmp/investigate_rates.py)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(git add *)",
+      "Bash(git push *)",
+      "Bash(python3)",
+      "Bash(git commit -m 'fix: prioritize exact trip matches over Prophecy-BOL guess, merge pending table \\(#31, #36\\) *)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('backend/main.py', encoding='utf-8'\\).read\\(\\)\\)\")"
     ]
   }
 }
