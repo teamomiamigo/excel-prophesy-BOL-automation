@@ -24,10 +24,19 @@ const TH_GROUP = {
   color: '#d1d5db',
 };
 
-function TableHead() {
+function TableHead({ allSelected, someSelected, onToggleSelectAll }) {
   return (
     <thead>
       <tr>
+        <th rowSpan={2} style={{ ...TH_STYLE, textAlign: 'center', width: 32 }}>
+          <input
+            type="checkbox"
+            checked={allSelected}
+            ref={el => { if (el) el.indeterminate = !allSelected && someSelected; }}
+            onChange={onToggleSelectAll}
+            title="Select all visible rows"
+          />
+        </th>
         <th colSpan={4} style={TH_STYLE} />
         <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '2px solid #404040' }}>Technique</th>
         <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '1px solid #404040' }}>Invoice (ALG)</th>
@@ -62,7 +71,7 @@ function TableHead() {
 
 export default function BOLTable({
   bols, loading, approvingId, unflaggingId, markingThirdPartyId, ignoringId, exportingSidId, checkingBolId,
-  filterText, onFilterChange,
+  filterText, onFilterChange, selectedIds, onToggleSelect, onToggleSelectAll,
   onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore, onExportSid, onCheckBol,
 }) {
   const lower = (filterText || '').toLowerCase();
@@ -80,6 +89,9 @@ export default function BOLTable({
     .slice()
     .sort((a, b) => new Date(effectiveDate(a)) - new Date(effectiveDate(b)));
   const totalVisible = visibleBols.length;
+  const visibleIds = visibleBols.map(b => b.id);
+  const allSelected = visibleIds.length > 0 && visibleIds.every(id => selectedIds.has(id));
+  const someSelected = visibleIds.some(id => selectedIds.has(id));
 
   function rowProps(bol) {
     return {
@@ -91,6 +103,8 @@ export default function BOLTable({
       isIgnoring:          ignoringId          === bol.id,
       isExportingSid:      exportingSidId      === bol.id,
       isCheckingBol:       checkingBolId       === bol.id,
+      isSelected:          selectedIds.has(bol.id),
+      onToggleSelect:      () => onToggleSelect(bol.id),
       onApprove:           () => onApprove(bol.id),
       onFlagOpen:          () => onFlagOpen(bol),
       onUnflag:            () => onUnflag(bol.id),
@@ -160,7 +174,11 @@ export default function BOLTable({
       ) : (
         <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb', marginBottom: 12 }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
-            <TableHead />
+            <TableHead
+              allSelected={allSelected}
+              someSelected={someSelected}
+              onToggleSelectAll={() => onToggleSelectAll(visibleIds)}
+            />
             <tbody>
               {visibleBols.map(bol => <BOLRow {...rowProps(bol)} />)}
             </tbody>

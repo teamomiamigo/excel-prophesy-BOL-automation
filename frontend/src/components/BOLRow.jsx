@@ -43,7 +43,7 @@ const TD = {
 
 const TD_R = { ...TD, textAlign: 'right' };
 
-export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isIgnoring, isExportingSid, isCheckingBol, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore, onExportSid, onCheckBol }) {
+export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isIgnoring, isExportingSid, isCheckingBol, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore, onExportSid, onCheckBol, onToggleSelect }) {
   const [hovered, setHovered] = useState(false);
   const [notesValue, setNotesValue] = useState(bol.notes || '');
   const [saveFlash, setSaveFlash] = useState(false);
@@ -81,6 +81,11 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
+      {/* Bulk-select checkbox (issue #32) */}
+      <td style={{ ...TD, textAlign: 'center' }}>
+        <input type="checkbox" checked={!!isSelected} onChange={onToggleSelect} />
+      </td>
+
       {/* Identity */}
       <td style={TD}>{bol.technique_trip || <span style={{ color: '#d1d5db' }}>—</span>}</td>
       <td style={TD}>

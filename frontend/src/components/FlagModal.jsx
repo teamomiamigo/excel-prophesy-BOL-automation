@@ -1,12 +1,13 @@
 import { useState, useEffect } from 'react';
 
-export default function FlagModal({ bol, submitting, onClose, onSubmit }) {
+export default function FlagModal({ bol, count, submitting, onClose, onSubmit }) {
   const [reason, setReason] = useState('');
+  const isBulk = count != null;
 
-  // Reset reason when modal opens on a different BOL
+  // Reset reason when modal opens on a different BOL (or a new bulk selection)
   useEffect(() => {
     setReason('');
-  }, [bol?.id]);
+  }, [bol?.id, count]);
 
   function handleSubmit(e) {
     e.preventDefault();
@@ -42,11 +43,16 @@ export default function FlagModal({ bol, submitting, onClose, onSubmit }) {
       >
         <div style={{ marginBottom: 16 }}>
           <h3 style={{ fontSize: 16, fontWeight: 700, color: '#111827', marginBottom: 4 }}>
-            Flag Record
+            {isBulk ? `Flag ${count} Record${count !== 1 ? 's' : ''}` : 'Flag Record'}
           </h3>
           <p style={{ fontSize: 13, color: '#6b7280' }}>
-            Invoice {bol.invoice_number}
-            {bol.amount != null && ` — $${parseFloat(bol.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+            {isBulk
+              ? 'One reason will be applied to all selected records (already-flagged ones are skipped).'
+              : <>
+                  Invoice {bol.invoice_number}
+                  {bol.amount != null && ` — $${parseFloat(bol.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                </>
+            }
           </p>
         </div>
 
@@ -104,7 +110,7 @@ export default function FlagModal({ bol, submitting, onClose, onSubmit }) {
                 cursor: submitting || reason.trim().length < 3 ? 'not-allowed' : 'pointer',
               }}
             >
-              {submitting ? 'Flagging…' : '⚑ Flag Record'}
+              {submitting ? 'Flagging…' : isBulk ? `⚑ Flag ${count} Record${count !== 1 ? 's' : ''}` : '⚑ Flag Record'}
             </button>
           </div>
         </form>

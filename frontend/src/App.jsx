@@ -6,6 +6,7 @@ import ApprovedSection from './components/ApprovedSection.jsx';
 import FlagModal from './components/FlagModal.jsx';
 import ReassignInvoiceModal from './components/ReassignInvoiceModal.jsx';
 import LogSection from './components/LogSection.jsx';
+import BulkActionToolbar from './components/BulkActionToolbar.jsx';
 
 // When Module 2 ships: extract fetch helpers to src/api/bolsApi.js
 // and move this state/logic to src/pages/BolReconciliation.jsx
@@ -47,6 +48,10 @@ export default function App() {
   const [exportingSidId, setExportingSidId] = useState(null);
   const [checkingBolId, setCheckingBolId] = useState(null);
   const [refreshLoading, setRefreshLoading] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [bulkActionLoading, setBulkActionLoading] = useState(false);
+  const [bulkFlagOpen, setBulkFlagOpen] = useState(false);
+  const [bulkResults, setBulkResults] = useState(null); // { action, succeeded, total, skipped }
 
   const thirdPartyBols     = pendingBols.filter(b => b.is_third_party);
   const visiblePendingBols = pendingBols.filter(b => !b.is_third_party);
@@ -57,6 +62,35 @@ export default function App() {
     readyToReview: visiblePendingBols.filter(b => b.technique_trip != null && b.amount != null).length,
     approvedToday: approvedBols.length,
   };
+
+  // -------------------------------------------------------------------------
+  // Selection (issue #32 — multi-select bulk actions)
+  // -------------------------------------------------------------------------
+
+  function toggleSelect(id) {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleSelectAll(visibleIds) {
+    setSelectedIds(prev => {
+      const allSelected = visibleIds.length > 0 && visibleIds.every(id => prev.has(id));
+      const next = new Set(prev);
+      if (allSelected) {
+        visibleIds.forEach(id => next.delete(id));
+      } else {
+        visibleIds.forEach(id => next.add(id));
+      }
+      return next;
+    });
+  }
+
+  function clearSelection() {
+    setSelectedIds(new Set());
+  }
 
   // -------------------------------------------------------------------------
   // Fetch helpers
@@ -223,6 +257,131 @@ export default function App() {
       setError(err.message);
     } finally {
       setRefreshLoading(false);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Bulk actions (issue #32) — fire the same per-record endpoints used by the
+  // individual action buttons, once per eligible selected record, then a
+  // single refresh. Eligibility mirrors each action's per-row button
+  // condition in BOLRow.jsx.
+  // -------------------------------------------------------------------------
+
+  function selectedRecords() {
+    return visiblePendingBols.filter(b => selectedIds.has(b.id));
+  }
+
+  async function handleBulkApprove() {
+    const targets = selectedRecords(); // no eligibility restriction — matches per-row Approve
+    if (!targets.length) return;
+    setBulkActionLoading(true);
+    try {
+      const results = await Promise.allSettled(
+        targets.map(b => fetch(`/api/bols/${b.id}/approve`, { method: 'POST' }))
+      );
+      const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
+      setBulkResults({ action: 'approved', succeeded, total: targets.length, skipped: 0 });
+      await Promise.all([fetchPending(), fetchApproved()]);
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBulkActionLoading(false);
+    }
+  }
+
+  function openBulkFlag() {
+    if (!selectedRecords().length) return;
+    setBulkFlagOpen(true);
+  }
+
+  async function handleBulkFlagSubmit(reason) {
+    const all = selectedRecords();
+    const eligible = all.filter(b => b.status !== 'flagged');
+    const skipped = all.length - eligible.length;
+    setFlagSubmitting(true);
+    try {
+      const results = await Promise.allSettled(
+        eligible.map(b => fetch(`/api/bols/${b.id}/flag`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason }),
+        }))
+      );
+      const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
+      setBulkFlagOpen(false);
+      setBulkResults({ action: 'flagged', succeeded, total: all.length, skipped });
+      await Promise.all([fetchPending(), fetchApproved()]);
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setFlagSubmitting(false);
+    }
+  }
+
+  async function handleBulkMarkThirdParty() {
+    const all = selectedRecords();
+    const eligible = all.filter(b => !b.amount && !b.bol_number && !b.is_third_party);
+    const skipped = all.length - eligible.length;
+    if (!all.length) return;
+    setBulkActionLoading(true);
+    try {
+      const results = await Promise.allSettled(
+        eligible.map(b => fetch(`/api/bols/${b.id}/mark-third-party`, { method: 'POST' }))
+      );
+      const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
+      setBulkResults({ action: 'marked third-party', succeeded, total: all.length, skipped });
+      await fetchPending();
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBulkActionLoading(false);
+    }
+  }
+
+  async function handleBulkIgnore() {
+    const all = selectedRecords();
+    const eligible = all.filter(b => b.technique_trip == null && b.invoice_number && !b.is_ignored);
+    const skipped = all.length - eligible.length;
+    if (!all.length) return;
+    setBulkActionLoading(true);
+    try {
+      const results = await Promise.allSettled(
+        eligible.map(b => fetch(`/api/bols/${b.id}/ignore`, { method: 'POST' }))
+      );
+      const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
+      setBulkResults({ action: 'ignored', succeeded, total: all.length, skipped });
+      await fetchPending();
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBulkActionLoading(false);
+    }
+  }
+
+  async function handleBulkExportSid() {
+    const all = selectedRecords();
+    const eligible = all.filter(b => b.needs_sid_export && b.manifest && !b.is_third_party && !b.is_ignored);
+    const skipped = all.length - eligible.length;
+    if (!all.length) return;
+    setBulkActionLoading(true);
+    try {
+      // Sequential, not Promise.all — reduces (doesn't fully eliminate) the chance
+      // the browser blocks/prompts on multiple simultaneous downloads. Reuses the
+      // exact per-record handler from #35 unchanged, so each file is identical to
+      // what clicking that record's own SID button would produce.
+      for (const b of eligible) {
+        await handleExportRecordToProphecy(b.id);
+      }
+      setBulkResults({ action: 'SID-exported', succeeded: eligible.length, total: all.length, skipped });
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBulkActionLoading(false);
     }
   }
 
@@ -517,6 +676,30 @@ export default function App() {
           </div>
         )}
 
+        {/* Bulk action results */}
+        {bulkResults && (
+          <div style={{
+            background: bulkResults.skipped > 0 ? '#fffbeb' : '#f0fdf4',
+            border: `1px solid ${bulkResults.skipped > 0 ? '#fde68a' : '#bbf7d0'}`,
+            borderRadius: 6,
+            padding: '10px 16px',
+            marginBottom: 16,
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            color: bulkResults.skipped > 0 ? '#92400e' : '#166534',
+          }}>
+            <span>
+              {bulkResults.succeeded} of {bulkResults.total} records {bulkResults.action}
+              {bulkResults.skipped > 0 && ` — ${bulkResults.skipped} skipped (not eligible)`}
+            </span>
+            <button
+              onClick={() => setBulkResults(null)}
+              style={{ background: 'none', border: 'none', color: 'inherit', fontSize: 16, padding: '0 4px' }}
+            >×</button>
+          </div>
+        )}
+
         {activeTab === 'dashboard' && (
           <>
             <SummaryBar
@@ -778,6 +961,9 @@ export default function App() {
               checkingBolId={checkingBolId}
               filterText={filterText}
               onFilterChange={setFilterText}
+              selectedIds={selectedIds}
+              onToggleSelect={toggleSelect}
+              onToggleSelectAll={toggleSelectAll}
               onApprove={handleApprove}
               onFlagOpen={setFlagTarget}
               onUnflag={handleUnflag}
@@ -823,6 +1009,15 @@ export default function App() {
         />
       )}
 
+      {bulkFlagOpen && (
+        <FlagModal
+          count={selectedRecords().length}
+          submitting={flagSubmitting}
+          onClose={() => setBulkFlagOpen(false)}
+          onSubmit={handleBulkFlagSubmit}
+        />
+      )}
+
       {reassignTargetId && (
         <ReassignInvoiceModal
           bol={pendingBols.find(b => b.id === reassignTargetId) || null}
@@ -832,6 +1027,17 @@ export default function App() {
           onIgnore={handleIgnore}
         />
       )}
+
+      <BulkActionToolbar
+        count={selectedIds.size}
+        loading={bulkActionLoading}
+        onApprove={handleBulkApprove}
+        onFlag={openBulkFlag}
+        onMarkThirdParty={handleBulkMarkThirdParty}
+        onIgnore={handleBulkIgnore}
+        onExportSid={handleBulkExportSid}
+        onClear={clearSelection}
+      />
     </div>
   );
 }
