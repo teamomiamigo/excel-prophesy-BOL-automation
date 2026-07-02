@@ -398,9 +398,20 @@ export default function App() {
   }
 
   async function handleInvoiceUpload(e) {
-    const files = Array.from(e.target.files || []);
-    if (!files.length) return;
+    const allFiles = Array.from(e.target.files || []);
+    if (!allFiles.length) return;
     e.target.value = '';
+    // Folder selection (webkitdirectory) gives every file a shared top-level
+    // folder name via webkitRelativePath, e.g. "Tania 6-30-2026 3-47PM/Z558123.CSV" —
+    // that folder name is the sender/date metadata, parsed server-side.
+    const folderName = allFiles[0].webkitRelativePath
+      ? allFiles[0].webkitRelativePath.split('/')[0]
+      : '';
+    const files = allFiles.filter(f => f.name.toLowerCase().endsWith('.csv'));
+    if (!files.length) {
+      setError('No CSV files found in the selected folder.');
+      return;
+    }
     setInvoiceUploading(true);
     setUploadResults(null);
     const matched = [], unmatched = [], errors = [], conflicts = [];
@@ -408,6 +419,7 @@ export default function App() {
       setUploadProgress(`${i + 1} of ${files.length}`);
       const form = new FormData();
       form.append('file', files[i]);
+      if (folderName) form.append('invoice_folder_name', folderName);
       if (uploadSender) form.append('invoice_sender', uploadSender);
       if (uploadDate) form.append('invoice_date', uploadDate);
       if (uploadTime) form.append('invoice_time', uploadTime);
@@ -815,10 +827,11 @@ export default function App() {
                   fontSize: 12,
                   cursor: invoiceUploading ? 'not-allowed' : 'pointer',
                 }}>
-                  {invoiceUploading ? `Uploading ${uploadProgress}…` : 'Upload Invoices'}
+                  {invoiceUploading ? `Uploading ${uploadProgress}…` : 'Upload Invoice Folder'}
                   <input
                     type="file"
-                    accept=".csv"
+                    webkitdirectory=""
+                    directory=""
                     multiple
                     style={{ display: 'none' }}
                     disabled={invoiceUploading}

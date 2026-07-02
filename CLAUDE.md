@@ -104,9 +104,9 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/admin/refetch-bols` | Re-query Technique for specific manifests; updates `bol_number` after Prophecy import (live mode only) |
 | POST | `/api/admin/poll-email` | Poll O365 IMAP for unread ALG invoice emails → extract CSVs → process (live mode only) |
 | POST | `/api/admin/reset-invoices` | Dev: clear invoice fields on all records + delete invoice-only stubs |
-| POST | `/api/invoices/upload` | Upload ALG invoice CSV (Z-number format) → match + update record; response includes `conflict` key if trip already had an invoice |
-| GET | `/api/invoices/{z}/file` | Serve original Z-number CSV from `INVOICE_FOLDER` (or `test_data/` in mock mode) |
-| POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` path for unprocessed CSVs → process each; files stay in place, dedup via DB `invoice_number` |
+| POST | `/api/invoices/upload` | Upload ALG invoice CSV(s) — pass a whole sender folder (`invoice_folder_name`, parsed the same way as `poll-folder`) or fall back to manual `invoice_sender`/`invoice_date`/`invoice_time` fields; response includes `conflict` key if trip already had an invoice |
+| GET | `/api/invoices/{z}/file` | Serve the invoice file for a Z-number, preferring the PDF ALG sends over the CSV; searches `INVOICE_FOLDER` root + one level of dated sender subfolders (or `test_data/` in mock mode) |
+| POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` (root + one level of dated sender subfolders) for unprocessed CSVs → process each, parsing sender/date from the subfolder name; files stay in place, dedup via DB `invoice_number` |
 | GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only); also stamps `sid_exported_at` on each included record |
 | POST | `/api/bols/{id}/export-prophecy-sid` | Per-record SID export — pushes one pending Type A record to Prophecy without waiting for a batch approval; same CSV logic as the bulk route, scoped to one manifest |
 | POST | `/api/bols/{id}/refresh-bol` | Check Prophecy for a BOL on one record's manifest without a full Technique pull; reuses `get_technique_data()` filtered to one manifest — ~10s live (hits AWP-SQL-PROD), near-instant if the record already has a BOL |
@@ -287,7 +287,7 @@ backend/config.py        — Pydantic BaseSettings; loads .env with typed defaul
                            EIA API, IMAP, USE_MOCK_DATA). Single source of truth for config — no hardcoded
                            values elsewhere.
 backend/data_layer.py    — The integration boundary; get_prophecy_data implemented; get_alg_invoice still stub (workaround: manual CSV upload)
-backend/mock_data.py     — 12 records at real scale; safe to delete when DB is live
+backend/mock_data.py     — 14 records at real scale; safe to delete when DB is live
 backend/email_parser.py  — O365 IMAP4_SSL polling (outlook.office365.com:993); marks emails read even
                            with no CSV attachment (prevents re-scan loop on next poll)
 backend/email_service.py — SMTP STARTTLS export; returns False (soft-fail, no exception) when credentials
@@ -323,6 +323,8 @@ frontend/src/components/
   ThirdPartySection.jsx       — Third-party records (customer pays direct); excluded from SID export
   FlagModal.jsx               — Modal overlay for entering a flag reason
   ReassignInvoiceModal.jsx    — Modal for moving an invoice to a different trip (preview/merge/replace)
+  BulkActionToolbar.jsx       — Floating bar shown when rows are multi-selected; bulk approve/flag/third-party/ignore
+  EmailComposeModal.jsx       — Builds an HTML table for selected records and calls mark-accounting-sent on send
   LogSection.jsx              — Historical log viewer (separate tab)
 ```
 

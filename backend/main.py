@@ -1101,6 +1101,53 @@ def _parse_invoice_folder_name(name: str) -> "tuple[str, datetime] | None":
     return display, dt
 
 
+def _find_invoice_file(folder: str, z: str) -> "tuple[str, str] | None":
+    """
+    Search `folder`'s root plus one level of subfolders (same layout
+    poll_invoice_folder scans) for a file whose name starts with Z-number `z`.
+    Prefers a .pdf match (ALG's human-readable invoice) over .csv — real ALG
+    PDFs are named like "Z557948- Segerdahl Graphics, Inc_.pdf", a prefix
+    match rather than an exact one. Most-recently-modified file wins on
+    duplicate matches (e.g. a resend). Returns (path, media_type) or None.
+    """
+    if not os.path.isdir(folder):
+        return None
+
+    z_upper = z.strip().upper()
+    pdf_hits: list[str] = []
+    csv_hits: list[str] = []
+
+    def _scan(dir_path: str):
+        try:
+            entries = os.listdir(dir_path)
+        except OSError:
+            return
+        for entry in entries:
+            entry_path = os.path.join(dir_path, entry)
+            if not os.path.isfile(entry_path):
+                continue
+            stem, ext = os.path.splitext(entry)
+            if not stem.upper().startswith(z_upper):
+                continue
+            ext = ext.lower()
+            if ext == ".pdf":
+                pdf_hits.append(entry_path)
+            elif ext == ".csv":
+                csv_hits.append(entry_path)
+
+    _scan(folder)
+    for entry in os.listdir(folder):
+        entry_path = os.path.join(folder, entry)
+        if os.path.isdir(entry_path):
+            _scan(entry_path)
+
+    if pdf_hits:
+        return max(pdf_hits, key=os.path.getmtime), "application/pdf"
+    if csv_hits:
+        return max(csv_hits, key=os.path.getmtime), "text/csv"
+    return None
+
+
 def _apply_access_prog_calc(
     matched_rec: "BOLRecord",
     match_strategy: "str | None",
@@ -1690,6 +1737,7 @@ def _process_invoice_csv(
 async def upload_alg_invoice(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    invoice_folder_name: Optional[str] = Form(None),
     invoice_sender: Optional[str] = Form(None),
     invoice_date: Optional[str] = Form(None),
     invoice_time: Optional[str] = Form(None),
@@ -1697,7 +1745,13 @@ async def upload_alg_invoice(
     """
     Upload an ALG invoice CSV (Z-number format from Tanya).
 
-    Optional form fields for manual uploads:
+    invoice_folder_name — the sender's dated folder name (e.g. "Tania 6-25-2026  4-16PM"),
+      passed when the user selects a whole folder in the frontend. Parsed with the same
+      _parse_invoice_folder_name() used by poll_invoice_folder, so sender metadata matches
+      regardless of which path the CSV came in through.
+
+    Optional form fields for manual uploads (fallback when invoice_folder_name is absent
+    or doesn't parse):
       invoice_sender  — sender name, e.g. "Tania"
       invoice_date    — ISO date string, e.g. "2026-06-25"
       invoice_time    — 24h time string, e.g. "16:16"
@@ -1706,10 +1760,14 @@ async def upload_alg_invoice(
         raise HTTPException(status_code=400, detail="Only .csv files are accepted.")
     content = await file.read()
 
-    # Build sender metadata from optional fields
+    # Build sender metadata — prefer the folder name (automatic), fall back to manual fields.
     sender_str: Optional[str] = None
     sent_at: Optional[datetime] = None
-    if invoice_sender and invoice_date:
+    if invoice_folder_name:
+        parsed = _parse_invoice_folder_name(invoice_folder_name)
+        if parsed:
+            sender_str, sent_at = parsed
+    if sender_str is None and invoice_sender and invoice_date:
         try:
             d = datetime.strptime(invoice_date, "%Y-%m-%d")
             if invoice_time:
@@ -1735,9 +1793,11 @@ async def upload_alg_invoice(
 @app.get("/api/invoices/{invoice_number}/file", tags=["Invoices"])
 def get_invoice_file(invoice_number: str):
     """
-    Serve the original invoice CSV file for a given Z-number.
-    Looks in INVOICE_FOLDER (live) or backend/test_data/ (mock).
-    Also checks a 'processed/' subfolder in case the file was moved after import.
+    Serve the original invoice file for a given Z-number, preferring the
+    human-readable PDF ALG sends (falls back to CSV if no PDF exists, e.g.
+    mock/test data). Searches INVOICE_FOLDER (live) or backend/test_data/
+    (mock), including one level of dated sender subfolders
+    (e.g. "Tania 6-25-2026  4-16PM/") created by poll_invoice_folder.
     """
     if settings.USE_MOCK_DATA:
         folder = os.path.join(os.path.dirname(__file__), "test_data")
@@ -1748,17 +1808,15 @@ def get_invoice_file(invoice_number: str):
         raise HTTPException(status_code=404, detail="No invoice folder configured (set INVOICE_FOLDER in .env)")
 
     z = invoice_number.strip().upper()
-    candidates = [
-        os.path.join(folder, f"{z}.CSV"),
-        os.path.join(folder, f"{z}.csv"),
-    ]
-    for path in candidates:
-        if os.path.isfile(path):
-            filename = os.path.basename(path)
-            return FileResponse(path, media_type="text/csv", filename=filename,
-                                headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+    hit = _find_invoice_file(folder, z)
+    if hit is None:
+        raise HTTPException(status_code=404, detail=f"File not found for {invoice_number}. Checked: {folder}")
 
-    raise HTTPException(status_code=404, detail=f"File not found for {invoice_number}. Checked: {folder}")
+    path, media_type = hit
+    filename = os.path.basename(path)
+    disposition = "inline" if media_type == "application/pdf" else "attachment"
+    return FileResponse(path, media_type=media_type, filename=filename,
+                         headers={"Content-Disposition": f'{disposition}; filename="{filename}"'})
 
 
 @app.post("/api/invoices/poll-folder", tags=["Invoices"])
@@ -1853,10 +1911,10 @@ def poll_invoice_folder(db: Session = Depends(get_db)):
     matched = sum(1 for r in results if r.get("matched") and r.get("match_strategy") != "invoice_only")
     stubbed = sum(1 for r in results if not r.get("matched") and not r.get("error"))
     errors  = sum(1 for r in results if r.get("error"))
-    msg = f"Processed {len(candidates)} file(s): {matched} matched, {stubbed} stubbed."
+    msg = f"Processed {len(file_queue)} file(s): {matched} matched, {stubbed} stubbed."
     if errors:
         msg += f" {errors} error(s)."
-    return {"found": len(candidates), "processed": results, "message": msg}
+    return {"found": len(file_queue), "processed": results, "message": msg}
 
 
 @app.post("/api/admin/poll-email", tags=["Admin"])

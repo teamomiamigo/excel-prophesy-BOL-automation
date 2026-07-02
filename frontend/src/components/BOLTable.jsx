@@ -120,6 +120,7 @@ export default function BOLTable({
   const matchesBol = b => !filterText || [
     b.technique_trip, b.manifest, b.invoice_number, b.inv_job_number,
     b.bol_number != null ? String(b.bol_number) : '',
+    b.invoice_email_sender,
   ].some(v => (v || '').toLowerCase().includes(lower));
 
   // One flat table, no category grouping — sorted by Trip/Manifest/BOL/Invoice # (click a
@@ -167,7 +168,7 @@ export default function BOLTable({
         </h2>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           <input
-            placeholder="Filter by trip, manifest, invoice #, job #, or BOL…"
+            placeholder="Filter by trip, manifest, invoice #, job #, BOL, or sender…"
             value={filterText}
             onChange={e => onFilterChange(e.target.value)}
             style={{

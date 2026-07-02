@@ -112,7 +112,7 @@ export default function ReassignInvoiceModal({ bol, submitting, onClose, onReass
                 href={`/api/invoices/${z}/file`}
                 target="_blank"
                 rel="noreferrer"
-                title={`Download ${z}.CSV`}
+                title={`Open invoice ${z}`}
                 style={{ fontSize: 11, color: '#1e40af', textDecoration: 'none', background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 4, padding: '1px 7px', fontWeight: 600, whiteSpace: 'nowrap' }}
               >
                 📄 {z}
