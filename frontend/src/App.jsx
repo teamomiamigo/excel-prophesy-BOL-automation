@@ -23,7 +23,6 @@ export default function App() {
   const [flagTarget, setFlagTarget] = useState(null);
   const [flagSubmitting, setFlagSubmitting] = useState(false);
 
-  const [sendLoading, setSendLoading] = useState(false);
   const [sidLoading, setSidLoading] = useState(false);
   const [invoiceUploading, setInvoiceUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(null);
@@ -534,21 +533,32 @@ export default function App() {
     }
   }
 
-  async function handleSendToAccounting() {
-    setSendLoading(true);
-    try {
-      const res = await fetch('/api/export', { method: 'POST' });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.detail || `Export failed (${res.status})`);
-      }
-      const data = await res.json();
-      setSuccessMessage(data.message);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setSendLoading(false);
+  async function handleRefetchBols(manifestNumbers) {
+    const res = await fetch('/api/admin/refetch-bols', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ manifest_numbers: manifestNumbers }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `Re-fetch failed (${res.status})`);
     }
+    const data = await res.json();
+    if (data.updated?.length) {
+      // Update bol_number in local approved state without a full refetch
+      const bolMap = Object.fromEntries(data.updated.map(u => [u.manifest, u.bol_number]));
+      setApprovedBols(prev => prev.map(b =>
+        b.manifest && bolMap[b.manifest] ? { ...b, bol_number: bolMap[b.manifest], needs_sid_export: false } : b
+      ));
+      setSuccessMessage(`Updated ${data.updated.length} BOL number(s).`);
+    } else {
+      setSuccessMessage('No new BOL numbers found — check again after Prophecy import completes.');
+    }
+  }
+
+  async function handleMarkSent(recordIds) {
+    setApprovedBols(prev => prev.filter(b => !recordIds.includes(b.id)));
+    setSuccessMessage(`${recordIds.length} record(s) marked as sent — moved to Log.`);
   }
 
   async function handleReassignInvoice(recordId, target, action) {
@@ -1001,13 +1011,13 @@ export default function App() {
             <ApprovedSection
               approvedBols={approvedBols}
               loading={loadingApproved && approvedBols.length === 0}
-              sendLoading={sendLoading}
               sidLoading={sidLoading}
               sidExportedThisSession={sidExportedThisSession}
               unapprovingId={unapprovingId}
               onUnapprove={handleUnapprove}
-              onConfirmSend={handleSendToAccounting}
               onExportProphecy={handleExportProphecy}
+              onRefetchBols={handleRefetchBols}
+              onMarkSent={handleMarkSent}
             />
           </>
         )}

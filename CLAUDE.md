@@ -97,9 +97,11 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/bols/{id}/unmark-third-party` | Revert third-party record back to pending queue |
 | POST | `/api/bols/{id}/ignore` | Mark record as ignored — stays in log, excluded from exports, reversible |
 | POST | `/api/bols/{id}/unignore` | Remove ignored flag |
+| POST | `/api/bols/mark-accounting-sent` | Set `accounting_exported_at = now()` on a list of record IDs; removes them from Approved view |
 | POST | `/api/bols/{id}/reassign-invoice` | Move invoice to a different trip/BOL/manifest; body: `{ target, action: preview\|merge\|replace }` |
 | PATCH | `/api/bols/{id}/notes` | Auto-save notes field (called by frontend with 500ms debounce) |
 | POST | `/api/admin/pull` | Pull Technique manifests from AWP-SQL-PROD (disabled in mock mode) |
+| POST | `/api/admin/refetch-bols` | Re-query Technique for specific manifests; updates `bol_number` after Prophecy import (live mode only) |
 | POST | `/api/admin/poll-email` | Poll O365 IMAP for unread ALG invoice emails → extract CSVs → process (live mode only) |
 | POST | `/api/admin/reset-invoices` | Dev: clear invoice fields on all records + delete invoice-only stubs |
 | POST | `/api/invoices/upload` | Upload ALG invoice CSV (Z-number format) → match + update record; response includes `conflict` key if trip already had an invoice |
