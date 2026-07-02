@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import SummaryBar from './components/SummaryBar.jsx';
 import BOLTable from './components/BOLTable.jsx';
 import ThirdPartySection from './components/ThirdPartySection.jsx';
@@ -44,6 +44,18 @@ export default function App() {
   const [uploadDate, setUploadDate] = useState('');
   const [uploadTime, setUploadTime] = useState('');
   const [showSenderFields, setShowSenderFields] = useState(false);
+  const folderInputRef = useRef(null);
+
+  // React's JSX attribute mapping doesn't reliably set the `webkitdirectory`
+  // IDL property on the underlying <input> — it has to be assigned directly
+  // on the DOM node, or the browser silently falls back to a normal (non-folder)
+  // file picker and every file's webkitRelativePath stays empty.
+  useEffect(() => {
+    if (folderInputRef.current) {
+      folderInputRef.current.webkitdirectory = true;
+      folderInputRef.current.directory = true;
+    }
+  }, []);
   const [sidExportedThisSession, setSidExportedThisSession] = useState(false);
   const [exportingSidId, setExportingSidId] = useState(null);
   const [checkingBolId, setCheckingBolId] = useState(null);
@@ -397,28 +409,22 @@ export default function App() {
     }
   }
 
-  async function handleInvoiceUpload(e) {
-    const allFiles = Array.from(e.target.files || []);
-    if (!allFiles.length) return;
-    e.target.value = '';
-    // Folder selection (webkitdirectory) gives every file a shared top-level
-    // folder name via webkitRelativePath, e.g. "Tania 6-30-2026 3-47PM/Z558123.CSV" —
-    // that folder name is the sender/date metadata, parsed server-side.
-    const folderName = allFiles[0].webkitRelativePath
-      ? allFiles[0].webkitRelativePath.split('/')[0]
-      : '';
-    const files = allFiles.filter(f => f.name.toLowerCase().endsWith('.csv'));
-    if (!files.length) {
+  // Shared upload loop — takes [{file, folderName}] regardless of which picker
+  // produced it (File System Access API walk, or the webkitdirectory fallback
+  // input) and does the actual per-file POST + results aggregation.
+  async function uploadInvoiceFiles(fileEntries) {
+    if (!fileEntries.length) {
       setError('No CSV files found in the selected folder.');
       return;
     }
     setInvoiceUploading(true);
     setUploadResults(null);
     const matched = [], unmatched = [], errors = [], conflicts = [];
-    for (let i = 0; i < files.length; i++) {
-      setUploadProgress(`${i + 1} of ${files.length}`);
+    for (let i = 0; i < fileEntries.length; i++) {
+      const { file, folderName } = fileEntries[i];
+      setUploadProgress(`${i + 1} of ${fileEntries.length}`);
       const form = new FormData();
-      form.append('file', files[i]);
+      form.append('file', file);
       if (folderName) form.append('invoice_folder_name', folderName);
       if (uploadSender) form.append('invoice_sender', uploadSender);
       if (uploadDate) form.append('invoice_date', uploadDate);
@@ -427,21 +433,86 @@ export default function App() {
         const res = await fetch('/api/invoices/upload', { method: 'POST', body: form });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          errors.push({ name: files[i].name, msg: data.detail || `HTTP ${res.status}` });
+          errors.push({ name: file.name, msg: data.detail || `HTTP ${res.status}` });
         } else if (data.matched) {
-          matched.push({ name: files[i].name, invoice: data.invoice_number, trip: data.matched_trip, strategy: data.match_strategy });
+          matched.push({ name: file.name, invoice: data.invoice_number, trip: data.matched_trip, strategy: data.match_strategy, sender: data.invoice_email_sender });
           if (data.conflict) conflicts.push(data.conflict);
         } else {
-          unmatched.push({ name: files[i].name, invoice: data.invoice_number, jobName: data.job_name, note: data.message });
+          unmatched.push({ name: file.name, invoice: data.invoice_number, jobName: data.job_name, note: data.message, sender: data.invoice_email_sender });
         }
       } catch (err) {
-        errors.push({ name: files[i].name, msg: err.message });
+        errors.push({ name: file.name, msg: err.message });
       }
     }
     setInvoiceUploading(false);
     setUploadProgress(null);
     setUploadResults({ matched, unmatched, errors, conflicts });
     await Promise.all([fetchPending(), fetchApproved()]);
+  }
+
+  // Primary picker — File System Access API. Each directory handle carries its
+  // own real `.name`, so there's no path-string parsing or separator guessing:
+  // walking the tree and reading `.name` at each level always gives the correct
+  // immediate-parent folder for a file, whether the user selects a specific
+  // dated sender folder directly or the whole INVOICE_FOLDER root above it.
+  async function pickInvoiceFolder() {
+    let rootHandle;
+    try {
+      rootHandle = await window.showDirectoryPicker();
+    } catch (err) {
+      if (err.name !== 'AbortError') setError('Folder selection failed: ' + err.message);
+      return;
+    }
+    const fileEntries = [];
+    async function walk(dirHandle, folderName) {
+      for await (const entry of dirHandle.values()) {
+        if (entry.kind === 'file') {
+          if (entry.name.toLowerCase().endsWith('.csv')) {
+            const file = await entry.getFile();
+            fileEntries.push({ file, folderName });
+          }
+        } else if (entry.kind === 'directory') {
+          await walk(entry, entry.name);
+        }
+      }
+    }
+    try {
+      await walk(rootHandle, rootHandle.name);
+    } catch (err) {
+      setError('Failed to read the selected folder: ' + err.message);
+      return;
+    }
+    await uploadInvoiceFiles(fileEntries);
+  }
+
+  // Fallback for browsers without the File System Access API (non-Chromium).
+  // webkitdirectory gives every file its full path from the selected root via
+  // webkitRelativePath — the sender/date info is the file's IMMEDIATE parent
+  // folder, not necessarily the top-level selected folder, so it's derived
+  // per file rather than once globally.
+  function parentFolderName(file) {
+    if (!file.webkitRelativePath) return '';
+    const parts = file.webkitRelativePath.split(/[\\/]/).filter(Boolean);
+    return parts.length >= 2 ? parts[parts.length - 2].trim() : '';
+  }
+
+  function handleFolderPickerClick() {
+    if (window.showDirectoryPicker) {
+      pickInvoiceFolder();
+    } else {
+      folderInputRef.current?.click();
+    }
+  }
+
+  async function handleInvoiceUpload(e) {
+    const allFiles = Array.from(e.target.files || []);
+    if (!allFiles.length) return;
+    e.target.value = '';
+    const files = allFiles.filter(f => f.name.toLowerCase().endsWith('.csv'));
+    if (!files.some(f => f.webkitRelativePath)) {
+      setError('The browser did not report folder paths for these files — it may have opened a plain file picker instead of a folder picker. Sender/date will not be auto-detected; use the manual "Sender" fields below, or try again.');
+    }
+    await uploadInvoiceFiles(files.map(file => ({ file, folderName: parentFolderName(file) })));
   }
 
   async function handleUnflag(recordId) {
@@ -816,28 +887,32 @@ export default function App() {
                 >
                   {pollFolderLoading ? 'Scanning…' : '⤓ Pull Invoices'}
                 </button>
-                <label style={{
-                  display: 'inline-block',
-                  background: invoiceUploading ? '#e5e7eb' : '#f0f9ff',
-                  color: invoiceUploading ? '#9ca3af' : '#0369a1',
-                  border: '1px solid #bae6fd',
-                  borderRadius: 5,
-                  padding: '4px 12px',
-                  fontWeight: 600,
-                  fontSize: 12,
-                  cursor: invoiceUploading ? 'not-allowed' : 'pointer',
-                }}>
+                <button
+                  onClick={handleFolderPickerClick}
+                  disabled={invoiceUploading}
+                  title="Select the sender's dated invoice folder (or the whole invoice share) to upload"
+                  style={{
+                    display: 'inline-block',
+                    background: invoiceUploading ? '#e5e7eb' : '#f0f9ff',
+                    color: invoiceUploading ? '#9ca3af' : '#0369a1',
+                    border: '1px solid #bae6fd',
+                    borderRadius: 5,
+                    padding: '4px 12px',
+                    fontWeight: 600,
+                    fontSize: 12,
+                    cursor: invoiceUploading ? 'not-allowed' : 'pointer',
+                  }}
+                >
                   {invoiceUploading ? `Uploading ${uploadProgress}…` : 'Upload Invoice Folder'}
-                  <input
-                    type="file"
-                    webkitdirectory=""
-                    directory=""
-                    multiple
-                    style={{ display: 'none' }}
-                    disabled={invoiceUploading}
-                    onChange={handleInvoiceUpload}
-                  />
-                </label>
+                </button>
+                <input
+                  ref={folderInputRef}
+                  type="file"
+                  multiple
+                  style={{ display: 'none' }}
+                  disabled={invoiceUploading}
+                  onChange={handleInvoiceUpload}
+                />
                 <button
                   type="button"
                   onClick={() => setShowSenderFields(v => !v)}
@@ -895,6 +970,9 @@ export default function App() {
                     <span style={{ color: '#16a34a', fontWeight: 700, minWidth: 14 }}>✓</span>
                     <span style={{ fontWeight: 600, color: '#166534', minWidth: 90 }}>{r.invoice}</span>
                     <span style={{ color: '#374151' }}>{r.name}</span>
+                    <span style={{ color: r.sender ? '#6b7280' : '#dc2626', fontStyle: r.sender ? 'normal' : 'italic', fontSize: 12 }}>
+                      {r.sender || '⚠ no sender detected'}
+                    </span>
                     <span style={{ marginLeft: 'auto', color: '#6b7280' }}>→ {r.trip} <span style={{ background: '#dcfce7', color: '#166534', borderRadius: 3, padding: '1px 5px', fontSize: 11 }}>{r.strategy}</span></span>
                   </div>
                 ))}
@@ -903,6 +981,9 @@ export default function App() {
                     <span style={{ color: '#d97706', fontWeight: 700, minWidth: 14 }}>—</span>
                     <span style={{ fontWeight: 600, color: '#92400e', minWidth: 90 }}>{r.invoice}</span>
                     <span style={{ color: '#374151' }}>{r.name}</span>
+                    <span style={{ color: r.sender ? '#6b7280' : '#dc2626', fontStyle: r.sender ? 'normal' : 'italic', fontSize: 12 }}>
+                      {r.sender || '⚠ no sender detected'}
+                    </span>
                     <span style={{ marginLeft: 'auto', color: '#6b7280', fontStyle: 'italic' }}>{r.note}</span>
                   </div>
                 ))}

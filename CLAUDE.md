@@ -330,6 +330,8 @@ frontend/src/components/
 
 ## Known bugs
 
+**`POST /api/invoices/upload`'s folder-based sender auto-detection is not working in live testing as of 2026-07-02**, despite passing all unit-level checks (`_parse_invoice_folder_name` verified correct; the picker itself was rewritten from `webkitdirectory` to the File System Access API). Treat as broken until confirmed fixed — see `documentation/Developmental Documentation.md` Reference section for the full investigation trail.
+
 **`days_back` is now hardcoded to 1** in `pull_technique_data()` in `main.py`. This is intentional for the daily pull workflow — morning pull always grabs today's manifests only.
 
 **Mock state** (`_mock_state` in `main.py`): in-memory dict initialized from `MOCK_BOLS` at startup. Mutations (approvals, flags, invoice uploads) survive the process lifetime but reset on every backend restart. Restart the backend to reset all records to their initial pending state during development.

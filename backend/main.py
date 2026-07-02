@@ -1068,17 +1068,19 @@ def _parse_invoice_folder_name(name: str) -> "tuple[str, datetime] | None":
     Parse a subfolder name like 'Tania 6-25-2026  4-16PM' into
     (display_string, datetime).  Returns None if the name doesn't match.
 
-    Expected parts (split on whitespace, empty parts dropped):
-        [0] sender name   e.g. 'Tania'
-        [1] date          e.g. '6-25-2026'  (M-D-YYYY)
-        [2] time          e.g. '4-16PM'     (H-MMAM/PM)
+    The last two whitespace-separated parts are always date + time; everything
+    before that is the sender name, so multi-word senders (e.g. "Tania Smith
+    6-25-2026 4-16PM") work the same as single-word ones:
+        [:-2] sender name   e.g. 'Tania'
+        [-2]  date          e.g. '6-25-2026'  (M-D-YYYY)
+        [-1]  time          e.g. '4-16PM'     (H-MMAM/PM)
     """
     parts = [p for p in name.split() if p]
     if len(parts) < 3:
         return None
-    sender = parts[0]
-    date_part = parts[1]
-    time_part = parts[2]
+    sender = " ".join(parts[:-2])
+    date_part = parts[-2]
+    time_part = parts[-1]
     try:
         dt_date = datetime.strptime(date_part, "%m-%d-%Y")
     except ValueError:
@@ -1767,6 +1769,9 @@ async def upload_alg_invoice(
         parsed = _parse_invoice_folder_name(invoice_folder_name)
         if parsed:
             sender_str, sent_at = parsed
+            logger.info("[UPLOAD] Folder name '%s' → sender='%s'", invoice_folder_name, sender_str)
+        else:
+            logger.info("[UPLOAD] Folder name '%s' — not parseable, no sender metadata from it", invoice_folder_name)
     if sender_str is None and invoice_sender and invoice_date:
         try:
             d = datetime.strptime(invoice_date, "%Y-%m-%d")
@@ -1785,9 +1790,11 @@ async def upload_alg_invoice(
         except ValueError:
             pass  # Bad date/time format — proceed without metadata
 
-    return _process_invoice_csv(content, file.filename or "upload.csv", db,
-                                 invoice_email_sender=sender_str,
-                                 invoice_sent_at=sent_at)
+    result = _process_invoice_csv(content, file.filename or "upload.csv", db,
+                                   invoice_email_sender=sender_str,
+                                   invoice_sent_at=sent_at)
+    result["invoice_email_sender"] = sender_str
+    return result
 
 
 @app.get("/api/invoices/{invoice_number}/file", tags=["Invoices"])
