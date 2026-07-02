@@ -6,11 +6,17 @@ Running log of development work on this branch — what changed, why, and anythi
 
 Stable technical notes that don't belong to one changelog entry — add here when something is worth knowing on its own. Keep this short; if it's about the codebase's architecture rather than something learned while fixing a bug, it probably belongs in `CLAUDE.md` instead.
 
-_(none yet)_
+- **Known data-integrity bug (found 2026-07-01, not yet fixed):** 10 pairs of duplicate `bol_records` rows exist in production for the same `technique_trip` (e.g. two rows for `TEC_T_0110814` with the identical `created_at` timestamp down to the microsecond). Root cause suspected in `pull_technique_data()`'s upsert/matching logic — a real trip is getting inserted twice in one pull instead of matched to its existing row. Not caused by anything in this changelog; discovered incidentally while verifying the table-merge below. Tracked as a follow-up, not yet fixed.
 
 ## Changelog
 
 One entry per closed issue. Newest on top.
+
+### 2026-07-01 — #31 / #36 Remove incorrect Prophecy badges + merge Invoice Only into main table
+**What:** Reordered invoice-matching priority in `_process_invoice_csv()` so exact Technique-trip matches (Z-number, then Job-Name-as-trip-suffix) are always tried before treating Job Name as a Prophecy BOL number — a real trip whose numeric suffix happens to start with "14" (e.g. `140237`) was being misclassified as a Wolf/311 Prophecy load, incorrectly showing the indigo "P" marker. Also removed the separate "Invoice Only" and "Comingle" collapsible sections in `BOLTable.jsx` — all pending records (manifest-only, invoice-only, comingle) now render in one flat table, sorted by effective date (`invoice_sent_at` if known, else `created_at`).
+**Why:** Katie wants one unified review queue, not split by category; the Prophecy-BOL heuristic had no way to distinguish "looks like a BOL number" from "is actually one" without first ruling out a real trip match.
+**Files:** backend/main.py (`_process_invoice_csv` matching order), frontend/src/components/BOLTable.jsx
+**Gotcha:** The date-based sort is a placeholder, not the real sortable-columns feature (issue #33) — many records have no `invoice_sent_at` yet and fall back to `created_at`, so ordering isn't very meaningful until #33 lands. Verified the reorder fix with a throwaway record (`TEC_T_0140237`) proving the collision case now matches correctly via `job_name` instead of `prophecy_bol`.
 
 ### 2026-07-01 — #21 access_prog diverges from ALG's invoice amount
 **What:** `access_prog` now uses SG360's own pulled pallet data (`get_pallet_data_for_manifests()` for Technique trips, new `get_prophecy_pallet_data()` for Wolf/311 Prophecy loads) instead of ALG's self-reported per-pallet weight, and uses the invoice's own parsed FSC rate (`alg_fsc_pct`/`alg_fsc_cost`) instead of an EIA-diesel-derived guess. Tariff lookup now tries an exact zone match, then this same invoice's own rate for a gap zone, then a nearest-zone guess as a last resort — the latter two cases set `tariff_zone_approximate`; no own pallet data at all sets `weight_source_fallback`. Both surface as a `~EST` badge in the dashboard.

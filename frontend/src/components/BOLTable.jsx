@@ -71,14 +71,15 @@ export default function BOLTable({
     b.bol_number != null ? String(b.bol_number) : '',
   ].some(v => (v || '').toLowerCase().includes(lower));
 
-  const isComingle    = b => (b.manifest || '').startsWith('CM_');
-  const isInvoiceOnly = b => b.technique_trip == null && !isComingle(b);
-  const isMain        = b => b.technique_trip != null && !isComingle(b);
-
-  const mainBols        = bols.filter(isMain).filter(matchesBol);
-  const invoiceOnlyBols = bols.filter(isInvoiceOnly).filter(matchesBol);
-  const comingleBols    = bols.filter(isComingle).filter(matchesBol);
-  const totalVisible    = mainBols.length + invoiceOnlyBols.length + comingleBols.length;
+  // One flat table, no category grouping — sorted by effective date (invoice date when
+  // known, otherwise when we first saw the record). A proper user-facing sort (issue #33)
+  // will replace this; this is just a sensible default until then.
+  const effectiveDate = b => b.invoice_sent_at || b.created_at;
+  const visibleBols = bols
+    .filter(matchesBol)
+    .slice()
+    .sort((a, b) => new Date(effectiveDate(a)) - new Date(effectiveDate(b)));
+  const totalVisible = visibleBols.length;
 
   function rowProps(bol) {
     return {
@@ -153,72 +154,14 @@ export default function BOLTable({
           {filterText ? `No records match "${filterText}"` : 'No pending records — all caught up!'}
         </div>
       ) : (
-        <>
-          {mainBols.length > 0 && (
-            <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb', marginBottom: 12 }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
-                <TableHead />
-                <tbody>
-                  {mainBols.map(bol => <BOLRow {...rowProps(bol)} />)}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {invoiceOnlyBols.length > 0 && (
-            <details style={{ marginBottom: 12 }}>
-              <summary style={{
-                cursor: 'pointer',
-                padding: '8px 14px',
-                background: '#faf5ff',
-                border: '1px solid #ddd6fe',
-                borderRadius: 8,
-                fontSize: 13,
-                fontWeight: 600,
-                color: '#7c3aed',
-                userSelect: 'none',
-                listStyle: 'none',
-              }}>
-                ▸ Invoice Only — {invoiceOnlyBols.length} record{invoiceOnlyBols.length !== 1 ? 's' : ''} (no matching manifest yet)
-              </summary>
-              <div style={{ overflowX: 'auto', borderRadius: '0 0 8px 8px', border: '1px solid #ddd6fe', borderTop: 'none' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
-                  <TableHead />
-                  <tbody>
-                    {invoiceOnlyBols.map(bol => <BOLRow {...rowProps(bol)} />)}
-                  </tbody>
-                </table>
-              </div>
-            </details>
-          )}
-
-          {comingleBols.length > 0 && (
-            <details style={{ marginBottom: 12 }}>
-              <summary style={{
-                cursor: 'pointer',
-                padding: '8px 14px',
-                background: '#fffbeb',
-                border: '1px solid #fcd34d',
-                borderRadius: 8,
-                fontSize: 13,
-                fontWeight: 600,
-                color: '#92400e',
-                userSelect: 'none',
-                listStyle: 'none',
-              }}>
-                ▸ Comingle — {comingleBols.length} record{comingleBols.length !== 1 ? 's' : ''}
-              </summary>
-              <div style={{ overflowX: 'auto', borderRadius: '0 0 8px 8px', border: '1px solid #fcd34d', borderTop: 'none' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
-                  <TableHead />
-                  <tbody>
-                    {comingleBols.map(bol => <BOLRow {...rowProps(bol)} />)}
-                  </tbody>
-                </table>
-              </div>
-            </details>
-          )}
-        </>
+        <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb', marginBottom: 12 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
+            <TableHead />
+            <tbody>
+              {visibleBols.map(bol => <BOLRow {...rowProps(bol)} />)}
+            </tbody>
+          </table>
+        </div>
       )}
     </section>
   );

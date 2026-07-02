@@ -1219,13 +1219,53 @@ def _process_invoice_csv(
 
     matched_rec = None
     match_strategy: Optional[str] = None
+    effective_prophecy_bol: Optional[str] = None
 
-    # Prophecy BOL lives in Job Name only — the BOL No column is always a permit number.
-    effective_prophecy_bol = job_name if job_name and _is_prophecy_bol(job_name) else None
+    # Try exact, reliable matches first — a real match always beats a "Job Name looks like
+    # a Prophecy BOL number" guess, since ordinary trip suffixes can coincidentally fall in
+    # the same 140000-149999 numeric range as real Prophecy BOLs (see _is_prophecy_bol).
+    # Job Name normally carries the trip suffix (e.g. "110810" → TEC_T_0110810); for a
+    # genuine Wolf/311 load with no Technique trip, it instead carries the Prophecy BOL
+    # itself — that's only checked below, after ruling out a real trip match.
 
-    if effective_prophecy_bol:
-        # ── Wolf/311 path ─────────────────────────────────────────────────────
-        # Job Name is a Prophecy BOL (14xxxx). No Technique trip for this load.
+    # 1. Already uploaded: match by Z-number.
+    if settings.USE_MOCK_DATA:
+        for rec in _mock_state.values():
+            if rec.get("invoice_number") == invoice_no:
+                matched_rec = rec
+                match_strategy = "invoice_number"
+                break
+    else:
+        matched_rec = (
+            db.query(BOLRecord)
+            .filter(BOLRecord.invoice_number == invoice_no)
+            .first()
+        )
+        if matched_rec is not None:
+            match_strategy = "invoice_number"
+
+    # 2. Job Name as trip suffix.
+    if matched_rec is None and job_name:
+        if settings.USE_MOCK_DATA:
+            for rec in _mock_state.values():
+                trip = rec.get("technique_trip") or ""
+                if trip and _trip_to_suffix(trip) == job_name:
+                    matched_rec = rec
+                    match_strategy = "job_name"
+                    break
+        else:
+            for row_obj in db.query(BOLRecord).filter(
+                BOLRecord.technique_trip.isnot(None)
+            ).all():
+                if _trip_to_suffix(row_obj.technique_trip or "") == job_name:
+                    matched_rec = row_obj
+                    match_strategy = "job_name"
+                    break
+
+    # 3. Job Name as a Prophecy BOL (Wolf/311 — no Technique trip for this load). Only
+    # reached once steps 1-2 have ruled out this being an ordinary trip suffix.
+    if matched_rec is None and job_name and _is_prophecy_bol(job_name):
+        effective_prophecy_bol = job_name
         bol_num = int(effective_prophecy_bol)
         if settings.USE_MOCK_DATA:
             for rec in _mock_state.values():
@@ -1241,72 +1281,35 @@ def _process_invoice_csv(
             )
             if matched_rec is not None:
                 match_strategy = "prophecy_bol"
-    else:
-        # ── Corp / Technique path ─────────────────────────────────────────────
-        # Job Name is the trip suffix (e.g. "110810" → TEC_T_0110810).
 
-        # 1. Already uploaded: match by Z-number.
+    # 4. Pallets + pieces (last resort, non-comingle only).
+    if matched_rec is None and not (cust_job_no or "").upper().startswith("CM") \
+            and total_pallets and total_pcs:
         if settings.USE_MOCK_DATA:
-            for rec in _mock_state.values():
-                if rec.get("invoice_number") == invoice_no:
-                    matched_rec = rec
-                    match_strategy = "invoice_number"
-                    break
+            candidates = [
+                rec for rec in _mock_state.values()
+                if rec.get("technique_pallets") == total_pallets
+                and rec.get("technique_pcs") == total_pcs
+                and not rec.get("invoice_number")
+                and rec.get("technique_trip") is not None
+            ]
+            if len(candidates) == 1:
+                matched_rec = candidates[0]
+                match_strategy = "pallets_pieces"
+                logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
+                               invoice_no, matched_rec.get("technique_trip"))
         else:
-            matched_rec = (
-                db.query(BOLRecord)
-                .filter(BOLRecord.invoice_number == invoice_no)
-                .first()
-            )
-            if matched_rec is not None:
-                match_strategy = "invoice_number"
-
-        # 2. Job Name as trip suffix.
-        if matched_rec is None and job_name:
-            if settings.USE_MOCK_DATA:
-                for rec in _mock_state.values():
-                    trip = rec.get("technique_trip") or ""
-                    if trip and _trip_to_suffix(trip) == job_name:
-                        matched_rec = rec
-                        match_strategy = "job_name"
-                        break
-            else:
-                for row_obj in db.query(BOLRecord).filter(
-                    BOLRecord.technique_trip.isnot(None)
-                ).all():
-                    if _trip_to_suffix(row_obj.technique_trip or "") == job_name:
-                        matched_rec = row_obj
-                        match_strategy = "job_name"
-                        break
-
-        # 3. Pallets + pieces (last resort, non-comingle only).
-        if matched_rec is None and not (cust_job_no or "").upper().startswith("CM") \
-                and total_pallets and total_pcs:
-            if settings.USE_MOCK_DATA:
-                candidates = [
-                    rec for rec in _mock_state.values()
-                    if rec.get("technique_pallets") == total_pallets
-                    and rec.get("technique_pcs") == total_pcs
-                    and not rec.get("invoice_number")
-                    and rec.get("technique_trip") is not None
-                ]
-                if len(candidates) == 1:
-                    matched_rec = candidates[0]
-                    match_strategy = "pallets_pieces"
-                    logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
-                                   invoice_no, matched_rec.get("technique_trip"))
-            else:
-                candidates = db.query(BOLRecord).filter(
-                    BOLRecord.technique_pallets == total_pallets,
-                    BOLRecord.technique_pcs == total_pcs,
-                    BOLRecord.invoice_number.is_(None),
-                    BOLRecord.technique_trip.isnot(None),
-                ).all()
-                if len(candidates) == 1:
-                    matched_rec = candidates[0]
-                    match_strategy = "pallets_pieces"
-                    logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
-                                   invoice_no, matched_rec.technique_trip)
+            candidates = db.query(BOLRecord).filter(
+                BOLRecord.technique_pallets == total_pallets,
+                BOLRecord.technique_pcs == total_pcs,
+                BOLRecord.invoice_number.is_(None),
+                BOLRecord.technique_trip.isnot(None),
+            ).all()
+            if len(candidates) == 1:
+                matched_rec = candidates[0]
+                match_strategy = "pallets_pieces"
+                logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
+                               invoice_no, matched_rec.technique_trip)
 
     if matched_rec is None:
         is_wolf_stub = bool(effective_prophecy_bol)
