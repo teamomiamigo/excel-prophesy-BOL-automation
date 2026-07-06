@@ -1,9 +1,14 @@
-export default function SummaryBar({ manifestOnly, invoiceOnly, readyToReview, approvedToday }) {
+export default function SummaryBar({ awaitingInvoice, readyToReview, readyToReviewTypeA, readyToReviewTypeB, approvedToday }) {
   const cards = [
-    { label: 'Manifest Only',   value: manifestOnly,   color: '#6b7280', bg: '#f9fafb' },
-    { label: 'Invoice Only',    value: invoiceOnly,    color: '#7c3aed', bg: '#faf5ff' },
-    { label: 'Ready to Review', value: readyToReview,  color: '#E76F1E', bg: '#fff7ed' },
-    { label: 'Approved Today',  value: approvedToday,  color: '#2D6A4F', bg: '#f0fdf4' },
+    { label: 'Awaiting Invoice', value: awaitingInvoice, color: '#6b7280', bg: '#f9fafb' },
+    {
+      label: 'Ready to Review',
+      value: readyToReview,
+      color: '#E76F1E',
+      bg: '#fff7ed',
+      sub: `${readyToReviewTypeA} Type A · ${readyToReviewTypeB} Type B`,
+    },
+    { label: 'Approved Today', value: approvedToday, color: '#2D6A4F', bg: '#f0fdf4' },
   ];
 
   return (
@@ -23,6 +28,11 @@ export default function SummaryBar({ manifestOnly, invoiceOnly, readyToReview, a
           <div style={{ fontSize: 12, color: '#6b7280', marginTop: 4, fontWeight: 500 }}>
             {card.label}
           </div>
+          {card.sub && (
+            <div style={{ fontSize: 11, color: '#9ca3af', marginTop: 3 }}>
+              {card.sub}
+            </div>
+          )}
         </div>
       ))}
     </div>
