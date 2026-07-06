@@ -43,6 +43,25 @@ const TD = {
 
 const TD_R = { ...TD, textAlign: 'right' };
 
+// Actions column: small neutral square icon button (Flag toggle)
+const ICON_BTN = {
+  width: 26,
+  height: 26,
+  border: '1px solid #e5e7eb',
+  borderRadius: 4,
+  background: '#fff',
+  fontSize: 12,
+  fontWeight: 600,
+  cursor: 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  padding: 0,
+};
+
+// Actions column: fixed-size empty slot — same footprint as a button, reads as "nothing here"
+const PLACEHOLDER = { width: '100%', height: 26 };
+
 export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isIgnoring, isExportingSid, isCheckingBol, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore, onExportSid, onCheckBol, onToggleSelect }) {
   const [hovered, setHovered] = useState(false);
   const [notesValue, setNotesValue] = useState(bol.notes || '');
@@ -219,117 +238,58 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
         </div>
       </td>
 
-      {/* Actions — fixed 5-slot grid so every row has identical column width */}
+      {/* Actions — routine zone (Approve/Flag/SID/BOL) + exception zone (3P/Ignore), fixed-size slots so every row has identical column width */}
       <td style={{ ...TD, textAlign: 'center' }}>
-        <div style={{ display: 'grid', gridTemplateColumns: '80px 36px 36px 36px 42px', gap: 4, alignItems: 'center', justifyContent: 'center' }}>
-          {/* Slot 1: Approve */}
-          <button
-            onClick={onApprove}
-            disabled={isApproving}
-            title="Approve this record"
-            style={{
-              background: isApproving ? '#d1fae5' : '#2D6A4F',
-              color: isApproving ? '#065f46' : '#fff',
-              border: 'none',
-              borderRadius: 4,
-              padding: '4px 0',
-              width: '100%',
-              fontSize: 12,
-              fontWeight: 600,
-              opacity: isApproving ? 0.7 : 1,
-              cursor: isApproving ? 'not-allowed' : 'pointer',
-            }}
-          >
-            {isApproving ? '…' : '✓ Approve'}
-          </button>
-          {/* Slot 2: Flag ↔ Unflag (swaps in place, same slot) */}
-          {isFlagged ? (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+          {/* Routine zone: Approve, Flag/Unflag, SID, Refresh BOL — used constantly, always one click */}
+          <div style={{ display: 'grid', gridTemplateColumns: '80px 26px 42px 42px', gap: 4, alignItems: 'center' }}>
+            {/* Approve */}
             <button
-              onClick={onUnflag}
-              disabled={isUnflagging}
-              title="Remove flag and return to pending"
+              onClick={onApprove}
+              disabled={isApproving}
+              title="Approve this record"
               style={{
-                background: '#fff',
-                color: '#6b7280',
-                border: '1px solid #d1d5db',
+                background: isApproving ? '#d1fae5' : '#2D6A4F',
+                color: isApproving ? '#065f46' : '#fff',
+                border: 'none',
                 borderRadius: 4,
                 padding: '4px 0',
                 width: '100%',
                 fontSize: 12,
                 fontWeight: 600,
-                cursor: isUnflagging ? 'not-allowed' : 'pointer',
-                opacity: isUnflagging ? 0.6 : 1,
+                opacity: isApproving ? 0.7 : 1,
+                cursor: isApproving ? 'not-allowed' : 'pointer',
               }}
             >
-              {isUnflagging ? '…' : '✕'}
+              {isApproving ? '…' : '✓ Approve'}
             </button>
-          ) : (
-            <button
-              onClick={onFlagOpen}
-              title="Flag this record for review"
-              style={{
-                background: '#fff7ed',
-                color: '#92400e',
-                border: '1px solid #fcd34d',
-                borderRadius: 4,
-                padding: '4px 0',
-                width: '100%',
-                fontSize: 12,
-                fontWeight: 600,
-                cursor: 'pointer',
-              }}
-            >
-              ⚑
-            </button>
-          )}
-          {/* Slot 3: 3P for eligible rows | Ignore link for invoice-only stubs | spacer otherwise */}
-          {!bol.amount && !bol.bol_number && !bol.is_third_party ? (
-            <button
-              onClick={onMarkThirdParty}
-              disabled={isMarkingThirdParty}
-              title="Mark as third-party — customer pays freight directly"
-              style={{
-                background: '#fff7ed',
-                color: '#c2410c',
-                border: '1px solid #fed7aa',
-                borderRadius: 4,
-                padding: '4px 0',
-                width: '100%',
-                fontSize: 11,
-                fontWeight: 700,
-                cursor: isMarkingThirdParty ? 'not-allowed' : 'pointer',
-                opacity: isMarkingThirdParty ? 0.6 : 1,
-                letterSpacing: '0.02em',
-              }}
-            >
-              {isMarkingThirdParty ? '…' : '3P'}
-            </button>
-          ) : bol.technique_trip == null && bol.invoice_number ? (
-            isIgnored ? (
+            {/* Flag ↔ Unflag (swaps in place, same slot) — small neutral icon button, secondary to Approve */}
+            {isFlagged ? (
               <button
-                onClick={() => onIgnore && onIgnore(bol.id, false)}
-                title="Unignore — restore this record"
-                style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#6b7280', cursor: 'pointer', textDecoration: 'underline' }}
+                onClick={onUnflag}
+                disabled={isUnflagging}
+                title="Remove flag and return to pending"
+                style={{
+                  ...ICON_BTN,
+                  color: '#6b7280',
+                  cursor: isUnflagging ? 'not-allowed' : 'pointer',
+                  opacity: isUnflagging ? 0.6 : 1,
+                }}
               >
-                {isIgnoring ? '…' : 'Unignore'}
+                {isUnflagging ? '…' : '✕'}
               </button>
             ) : (
               <button
-                onClick={() => onIgnore && onIgnore(bol.id, true)}
-                disabled={isIgnoring}
-                title="Ignore — mark as unresolvable, exclude from exports"
-                style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#9ca3af', cursor: isIgnoring ? 'not-allowed' : 'pointer', textDecoration: 'underline' }}
+                onClick={onFlagOpen}
+                title="Flag this record for review"
+                style={{ ...ICON_BTN, color: '#92400e', borderColor: '#fcd34d', background: '#fff7ed' }}
               >
-                {isIgnoring ? '…' : 'Ignore'}
+                ⚑
               </button>
-            )
-          ) : (
-            <div style={{ width: '100%' }} />
-          )}
-          {/* Slot 4 + 5: Export to Prophecy / Check BOL — only for pending Type A records
-              (no BOL yet, has a manifest, not third-party/ignored) */}
-          {bol.needs_sid_export && bol.manifest && !bol.is_third_party && !bol.is_ignored ? (
-            <>
+            )}
+            {/* Export to Prophecy / Check BOL — only for pending Type A records
+                (no BOL yet, has a manifest, not third-party/ignored) */}
+            {bol.needs_sid_export && bol.manifest && !bol.is_third_party && !bol.is_ignored ? (
               <button
                 onClick={onExportSid}
                 disabled={isExportingSid}
@@ -349,6 +309,10 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
               >
                 {isExportingSid ? '…' : 'SID'}
               </button>
+            ) : (
+              <div style={PLACEHOLDER} />
+            )}
+            {bol.needs_sid_export && bol.manifest && !bol.is_third_party && !bol.is_ignored ? (
               <button
                 onClick={onCheckBol}
                 disabled={isCheckingBol}
@@ -368,13 +332,60 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
               >
                 {isCheckingBol ? '…' : '↻ BOL'}
               </button>
-            </>
-          ) : (
-            <>
-              <div style={{ width: '100%' }} />
-              <div style={{ width: '100%' }} />
-            </>
-          )}
+            ) : (
+              <div style={PLACEHOLDER} />
+            )}
+          </div>
+
+          {/* Divider between routine and exception-handling actions */}
+          <div style={{ width: 1, alignSelf: 'stretch', background: '#e5e7eb' }} />
+
+          {/* Exception zone: 3P | Ignore | Unignore — mutually exclusive, one fixed slot */}
+          <div style={{ width: 44 }}>
+            {!bol.amount && !bol.bol_number && !bol.is_third_party ? (
+              <button
+                onClick={onMarkThirdParty}
+                disabled={isMarkingThirdParty}
+                title="Mark as third-party — customer pays freight directly"
+                style={{
+                  background: '#fff7ed',
+                  color: '#c2410c',
+                  border: '1px solid #fed7aa',
+                  borderRadius: 4,
+                  padding: '4px 0',
+                  width: '100%',
+                  fontSize: 11,
+                  fontWeight: 700,
+                  cursor: isMarkingThirdParty ? 'not-allowed' : 'pointer',
+                  opacity: isMarkingThirdParty ? 0.6 : 1,
+                  letterSpacing: '0.02em',
+                }}
+              >
+                {isMarkingThirdParty ? '…' : '3P'}
+              </button>
+            ) : bol.technique_trip == null && bol.invoice_number ? (
+              isIgnored ? (
+                <button
+                  onClick={() => onIgnore && onIgnore(bol.id, false)}
+                  title="Unignore — restore this record"
+                  style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#6b7280', cursor: 'pointer', textDecoration: 'underline', width: '100%' }}
+                >
+                  {isIgnoring ? '…' : 'Unignore'}
+                </button>
+              ) : (
+                <button
+                  onClick={() => onIgnore && onIgnore(bol.id, true)}
+                  disabled={isIgnoring}
+                  title="Ignore — mark as unresolvable, exclude from exports"
+                  style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#9ca3af', cursor: isIgnoring ? 'not-allowed' : 'pointer', textDecoration: 'underline', width: '100%' }}
+                >
+                  {isIgnoring ? '…' : 'Ignore'}
+                </button>
+              )
+            ) : (
+              <div style={PLACEHOLDER} />
+            )}
+          </div>
         </div>
       </td>
     </tr>
