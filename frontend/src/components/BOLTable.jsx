@@ -80,7 +80,7 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort 
           />
         </th>
         <th colSpan={4} style={TH_STYLE} />
-        <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '2px solid #404040' }}>Technique</th>
+        <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '2px solid #404040' }}>SG360</th>
         <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '1px solid #404040' }}>Invoice (ALG)</th>
         <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '1px solid #404040' }}>Diff</th>
         <th colSpan={4} style={TH_STYLE} />

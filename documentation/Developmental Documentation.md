@@ -1,4 +1,4 @@
-*updated 2026-07-02*
+*updated 2026-07-06*
 
 Running log of development work on this branch — what changed, why, and anything non-obvious for the next person (human dev or Claude Code) touching this code. Pairs with `CLAUDE.md` (architecture/business rules, kept current) and the GitHub issue backlog (what's queued up next).
 
@@ -8,6 +8,8 @@ Stable technical notes that don't belong to one changelog entry — add here whe
 
 - **Known data-integrity bug (found 2026-07-01, not yet fixed):** 10 pairs of duplicate `bol_records` rows exist in production for the same `technique_trip` (e.g. two rows for `TEC_T_0110814` with the identical `created_at` timestamp down to the microsecond). Root cause suspected in `pull_technique_data()`'s upsert/matching logic — a real trip is getting inserted twice in one pull instead of matched to its existing row. Not caused by anything in this changelog; discovered incidentally while verifying the table-merge below. Tracked as a follow-up, not yet fixed.
 - **Known open bug (2026-07-02):** "Upload Invoice Folder" sender/date auto-detection still fails live ("no sender detected") after three rounds of fixes — per-file folder derivation, the standard React `webkitdirectory`-via-ref fix, and finally replacing `webkitdirectory` entirely with the File System Access API (`showDirectoryPicker()`). Each fix addressed a real, independently-verified bug without resolving the live symptom, and this session's own diagnostic tooling (server log capture, Claude in Chrome, Claude Preview) was independently unreliable throughout, so the true root cause is still unconfirmed. `_parse_invoice_folder_name()` itself is unit-verified correct. Next step: get the exact live folder name string and/or a working way to inspect the browser DOM/network tab directly.
+- **`start.ps1` encoding gotcha (2026-07-06):** Windows PowerShell 5.1 reads `.ps1` files without a UTF-8 BOM using the system codepage, not UTF-8 — a literal em-dash (`—`) in a comment or string gets misdecoded into a stray quote-like byte, corrupting the parser's quote-tracking for the rest of the file (manifests as unrelated-looking parse errors on far-later lines). Keep `.ps1` files ASCII-only.
+- **Inconsistent `python` resolution on this machine (2026-07-06):** bare `python` resolves to different interpreters depending on execution context — an interactive shell (profile loaded) picks one install with packages present; a `-NoProfile` background process (as `start.ps1` spawns) picks a different install (`Python314`) that may be missing packages. Backend deps were installed into both; if `ModuleNotFoundError` recurs after adding a new dependency, install it into both interpreters or pin `start.ps1` to a full path.
 
 ## Changelog
 

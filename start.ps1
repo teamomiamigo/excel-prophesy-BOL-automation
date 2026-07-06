@@ -1,4 +1,4 @@
-# SG360 BOL Reconciliation — Start both servers
+# SG360 BOL Reconciliation - Start both servers
 # Run from the project root: .\start.ps1
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -16,7 +16,7 @@ foreach ($port in @(8000, 3000)) {
 Start-Sleep -Seconds 1
 $stillOn8000 = (Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue).OwningProcess
 if ($stillOn8000) {
-    Write-Host "WARNING: Port 8000 still in use by PID(s): $stillOn8000 — attempting name-based kill" -ForegroundColor Red
+    Write-Host "WARNING: Port 8000 still in use by PID(s): $stillOn8000 - attempting name-based kill" -ForegroundColor Red
     Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 Start-Sleep -Seconds 1

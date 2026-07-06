@@ -34,7 +34,9 @@
       "Bash(git push *)",
       "Bash(python3)",
       "Bash(git commit -m 'fix: prioritize exact trip matches over Prophecy-BOL guess, merge pending table \\(#31, #36\\) *)",
-      "Bash(python3 -c \"import ast; ast.parse\\(open\\('backend/main.py', encoding='utf-8'\\).read\\(\\)\\)\")"
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('backend/main.py', encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(where python *)",
+      "Bash(py -3 -c \"import uvicorn\")"
     ]
   }
 }

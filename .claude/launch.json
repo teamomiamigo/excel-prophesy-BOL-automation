@@ -7,6 +7,13 @@
       "runtimeArgs": ["run", "dev"],
       "port": 3000,
       "cwd": "${workspaceFolder}/frontend"
+    },
+    {
+      "name": "backend",
+      "runtimeExecutable": "C:\\Users\\nikhilm\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe",
+      "runtimeArgs": ["-m", "uvicorn", "backend.main:app", "--reload", "--port", "8000"],
+      "port": 8000,
+      "cwd": "${workspaceFolder}"
     }
   ]
 }
