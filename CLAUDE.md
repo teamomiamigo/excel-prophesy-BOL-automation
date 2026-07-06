@@ -117,7 +117,7 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` (root + one level of dated sender subfolders) for unprocessed CSVs → process each, parsing sender/date from the subfolder name; files stay in place, dedup via DB `invoice_number` |
 | GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only); also stamps `sid_exported_at` on each included record |
 | POST | `/api/bols/{id}/export-prophecy-sid` | Per-record SID export — pushes one pending Type A record to Prophecy without waiting for a batch approval; same CSV logic as the bulk route, scoped to one manifest |
-| POST | `/api/bols/{id}/refresh-bol` | Check Prophecy for a BOL on one record's manifest without a full Technique pull; reuses `get_technique_data()` filtered to one manifest — ~10s live (hits AWP-SQL-PROD), near-instant if the record already has a BOL |
+| POST | `/api/bols/{id}/refresh-bol` | Refresh one record's manifest-side data: re-pulls weight/pallets/pieces from VisualMail (`get_manifest_weights()`) and checks Prophecy for a BOL (`get_technique_data()` filtered to one manifest), without a full Technique pull — ~10s live (hits AWP-SQL-PROD), near-instant if the record already has a BOL. Does not touch invoice-side fields (access_prog/cost_pct/amount/alg_*) |
 | POST | `/api/export` | Generate accounting CSV and email to Mary + Katie |
 | GET | `/api/logs` | All records across all dates; optional `?start_date=` / `?end_date=` / `?status=` filters |
 | GET | `/api/logs/export` | Download log as CSV; same date-range params as above |

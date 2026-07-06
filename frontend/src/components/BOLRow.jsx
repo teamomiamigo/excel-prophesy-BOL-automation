@@ -352,7 +352,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
               <button
                 onClick={onCheckBol}
                 disabled={isCheckingBol}
-                title="Check Prophecy for a BOL number on this manifest"
+                title="Refresh BOL status and manifest weight/pallets/pieces from Technique"
                 style={{
                   background: isCheckingBol ? '#e5e7eb' : '#f9fafb',
                   color: '#374151',

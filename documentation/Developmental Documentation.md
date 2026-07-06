@@ -15,6 +15,12 @@ Stable technical notes that don't belong to one changelog entry — add here whe
 
 One entry per closed issue. Newest on top.
 
+### 2026-07-06 — Refresh button silently missed manifest weight/pallet/piece changes
+**What:** `POST /api/bols/{id}/refresh-bol` now also re-pulls technique_weight/technique_pallets/technique_pcs from VisualMail (`get_manifest_weights()`) in addition to the existing Prophecy BOL check, recomputing weight_diff/pallet_diff/pcs_diff when an invoice is already matched. Response message now reports both outcomes together.
+**Why:** The button's visibility/condition was already correct (shows for every genuine Technique Type A record with a manifest), but clicking it only ever checked for a new BOL number — it never re-synced weight/pallet/piece counts, so "refresh this record" didn't actually refresh all of the manifest's data.
+**Files:** backend/main.py (`refresh_bol_for_record`), frontend/src/components/BOLRow.jsx (tooltip)
+**Gotcha:** Deliberately does not touch access_prog/cost_pct/amount/alg_* — those are invoice-driven (recomputed by `_process_invoice_csv` at invoice-upload time), not manifest-driven, so this refresh stays scoped to manifest-side fields only.
+
 ### 2026-07-02 — #29 Invoice file link broken + folder-based invoice ingestion
 **What:** `GET /api/invoices/{z}/file` now searches INVOICE_FOLDER's root plus one level of dated sender subfolders (e.g. "Tania 6-25-2026  4-16PM/") and prefers a matching PDF over the CSV (ALG's real PDFs are named like "Z557948- Segerdahl Graphics, Inc_.pdf" — prefix match, not exact). Fixed a NameError in `poll_invoice_folder()` (`candidates` was never defined — leftover from a copy-pasted function) that threw a 500 on every non-empty scan, which is why "Pull Invoices" appeared broken. Added `invoice_email_sender` to the Pending table's filter box. "Upload Invoices" is now a folder picker (`webkitdirectory`) instead of a multi-file picker — the selected folder's name is parsed server-side with the same `_parse_invoice_folder_name()` `poll-folder` already used, so sender/date no longer need manual entry; non-CSV files in the folder (PDFs, `.msg`) are ignored.
 **Why:** ALG's shared drive changed from flat CSVs to one dated subfolder per email drop; the file-viewer endpoint and the manual upload flow were never updated to match, and a leftover bug silently broke the one code path that already had.
