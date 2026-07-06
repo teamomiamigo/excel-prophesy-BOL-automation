@@ -2133,16 +2133,23 @@ def export_prophecy_sid_for_record(record_id: uuid.UUID, db: Session = Depends(g
 @app.post("/api/bols/{record_id}/refresh-bol", tags=["Admin"])
 def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
     """
-    Check whether Prophecy now has a BOL (load_id/pooled_to_load_id) for one
-    specific record's manifest, without re-running the full Technique pull
-    across every manifest. Meant for the round-trip: Katie exports a SID file
-    for one record, imports it into Prophecy, then uses this to confirm the
-    BOL number came back — instead of waiting for tomorrow's full pull.
+    Refresh one record's manifest-side data from Technique without re-running
+    the full pull across every manifest: (1) re-check VisualMail for updated
+    weight/pallets/pieces (Query B — the only source of these fields), and
+    (2) check whether Prophecy now has a BOL (load_id/pooled_to_load_id) for
+    this manifest (Query A). Meant for the round-trip: Katie exports a SID
+    file for one record, imports it into Prophecy, then uses this to confirm
+    the BOL number came back — instead of waiting for tomorrow's full pull.
 
-    Reuses get_technique_data() unchanged (proven, already-working query) and
-    filters the result to this one manifest, rather than a new hand-written
-    single-manifest SQL query — heavier than strictly necessary, but zero risk
-    of a subtly wrong new query. Revisit if this proves too slow in practice.
+    Does NOT touch invoice-side fields (invoice_number/amount/alg_*/
+    access_prog/cost_pct) — those are only recomputed by invoice upload
+    (_process_invoice_csv), not by this manifest refresh.
+
+    Reuses get_technique_data()/get_manifest_weights() unchanged (proven,
+    already-working queries — the same two the morning pull uses) rather
+    than new hand-written single-manifest SQL — heavier than strictly
+    necessary, but zero risk of a subtly wrong new query. Revisit if this
+    proves too slow in practice.
     """
     if settings.USE_MOCK_DATA:
         raise HTTPException(
@@ -2158,21 +2165,51 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
     if not rec.needs_sid_export:
         return {"updated": False, "bol_number": rec.bol_number, "message": "This record already has a BOL."}
 
-    from backend.data_layer import get_technique_data
+    from backend.data_layer import get_technique_data, get_manifest_weights
 
+    messages = []
+    updated = False
+
+    # (1) Refresh weight/pallets/pieces from VisualMail (Query B)
+    weight_data = get_manifest_weights([rec.manifest]).get(rec.manifest)
+    if weight_data:
+        new_weight  = weight_data["technique_weight"]
+        new_pallets = weight_data["technique_pallets"]
+        new_pcs     = weight_data["technique_pcs"]
+        if (new_weight, new_pallets, new_pcs) != (rec.technique_weight, rec.technique_pallets, rec.technique_pcs):
+            rec.technique_weight  = new_weight
+            rec.technique_pallets = new_pallets
+            rec.technique_pcs     = new_pcs
+            if rec.alg_weight is not None and rec.technique_weight:
+                rec.weight_diff = Decimal(str(round(float(rec.alg_weight) - float(rec.technique_weight), 2)))
+            if rec.alg_pallets is not None and rec.technique_pallets is not None:
+                rec.pallet_diff = rec.alg_pallets - rec.technique_pallets
+            if rec.alg_pcs is not None and rec.technique_pcs is not None:
+                rec.pcs_diff = rec.alg_pcs - rec.technique_pcs
+            updated = True
+            messages.append("Weight/pallets/pieces updated.")
+
+    # (2) Check BOL status from Technique/ShipperPlus (Query A)
     manifests = get_technique_data(days_back=21)
     match = next((m for m in manifests if m.get("manifest") == rec.manifest), None)
     if match is None:
-        return {"updated": False, "bol_number": None, "message": "Manifest not found in Technique — try again later."}
+        messages.append("Manifest not found in Technique for BOL check — try again later.")
+    else:
+        before = rec.bol_number
+        _apply_bol_status(rec, match)
+        if rec.bol_number and rec.bol_number != before:
+            updated = True
+            messages.append(f"BOL {rec.bol_number} found.")
 
-    before = rec.bol_number
-    _apply_bol_status(rec, match)
     db.commit()
 
-    if rec.bol_number and rec.bol_number != before:
-        logger.info("[REFRESH-BOL] %s → BOL %s", rec.manifest, rec.bol_number)
-        return {"updated": True, "bol_number": rec.bol_number, "message": f"BOL {rec.bol_number} found."}
-    return {"updated": False, "bol_number": rec.bol_number, "message": "No BOL in Prophecy yet — check again later."}
+    if updated:
+        logger.info("[REFRESH-BOL] %s → bol=%s weight=%s pallets=%s pcs=%s",
+                    rec.manifest, rec.bol_number, rec.technique_weight, rec.technique_pallets, rec.technique_pcs)
+    else:
+        messages.append("No changes.")
+
+    return {"updated": updated, "bol_number": rec.bol_number, "message": " ".join(messages)}
 
 
 @app.get("/api/logs", response_model=list[BOLSummary], tags=["Logs"])

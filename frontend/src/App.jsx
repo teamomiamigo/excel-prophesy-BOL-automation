@@ -68,11 +68,14 @@ export default function App() {
   const thirdPartyBols     = pendingBols.filter(b => b.is_third_party);
   const visiblePendingBols = pendingBols.filter(b => !b.is_third_party);
 
+  const readyToReviewBols = visiblePendingBols.filter(b => b.technique_trip != null && b.amount != null);
+
   const summary = {
-    manifestOnly:  visiblePendingBols.filter(b => b.technique_trip != null && b.amount == null).length,
-    invoiceOnly:   visiblePendingBols.filter(b => b.technique_trip == null).length,
-    readyToReview: visiblePendingBols.filter(b => b.technique_trip != null && b.amount != null).length,
-    approvedToday: approvedBols.length,
+    awaitingInvoice:      visiblePendingBols.filter(b => b.technique_trip != null && b.amount == null).length,
+    readyToReview:        readyToReviewBols.length,
+    readyToReviewTypeA:   readyToReviewBols.filter(b => b.needs_sid_export === true).length,
+    readyToReviewTypeB:   readyToReviewBols.filter(b => b.needs_sid_export === false).length,
+    approvedToday:        approvedBols.length,
   };
 
   // -------------------------------------------------------------------------
@@ -809,9 +812,10 @@ export default function App() {
         {activeTab === 'dashboard' && (
           <>
             <SummaryBar
-              manifestOnly={summary.manifestOnly}
-              invoiceOnly={summary.invoiceOnly}
+              awaitingInvoice={summary.awaitingInvoice}
               readyToReview={summary.readyToReview}
+              readyToReviewTypeA={summary.readyToReviewTypeA}
+              readyToReviewTypeB={summary.readyToReviewTypeB}
               approvedToday={summary.approvedToday}
             />
 
@@ -832,9 +836,7 @@ export default function App() {
                 {new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}
               </span>
               <span>·</span>
-              <span>{summary.manifestOnly + summary.invoiceOnly + summary.readyToReview + thirdPartyBols.length + summary.approvedToday} records loaded</span>
-              <span>·</span>
-              <span>{summary.readyToReview} ready &nbsp;·&nbsp; {summary.manifestOnly} manifest only &nbsp;·&nbsp; {summary.invoiceOnly} invoice only &nbsp;·&nbsp; {summary.approvedToday} approved</span>
+              <span>{pendingBols.length + approvedBols.length} records loaded</span>
               <span style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
                 <button
                   onClick={handleRefresh}

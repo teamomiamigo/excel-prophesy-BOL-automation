@@ -18,6 +18,8 @@ Stop-Process -Id (Get-NetTCPConnection -LocalPort 8000).OwningProcess -Force
 ```
 Then restart normally. The `start.ps1` script kills by port but may not catch subprocesses spawned by `--reload`.
 
+**If `/run` or `start.ps1` fails with `ModuleNotFoundError` for a package you know is installed:** bare `python` resolves to different interpreters depending on execution context on this machine — an interactive shell picks one install, `start.ps1`'s `-NoProfile` background process picks another (`Python314`) that can be missing packages. Install new backend deps into both, or point `start.ps1` at a full interpreter path.
+
 **Or start individually:**
 ```powershell
 # Backend (from project root)
@@ -39,7 +41,13 @@ python -m backend.seed_rates [--tariff PATH] [--fsc PATH]
 ```
 Omit flags to use the default source paths under `c:\nikhilm\billing-freight-automation\`.
 
-There are no automated tests. Verify changes manually via the dashboard at `http://localhost:3000` and the FastAPI docs at `http://localhost:8000/docs`.
+There are no automated tests and no linter configured for the frontend. Verify changes manually via the dashboard at `http://localhost:3000` and the FastAPI docs at `http://localhost:8000/docs`.
+
+**Other frontend scripts:**
+```powershell
+cd frontend && npm run build     # production build (not currently deployed anywhere — no CI/CD)
+cd frontend && npm run preview   # serve the production build locally
+```
 
 **Vite dev proxy:** The frontend calls bare `/api/*` paths. Vite proxies them to `http://localhost:8000`. Never hardcode `localhost:8000` in frontend code — the proxy handles it.
 
@@ -109,7 +117,7 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` (root + one level of dated sender subfolders) for unprocessed CSVs → process each, parsing sender/date from the subfolder name; files stay in place, dedup via DB `invoice_number` |
 | GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only); also stamps `sid_exported_at` on each included record |
 | POST | `/api/bols/{id}/export-prophecy-sid` | Per-record SID export — pushes one pending Type A record to Prophecy without waiting for a batch approval; same CSV logic as the bulk route, scoped to one manifest |
-| POST | `/api/bols/{id}/refresh-bol` | Check Prophecy for a BOL on one record's manifest without a full Technique pull; reuses `get_technique_data()` filtered to one manifest — ~10s live (hits AWP-SQL-PROD), near-instant if the record already has a BOL |
+| POST | `/api/bols/{id}/refresh-bol` | Refresh one record's manifest-side data: re-pulls weight/pallets/pieces from VisualMail (`get_manifest_weights()`) and checks Prophecy for a BOL (`get_technique_data()` filtered to one manifest), without a full Technique pull — ~10s live (hits AWP-SQL-PROD), near-instant if the record already has a BOL. Does not touch invoice-side fields (access_prog/cost_pct/amount/alg_*) |
 | POST | `/api/export` | Generate accounting CSV and email to Mary + Katie |
 | GET | `/api/logs` | All records across all dates; optional `?start_date=` / `?end_date=` / `?status=` filters |
 | GET | `/api/logs/export` | Download log as CSV; same date-range params as above |
@@ -314,6 +322,7 @@ documentation/           — Five .md spec files (Design & Workflow, Requirement
                            is the running dev changelog — one entry per closed GitHub issue, appended
                            by the `commit` skill. Read it for recent history that isn't yet folded
                            into this file.
+frontend/src/main.jsx    — Vite entry point; mounts <App /> only, no router
 frontend/src/App.jsx     — Owns all state + fetch/mutation handlers; passes data+callbacks down as props
 frontend/src/components/
   SummaryBar.jsx              — Pending/approved/flagged counts strip
@@ -327,6 +336,16 @@ frontend/src/components/
   EmailComposeModal.jsx       — Builds an HTML table for selected records and calls mark-accounting-sent on send
   LogSection.jsx              — Historical log viewer (separate tab)
 ```
+
+## Frontend patterns
+
+No Context, no reducer, no router, no `useMemo`/`useCallback` anywhere in `frontend/src` — just `useState`/`useEffect`/`useRef`, all lifted to `App.jsx` (~1160 lines) and passed down as props. Conventions to match when extending it:
+
+- **Inline styles only** — no CSS modules, Tailwind, or styled-components. Style objects are built ad hoc per component (e.g. `TD`/`TD_R` constants in `BOLRow.jsx` for shared cell styles). Colors are hardcoded hex per-component (`#2D6A4F` green, `#dc2626` red, etc.) — there's no shared theme/constants file, so matching an existing color means grepping for its hex value in the relevant component.
+- **Modals** (`FlagModal.jsx`, `ReassignInvoiceModal.jsx`) are conditionally rendered inline in `App.jsx`'s JSX based on a target-id state variable (e.g. `flagTarget`, `reassignTargetId`) — not a portal, not router-based.
+- **Debounced auto-save**: the notes field in `BOLRow.jsx` uses local `useState` + `useRef` to hand-roll a 500ms `setTimeout` debounce, then calls back up to `App.jsx`'s `onNotesUpdate` (which hits `PATCH /api/bols/{id}/notes`). Reuse this pattern for any other field needing autosave.
+- **Bulk-select**: `selectedIds` is a `Set` in `App.jsx` state, with `toggleSelect`/`toggleSelectAll`/`clearSelection` helpers; `BulkActionToolbar.jsx` reads from it.
+- **Module 2 refactor seam**: `App.jsx` has an in-code comment marking the intended split when Module 2 ships — extract fetch helpers to `src/api/bolsApi.js` and move this state/logic to `src/pages/BolReconciliation.jsx`. Don't do this preemptively; it's noted for when a second module actually needs the shared shell.
 
 ## Known bugs
 

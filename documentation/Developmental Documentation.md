@@ -1,4 +1,4 @@
-*updated 2026-07-02*
+*updated 2026-07-06*
 
 Running log of development work on this branch — what changed, why, and anything non-obvious for the next person (human dev or Claude Code) touching this code. Pairs with `CLAUDE.md` (architecture/business rules, kept current) and the GitHub issue backlog (what's queued up next).
 
@@ -8,10 +8,18 @@ Stable technical notes that don't belong to one changelog entry — add here whe
 
 - **Known data-integrity bug (found 2026-07-01, not yet fixed):** 10 pairs of duplicate `bol_records` rows exist in production for the same `technique_trip` (e.g. two rows for `TEC_T_0110814` with the identical `created_at` timestamp down to the microsecond). Root cause suspected in `pull_technique_data()`'s upsert/matching logic — a real trip is getting inserted twice in one pull instead of matched to its existing row. Not caused by anything in this changelog; discovered incidentally while verifying the table-merge below. Tracked as a follow-up, not yet fixed.
 - **Known open bug (2026-07-02):** "Upload Invoice Folder" sender/date auto-detection still fails live ("no sender detected") after three rounds of fixes — per-file folder derivation, the standard React `webkitdirectory`-via-ref fix, and finally replacing `webkitdirectory` entirely with the File System Access API (`showDirectoryPicker()`). Each fix addressed a real, independently-verified bug without resolving the live symptom, and this session's own diagnostic tooling (server log capture, Claude in Chrome, Claude Preview) was independently unreliable throughout, so the true root cause is still unconfirmed. `_parse_invoice_folder_name()` itself is unit-verified correct. Next step: get the exact live folder name string and/or a working way to inspect the browser DOM/network tab directly.
+- **`start.ps1` encoding gotcha (2026-07-06):** Windows PowerShell 5.1 reads `.ps1` files without a UTF-8 BOM using the system codepage, not UTF-8 — a literal em-dash (`—`) in a comment or string gets misdecoded into a stray quote-like byte, corrupting the parser's quote-tracking for the rest of the file (manifests as unrelated-looking parse errors on far-later lines). Keep `.ps1` files ASCII-only.
+- **Inconsistent `python` resolution on this machine (2026-07-06):** bare `python` resolves to different interpreters depending on execution context — an interactive shell (profile loaded) picks one install with packages present; a `-NoProfile` background process (as `start.ps1` spawns) picks a different install (`Python314`) that may be missing packages. Backend deps were installed into both; if `ModuleNotFoundError` recurs after adding a new dependency, install it into both interpreters or pin `start.ps1` to a full path.
 
 ## Changelog
 
 One entry per closed issue. Newest on top.
+
+### 2026-07-06 — Refresh button silently missed manifest weight/pallet/piece changes
+**What:** `POST /api/bols/{id}/refresh-bol` now also re-pulls technique_weight/technique_pallets/technique_pcs from VisualMail (`get_manifest_weights()`) in addition to the existing Prophecy BOL check, recomputing weight_diff/pallet_diff/pcs_diff when an invoice is already matched. Response message now reports both outcomes together.
+**Why:** The button's visibility/condition was already correct (shows for every genuine Technique Type A record with a manifest), but clicking it only ever checked for a new BOL number — it never re-synced weight/pallet/piece counts, so "refresh this record" didn't actually refresh all of the manifest's data.
+**Files:** backend/main.py (`refresh_bol_for_record`), frontend/src/components/BOLRow.jsx (tooltip)
+**Gotcha:** Deliberately does not touch access_prog/cost_pct/amount/alg_* — those are invoice-driven (recomputed by `_process_invoice_csv` at invoice-upload time), not manifest-driven, so this refresh stays scoped to manifest-side fields only.
 
 ### 2026-07-02 — #29 Invoice file link broken + folder-based invoice ingestion
 **What:** `GET /api/invoices/{z}/file` now searches INVOICE_FOLDER's root plus one level of dated sender subfolders (e.g. "Tania 6-25-2026  4-16PM/") and prefers a matching PDF over the CSV (ALG's real PDFs are named like "Z557948- Segerdahl Graphics, Inc_.pdf" — prefix match, not exact). Fixed a NameError in `poll_invoice_folder()` (`candidates` was never defined — leftover from a copy-pasted function) that threw a 500 on every non-empty scan, which is why "Pull Invoices" appeared broken. Added `invoice_email_sender` to the Pending table's filter box. "Upload Invoices" is now a folder picker (`webkitdirectory`) instead of a multi-file picker — the selected folder's name is parsed server-side with the same `_parse_invoice_folder_name()` `poll-folder` already used, so sender/date no longer need manual entry; non-CSV files in the folder (PDFs, `.msg`) are ignored.
