@@ -15,6 +15,12 @@ Stable technical notes that don't belong to one changelog entry — add here whe
 
 One entry per closed issue. Newest on top.
 
+### 2026-07-06 — #45 Unmatched invoices stuck indefinitely due to narrow pull window
+**What:** Added a wide (21-day) Technique fallback in `pull_technique_data()` for invoice_only stubs the fast DB-only rematch can't resolve, plus a per-record `POST /api/bols/{id}/retry-match` route and "🔍 Retry" button for on-demand resolution. Also fixed an early-return bug that skipped stub rematching entirely whenever a day's narrow pull found zero new manifests.
+**Why:** Traced live against real Technique data — every currently-unmatched invoice (some 11+ days old) corresponded to a real, valid trip that the narrow daily pull window had simply never seen, since nothing ever re-checked with a wider window afterward.
+**Files:** backend/main.py (`_trip_to_suffix` de-duplicated, new `_create_technique_record_from_fallback`, `pull_technique_data`, new `retry_match_invoice` route), frontend/src/components/BOLRow.jsx, BOLTable.jsx, App.jsx
+**Gotcha:** The wide fallback only ever creates brand-new records (never touches the main pull's wipe-on-re-pull upsert path), so it can't reintroduce the invoice-data-wiping issue that `days_back=1` was originally chosen to avoid.
+
 ### 2026-07-06 — #44 Weight/pallet/pcs diff calculation broken for Wolf/311 records
 **What:** Added a shared `_compute_diffs()` helper (picks Prophecy vs. Technique baseline based on whether the record has a `technique_trip`) and routed all 5 diff-computation call sites through it, replacing duplicated/inconsistent inline branching. Fixed the root cause in Wolf/311 stub creation: `match_strategy` was hardcoded to `"invoice_only"` instead of `"prophecy_bol"`, and `technique_weight/pallets/pcs` were stored as `0` instead of `None` — both silently broke the old branch-selection logic. Added `POST /api/admin/recompute-diffs` to backfill existing records.
 **Why:** ΔWGT/ΔPAL/ΔPCS were blank for brand-new Wolf/311 invoices and wrong/partial for older ones — traced to root cause against live data (not just code inspection) before fixing, confirming the exact mechanism rather than guessing.
@@ -79,6 +85,5 @@ One entry per closed issue. Newest on top.
 
 
 Bugs still need to be fixed
-- pulling older specified technique manifest data
 - changing auto notes to match properly what they need to say, specifically for the type B records 
 - making things editable

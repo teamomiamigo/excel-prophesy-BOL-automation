@@ -59,6 +59,7 @@ export default function App() {
   const [sidExportedThisSession, setSidExportedThisSession] = useState(false);
   const [exportingSidId, setExportingSidId] = useState(null);
   const [checkingBolId, setCheckingBolId] = useState(null);
+  const [retryingMatchId, setRetryingMatchId] = useState(null);
   const [refreshLoading, setRefreshLoading] = useState(false);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [bulkActionLoading, setBulkActionLoading] = useState(false);
@@ -273,6 +274,21 @@ export default function App() {
       setError(err.message);
     } finally {
       setCheckingBolId(null);
+    }
+  }
+
+  async function handleRetryMatch(recordId) {
+    setRetryingMatchId(recordId);
+    try {
+      const res = await fetch(`/api/bols/${recordId}/retry-match`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Retry match failed (${res.status})`);
+      setSuccessMessage(data.message || (data.matched ? 'Matched.' : 'Still not found.'));
+      if (data.matched) await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRetryingMatchId(null);
     }
   }
 
@@ -1078,6 +1094,7 @@ export default function App() {
               ignoringId={ignoringId}
               exportingSidId={exportingSidId}
               checkingBolId={checkingBolId}
+              retryingMatchId={retryingMatchId}
               filterText={filterText}
               onFilterChange={setFilterText}
               selectedIds={selectedIds}
@@ -1094,6 +1111,7 @@ export default function App() {
               onIgnore={handleIgnore}
               onExportSid={handleExportRecordToProphecy}
               onCheckBol={handleCheckBol}
+              onRetryMatch={handleRetryMatch}
             />
 
             <ThirdPartySection

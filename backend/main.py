@@ -851,6 +851,34 @@ def _compute_diffs(row: "BOLRecord") -> None:
     )
 
 
+def _trip_to_suffix(trip: str) -> str:
+    """e.g. 'TEC_T_0110977' -> '110977'. Shared by invoice matching and stub re-matching."""
+    parts = (trip or "").split("T_")
+    return str(int(parts[-1])) if len(parts) >= 2 else ""
+
+
+def _create_technique_record_from_fallback(db: Session, m: dict, weight_data: dict) -> "BOLRecord":
+    """
+    Create a brand-new BOLRecord for a manifest found only via a wide-window Technique
+    fallback query (see the invoice_only stub fallback in pull_technique_data() and
+    POST /api/bols/{id}/retry-match) — deliberately separate from the main daily pull's
+    per-manifest upsert, which has wipe-on-existing semantics that don't apply here:
+    this only ever fires for a manifest we've never seen before.
+    """
+    row = BOLRecord(status=BOLStatus.PENDING)
+    db.add(row)
+    row.technique_trip = m["technique_trip"]
+    row.manifest = m["manifest"]
+    row.technique_weight  = weight_data.get("technique_weight", 0)
+    row.technique_pallets = weight_data.get("technique_pallets", 0)
+    row.technique_pcs     = weight_data.get("technique_pcs", 0)
+    _apply_bol_status(row, m)
+    proph_pcs = m.get("prophecy_pcs") or 0
+    if proph_pcs:
+        row.prophecy_pcs = proph_pcs
+    return row
+
+
 @app.post("/api/admin/pull", tags=["Admin"])
 def pull_technique_data(db: Session = Depends(get_db)):
     """
@@ -874,8 +902,6 @@ def pull_technique_data(db: Session = Depends(get_db)):
     days_back = 1
 
     manifests = get_technique_data(days_back=days_back)
-    if not manifests:
-        return {"records_loaded": 0, "date": date.today().isoformat(), "message": "No manifests found."}
 
     # Deduplicate by (technique_trip, manifest) — the SQL query can return multiple
     # rows for the same manifest when pooled_to_load_id or other GROUP BY fields differ.
@@ -953,11 +979,12 @@ def pull_technique_data(db: Session = Depends(get_db)):
     db.commit()
     logger.info("[PULL] Loaded %d records (days_back=%d)", loaded, days_back)
 
-    # --- Re-match existing invoice_only stubs against newly loaded manifests ---
-    def _trip_to_suffix_pull(trip: str) -> str:
-        parts = trip.split("T_")
-        return str(int(parts[-1])) if len(parts) >= 2 else ""
+    # NOTE: stub re-matching and the wide fallback below intentionally run even when
+    # `loaded == 0` (no new manifests today) — a day with nothing new despatched is
+    # exactly when a stuck invoice_only stub from days ago most needs a chance to
+    # resolve. Returning early here used to skip both unconditionally.
 
+    # --- Re-match existing invoice_only stubs against newly loaded manifests ---
     stubs = db.query(BOLRecord).filter(BOLRecord.match_strategy == "invoice_only").all()
     rematched = 0
     for stub in stubs:
@@ -976,7 +1003,7 @@ def pull_technique_data(db: Session = Depends(get_db)):
 
         # Strategy 1: trip suffix → job name
         for c in technique_recs:
-            if c.technique_trip and _trip_to_suffix_pull(c.technique_trip) == job_name_s:
+            if c.technique_trip and _trip_to_suffix(c.technique_trip) == job_name_s:
                 match_rec = c
                 match_strat = "job_name"
                 break
@@ -1024,10 +1051,50 @@ def pull_technique_data(db: Session = Depends(get_db)):
         db.commit()
         logger.info("[PULL] Re-matched %d invoice_only stub(s) to newly loaded manifests", rematched)
 
+    # --- Wide fallback: stubs still unmatched may reference a real trip whose despatch
+    # date just falls outside this pull's narrow days_back=1 window. Check a much wider
+    # window once, rather than never re-checking Technique at all for these. ---
+    remaining_stubs = db.query(BOLRecord).filter(
+        BOLRecord.match_strategy == "invoice_only", BOLRecord.bol_number.is_(None)
+    ).all()
+    wide_resolved = 0
+    if remaining_stubs:
+        wide_manifests = get_technique_data(days_back=21)
+        wide_by_suffix = {_trip_to_suffix(m["technique_trip"]): m for m in wide_manifests if m.get("technique_trip")}
+        to_resolve = [
+            (s, wide_by_suffix[s.inv_job_number])
+            for s in remaining_stubs
+            if s.inv_job_number and s.inv_job_number in wide_by_suffix
+        ]
+        if to_resolve:
+            weights_by_manifest = get_manifest_weights([m["manifest"] for _, m in to_resolve])
+            for stub, m in to_resolve:
+                row = _create_technique_record_from_fallback(db, m, weights_by_manifest.get(m["manifest"], {}))
+                row.invoice_number = stub.invoice_number
+                row.inv_job_number = stub.inv_job_number
+                row.amount         = stub.amount
+                row.alg_weight     = stub.alg_weight
+                row.alg_pallets    = stub.alg_pallets
+                row.alg_pcs        = stub.alg_pcs
+                row.match_strategy = "job_name"
+                _compute_diffs(row)
+                db.delete(stub)
+                wide_resolved += 1
+            db.commit()
+            logger.info("[PULL] Wide fallback (21-day) resolved %d previously-stuck stub(s)", wide_resolved)
+
     msg = f"Loaded {loaded} manifest(s)."
     if rematched:
         msg += f" Re-matched {rematched} invoice stub(s)."
-    return {"records_loaded": loaded, "rematched": rematched, "date": date.today().isoformat(), "message": msg}
+    if wide_resolved:
+        msg += f" Resolved {wide_resolved} previously-stuck stub(s) via wide lookback."
+    return {
+        "records_loaded": loaded,
+        "rematched": rematched,
+        "wide_resolved": wide_resolved,
+        "date": date.today().isoformat(),
+        "message": msg,
+    }
 
 
 @app.post("/api/admin/refetch-bols", tags=["Admin"])
@@ -1370,11 +1437,6 @@ def _process_invoice_csv(
             status_code=422,
             detail="Could not parse Invoice No from the CSV. Check file format.",
         )
-
-    def _trip_to_suffix(trip: str) -> str:
-        """TEC_T_0110633 → '110633'"""
-        parts = trip.split("T_")
-        return str(int(parts[-1])) if len(parts) >= 2 else ""
 
     def _is_prophecy_bol(bol_no: str) -> bool:
         """Prophecy BOLs are 6-digit numbers starting with '14' (140000–149999).
@@ -2236,6 +2298,50 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
         messages.append("No changes.")
 
     return {"updated": updated, "bol_number": rec.bol_number, "message": " ".join(messages)}
+
+
+@app.post("/api/bols/{record_id}/retry-match", tags=["Admin"])
+def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
+    """
+    On-demand retry for one stuck invoice_only stub: check a wide (21-day) Technique
+    window immediately instead of waiting for the next "Pull Manifests" click. Reuses
+    _create_technique_record_from_fallback()/_compute_diffs() so this stays in sync
+    with the automatic wide fallback in pull_technique_data().
+    """
+    if settings.USE_MOCK_DATA:
+        raise HTTPException(status_code=400, detail="Retry-match is disabled in mock mode.")
+
+    stub = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if stub is None:
+        raise HTTPException(status_code=404, detail="Record not found.")
+    if stub.match_strategy != "invoice_only" or stub.bol_number:
+        raise HTTPException(status_code=422, detail="This record isn't a pending unmatched invoice.")
+
+    job_name_s = stub.inv_job_number or ""
+    if not job_name_s:
+        return {"matched": False, "message": "No job name on this invoice to match against."}
+
+    from backend.data_layer import get_technique_data, get_manifest_weights
+
+    manifests = get_technique_data(days_back=21)
+    match = next((m for m in manifests if _trip_to_suffix(m.get("technique_trip") or "") == job_name_s), None)
+    if match is None:
+        return {"matched": False, "message": "Still not found in Technique (checked last 21 days)."}
+
+    weight_data = get_manifest_weights([match["manifest"]]).get(match["manifest"], {})
+    row = _create_technique_record_from_fallback(db, match, weight_data)
+    row.invoice_number = stub.invoice_number
+    row.inv_job_number  = stub.inv_job_number
+    row.amount          = stub.amount
+    row.alg_weight      = stub.alg_weight
+    row.alg_pallets     = stub.alg_pallets
+    row.alg_pcs         = stub.alg_pcs
+    row.match_strategy  = "job_name"
+    _compute_diffs(row)
+    db.delete(stub)
+    db.commit()
+    logger.info("[RETRY-MATCH] Resolved stub %s → %s", stub.invoice_number, row.technique_trip)
+    return {"matched": True, "message": f"Matched to {row.technique_trip}."}
 
 
 @app.get("/api/logs", response_model=list[BOLSummary], tags=["Logs"])
