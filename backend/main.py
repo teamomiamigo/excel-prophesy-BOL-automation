@@ -1192,7 +1192,7 @@ def _parse_invoice_folder_name(name: str) -> "tuple[str, datetime] | None":
     return display, dt
 
 
-def _find_invoice_file(folder: str, z: str) -> "tuple[str, str] | None":
+def _find_invoice_file(folder: str, z: str, require_csv: bool = False) -> "tuple[str, str] | None":
     """
     Search `folder`'s root plus one level of subfolders (same layout
     poll_invoice_folder scans) for a file whose name starts with Z-number `z`.
@@ -1200,6 +1200,11 @@ def _find_invoice_file(folder: str, z: str) -> "tuple[str, str] | None":
     PDFs are named like "Z557948- Segerdahl Graphics, Inc_.pdf", a prefix
     match rather than an exact one. Most-recently-modified file wins on
     duplicate matches (e.g. a resend). Returns (path, media_type) or None.
+
+    require_csv=True skips the PDF preference and only returns a .csv match —
+    used by the recompute-access-prog backfill, which needs to re-parse the
+    invoice's line items, not just view/serve the file (GET /api/invoices/{z}/file
+    uses the default PDF-preferred behavior).
     """
     if not os.path.isdir(folder):
         return None
@@ -1232,7 +1237,7 @@ def _find_invoice_file(folder: str, z: str) -> "tuple[str, str] | None":
         if os.path.isdir(entry_path):
             _scan(entry_path)
 
-    if pdf_hits:
+    if not require_csv and pdf_hits:
         return max(pdf_hits, key=os.path.getmtime), "application/pdf"
     if csv_hits:
         return max(csv_hits, key=os.path.getmtime), "text/csv"
@@ -1244,7 +1249,6 @@ def _apply_access_prog_calc(
     match_strategy: "str | None",
     effective_prophecy_bol: "str | None",
     alg_rate_by_zip3: dict,
-    alg_pallet_fallback: list,
     fsc_rate_val: "float | None",
     fsc_cost_val: "float | None",
     _get_tariff_rate,
@@ -1252,11 +1256,13 @@ def _apply_access_prog_calc(
     _fsc_pct,
 ) -> None:
     """
-    Compute access_prog/base_tariff/fsc_pct from SG360's OWN pallet data (independent of
-    ALG's invoice) and set them on matched_rec, along with alg_fsc_pct/alg_fsc_cost and the
-    tariff_zone_approximate/weight_source_fallback flags. Shared by _process_invoice_csv()
-    (called live on every invoice upload) and the one-off recompute script used to bring
-    pre-#21-fix records up to date without needing a fresh invoice upload.
+    Compute access_prog/base_tariff/fsc_pct from SG360's OWN weight/pallet/piece data —
+    never ALG's — applied against ALG's own invoiced per-zone rate, since the tariff/zone
+    rate structure is legitimately ALG's pricing (using it isn't a violation of
+    independence; substituting their weight/pallet counts for ours would be). Sets
+    alg_fsc_pct/alg_fsc_cost and the tariff_zone_approximate/weight_source_fallback flags.
+    Shared by _process_invoice_csv() (every invoice upload) and the
+    POST /api/admin/recompute-access-prog backfill.
 
     See CLAUDE.md's "access_prog calculation" section for the full rationale/priority order.
     """
@@ -1282,45 +1288,36 @@ def _apply_access_prog_calc(
             if len(dest_id) >= 6 and weight > 0:
                 own_pallets.append((dest_id[3:6], weight))
 
+    matched_rec.weight_source_fallback = not bool(own_pallets)
+    if not own_pallets:
+        # No own weight/pallet data available at all (manifest/BOL not found, not yet
+        # synced) — no independent data means no independent estimate. Leave access_prog
+        # blank rather than substituting ALG's own invoiced weight.
+        matched_rec.tariff_zone_approximate = False
+        return
+
     new_tariff_sum = Decimal("0")
     new_base_sum = Decimal("0")
     any_approximate = False
-    if own_pallets:
-        # Real independent estimate: our own weight, per-zone rate resolved in priority
-        # order — our rate card, then this invoice's own rate for that zone (better than
-        # a numeric guess when our card has a gap), then a nearest-zone fallback as a
-        # last resort.
-        for zip3, weight in own_pallets:
-            tariff = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
-            if tariff and tariff.get("is_exact_zone_match"):
-                new_tariff_sum += tariff["access_prog"]
-                new_base_sum += tariff.get("base_tariff") or Decimal("0")
-                continue
-            alg_rate = alg_rate_by_zip3.get(zip3)
-            if alg_rate is not None:
-                base = Decimal(str(round(alg_rate * weight / 100.0, 2)))
-                with_fsc = base * (Decimal("1") + _effective_fsc_pct) if _effective_fsc_pct is not None else base
-                new_base_sum += base
-                new_tariff_sum += with_fsc
-                logger.info("[TARIFF] zip3=%s: no exact rate-card match, used this invoice's own rate %.2f", zip3, alg_rate)
-                continue
-            if tariff:
-                new_tariff_sum += tariff["access_prog"]
-                new_base_sum += tariff.get("base_tariff") or Decimal("0")
+    for zip3, weight in own_pallets:
+        # Rate/zone structure is ALG's own pricing — use their invoiced rate for this
+        # zone first; our internal rate card is only a fallback for a zone this invoice
+        # didn't happen to bill.
+        alg_rate = alg_rate_by_zip3.get(zip3)
+        if alg_rate is not None:
+            base = Decimal(str(round(alg_rate * weight / 100.0, 2)))
+            with_fsc = base * (Decimal("1") + _effective_fsc_pct) if _effective_fsc_pct is not None else base
+            new_base_sum += base
+            new_tariff_sum += with_fsc
+            continue
+        tariff = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
+        if tariff:
+            new_tariff_sum += tariff["access_prog"]
+            new_base_sum += tariff.get("base_tariff") or Decimal("0")
+            if not tariff.get("is_exact_zone_match"):
+                any_approximate = True
+        else:
             any_approximate = True
-        matched_rec.weight_source_fallback = False
-    else:
-        # No own pallet data available (manifest/BOL not found, not yet synced) — fall
-        # back to ALG's own invoiced weight, but flag it so this is visibly distinguishable
-        # from a real independent estimate.
-        for zip3, weight in alg_pallet_fallback:
-            tariff = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
-            if tariff:
-                new_tariff_sum += tariff["access_prog"]
-                new_base_sum += tariff.get("base_tariff") or Decimal("0")
-                if not tariff.get("is_exact_zone_match"):
-                    any_approximate = True
-        matched_rec.weight_source_fallback = True
 
     matched_rec.tariff_zone_approximate = any_approximate
     if new_tariff_sum > 0:
@@ -1331,6 +1328,73 @@ def _apply_access_prog_calc(
         matched_rec.access_prog = new_tariff_sum
         matched_rec.base_tariff = new_base_sum if new_base_sum > 0 else None
         matched_rec.fsc_pct = _effective_fsc_pct
+
+
+def _parse_alg_csv_context(reader: "csv.DictReader") -> dict:
+    """
+    Walk an ALG invoice CSV's rows once, extracting everything invoice-matching and
+    _apply_access_prog_calc() need: invoice number, job name, ALG's own per-zone rate,
+    total weight/pallets/pieces, FSC rate/cost, and total billed amount. Shared by the
+    live upload path (_process_invoice_csv) and the POST /api/admin/recompute-access-prog
+    backfill (re-parsing a historical invoice file located via _find_invoice_file()).
+    """
+    ctx = {
+        "invoice_no": None,
+        "job_name": None,
+        "alg_bol_no": None,
+        "cust_job_no": None,
+        "total_pcs": 0,
+        "total_weight": 0.0,
+        "total_pallets": 0,
+        "fsc_rate_val": None,
+        "fsc_cost_val": None,
+        "total_billed": None,
+        "alg_rate_by_zip3": {},
+    }
+    for row in reader:
+        inv = (row.get("Invoice No") or "").strip()
+        post_office = (row.get("Post Office") or "").strip()
+
+        if "Fuel Surcharge" in post_office:
+            try:
+                ctx["fsc_rate_val"] = float(row.get("Rate") or 0)
+                ctx["fsc_cost_val"] = float(row.get("Billed$") or 0)
+            except (ValueError, TypeError):
+                pass
+            continue
+
+        if "Total Billed Amount" in post_office:
+            # The total is in the last populated column
+            vals = [v.strip() for v in row.values() if (v or "").strip()]
+            try:
+                ctx["total_billed"] = float(vals[-1])
+            except (ValueError, IndexError):
+                pass
+            continue
+
+        if not inv or not inv.startswith("Z"):
+            continue
+
+        ctx["invoice_no"] = inv
+        ctx["job_name"] = (row.get("Job Name") or "").strip()      # matching key
+        ctx["alg_bol_no"] = (row.get("BOL No") or "").strip()      # ALG reference, not used for matching
+        try:
+            ctx["total_pcs"] += int(float(row.get("Pcs") or 0))
+            ctx["total_weight"] += float(row.get("GrossWt") or 0)
+            ctx["total_pallets"] += int(float(row.get("PalletCount") or 0))
+        except (ValueError, TypeError):
+            pass
+        if ctx["cust_job_no"] is None:
+            ctx["cust_job_no"] = (row.get("Cust Job No") or "").strip()
+        raw_zip = (row.get("Zip") or "").strip()
+        try:
+            gross_wt = float(row.get("GrossWt") or 0)
+            rate_val = float(row.get("Rate") or 0)
+            if raw_zip and gross_wt > 0 and rate_val > 0:
+                ctx["alg_rate_by_zip3"].setdefault(raw_zip[:3], rate_val)
+        except (ValueError, TypeError):
+            pass
+    return ctx
 
 
 def _process_invoice_csv(
@@ -1357,21 +1421,21 @@ def _process_invoice_csv(
     text_content = content.decode("utf-8", errors="replace")
 
     reader = csv.DictReader(io.StringIO(text_content))
-    invoice_no: Optional[str] = None
-    job_name: Optional[str] = None   # Technique DespatchID suffix — the real matching key
-    alg_bol_no: Optional[str] = None  # ALG's internal BOL reference (stored for info only)
-    total_pcs = 0
-    total_weight = 0.0
-    total_pallets = 0
-    fsc_rate_val: Optional[float] = None
-    fsc_cost_val: Optional[float] = None
-    total_billed: Optional[float] = None
-    cust_job_no: Optional[str] = None
-    # Buffered from ALG's own CSV line items — used as a rate-card-gap fallback (a zone this
-    # invoice actually billed is better than guessing a "nearest zone") and as a last-resort
-    # weight source when our own pallet data (Technique/Prophecy) isn't available at all.
-    alg_rate_by_zip3: dict[str, float] = {}
-    alg_pallet_fallback: list[tuple[str, float]] = []
+    ctx = _parse_alg_csv_context(reader)
+    invoice_no: Optional[str]       = ctx["invoice_no"]
+    job_name: Optional[str]         = ctx["job_name"]        # Technique DespatchID suffix — the real matching key
+    alg_bol_no: Optional[str]       = ctx["alg_bol_no"]      # ALG's internal BOL reference (stored for info only)
+    total_pcs                       = ctx["total_pcs"]
+    total_weight                    = ctx["total_weight"]
+    total_pallets                   = ctx["total_pallets"]
+    fsc_rate_val: Optional[float]   = ctx["fsc_rate_val"]
+    fsc_cost_val: Optional[float]   = ctx["fsc_cost_val"]
+    total_billed: Optional[float]   = ctx["total_billed"]
+    cust_job_no: Optional[str]      = ctx["cust_job_no"]
+    # ALG's own per-zone rate, used as the primary rate source in _apply_access_prog_calc()
+    # (the tariff/zone structure is legitimately ALG's pricing) — our internal rate card is
+    # only a fallback for a zone this invoice didn't happen to bill.
+    alg_rate_by_zip3: dict[str, float] = ctx["alg_rate_by_zip3"]
 
     if not settings.USE_MOCK_DATA:
         from backend.data_layer import get_tariff_rate as _get_tariff_rate
@@ -1383,54 +1447,6 @@ def _process_invoice_csv(
         _get_tariff_rate = None
         _diesel_price = None
         _fsc_pct = None
-
-    for row in reader:
-        inv = (row.get("Invoice No") or "").strip()
-        post_office = (row.get("Post Office") or "").strip()
-
-        if "Fuel Surcharge" in post_office:
-            try:
-                fsc_rate_val = float(row.get("Rate") or 0)
-                fsc_cost_val = float(row.get("Billed$") or 0)
-            except (ValueError, TypeError):
-                pass
-            continue
-
-        if "Total Billed Amount" in post_office:
-            # The total is in the last populated column
-            vals = [v.strip() for v in row.values() if (v or "").strip()]
-            try:
-                total_billed = float(vals[-1])
-            except (ValueError, IndexError):
-                pass
-            continue
-
-        if not inv or not inv.startswith("Z"):
-            continue
-
-        invoice_no = inv
-        job_name = (row.get("Job Name") or "").strip()      # matching key
-        alg_bol_no = (row.get("BOL No") or "").strip()      # ALG reference, not used for matching
-        try:
-            total_pcs += int(float(row.get("Pcs") or 0))
-            total_weight += float(row.get("GrossWt") or 0)
-            total_pallets += int(float(row.get("PalletCount") or 0))
-        except (ValueError, TypeError):
-            pass
-        if cust_job_no is None:
-            cust_job_no = (row.get("Cust Job No") or "").strip()
-        if _get_tariff_rate is not None:
-            raw_zip = (row.get("Zip") or "").strip()
-            try:
-                gross_wt = float(row.get("GrossWt") or 0)
-                rate_val = float(row.get("Rate") or 0)
-                if raw_zip and gross_wt > 0:
-                    zip3 = raw_zip[:3]
-                    alg_pallet_fallback.append((zip3, gross_wt))
-                    if rate_val > 0:
-                        alg_rate_by_zip3.setdefault(zip3, rate_val)
-            except (ValueError, TypeError):
-                pass
 
     if not invoice_no:
         raise HTTPException(
@@ -1619,7 +1635,10 @@ def _process_invoice_csv(
             )
             db.add(stub)
             db.commit()
-            # For Wolf/311 stubs: try to fill Prophecy quantities immediately.
+            # For Wolf/311 stubs: try to fill Prophecy quantities immediately, and — since
+            # we already have everything _apply_access_prog_calc() needs (a Prophecy BOL
+            # number) — compute Calculated Cost here too, instead of leaving it null until
+            # some future invoice happens to re-touch this record.
             if is_wolf_stub and stub_bol_number:
                 from backend.data_layer import get_prophecy_data as _get_prophecy_data
                 prop = _get_prophecy_data(stub_bol_number)
@@ -1628,7 +1647,15 @@ def _process_invoice_csv(
                     stub.prophecy_pallets = prop["prophecy_pallets"]
                     stub.prophecy_pcs     = prop["prophecy_pcs"]
                     _compute_diffs(stub)
-                    db.commit()
+                if _get_tariff_rate is not None:
+                    _apply_access_prog_calc(
+                        stub, "prophecy_bol", effective_prophecy_bol,
+                        alg_rate_by_zip3, fsc_rate_val, fsc_cost_val,
+                        _get_tariff_rate, _diesel_price, _fsc_pct,
+                    )
+                    if stub.amount and stub.access_prog:
+                        stub.cost_pct = Decimal(str(round(float(stub.amount) / float(stub.access_prog), 6)))
+                db.commit()
         logger.info(
             "[INVOICE] %s → no match, stub created (bol=%s, note=%s)",
             invoice_no, stub_bol_number, auto_note,
@@ -1759,7 +1786,7 @@ def _process_invoice_csv(
         if not already_done:
             _apply_access_prog_calc(
                 matched_rec, match_strategy, effective_prophecy_bol,
-                alg_rate_by_zip3, alg_pallet_fallback, fsc_rate_val, fsc_cost_val,
+                alg_rate_by_zip3, fsc_rate_val, fsc_cost_val,
                 _get_tariff_rate, _diesel_price, _fsc_pct,
             )
         if matched_rec.amount and matched_rec.access_prog:
@@ -2015,6 +2042,73 @@ def recompute_diffs(db: Session = Depends(get_db)):
     db.commit()
     logger.info("[RECOMPUTE-DIFFS] Checked %d record(s) with an invoice matched", checked)
     return {"records_checked": checked}
+
+
+@app.post("/api/admin/recompute-access-prog", tags=["Admin"])
+def recompute_access_prog(db: Session = Depends(get_db)):
+    """
+    Backfill Calculated Cost (access_prog) for existing matched records using the
+    corrected formula: our own weight/pallets/pieces x ALG's own invoiced per-zone rate.
+    ALG's per-zone rate/FSC context isn't stored anywhere — only parsed transiently from
+    each invoice's CSV on upload — so this re-locates each record's original file
+    (_find_invoice_file, require_csv=True) and re-parses it, then re-runs
+    _apply_access_prog_calc() with a fresh live query for our own pallet data. Records
+    whose original file can no longer be found, or for which we have no own pallet data
+    available, are left untouched and reported separately rather than guessed at.
+    """
+    if settings.USE_MOCK_DATA:
+        raise HTTPException(status_code=400, detail="Not available in mock mode.")
+
+    folder = settings.INVOICE_FOLDER
+    if not folder or not os.path.isdir(folder):
+        raise HTTPException(status_code=404, detail="INVOICE_FOLDER is not configured or does not exist.")
+
+    from backend.data_layer import get_tariff_rate as _get_tariff_rate
+    from backend.data_layer import get_current_diesel_price, get_fsc_rate as _get_fsc_rate
+    _diesel_price = get_current_diesel_price()
+    _fsc_pct = _get_fsc_rate(_diesel_price) if _diesel_price is not None else None
+
+    fixed = 0
+    skipped_no_file = 0
+    skipped_no_own_data = 0
+
+    for rec in db.query(BOLRecord).filter(BOLRecord.invoice_number.isnot(None)).all():
+        hit = _find_invoice_file(folder, rec.invoice_number, require_csv=True)
+        if hit is None:
+            skipped_no_file += 1
+            continue
+        path, _media_type = hit
+        try:
+            with open(path, "rb") as f:
+                content = f.read()
+        except OSError:
+            skipped_no_file += 1
+            continue
+
+        reader = csv.DictReader(io.StringIO(content.decode("utf-8", errors="replace")))
+        ctx = _parse_alg_csv_context(reader)
+
+        effective_prophecy_bol = (
+            str(rec.bol_number) if rec.match_strategy == "prophecy_bol" and rec.bol_number else None
+        )
+        _apply_access_prog_calc(
+            rec, rec.match_strategy, effective_prophecy_bol,
+            ctx["alg_rate_by_zip3"], ctx["fsc_rate_val"], ctx["fsc_cost_val"],
+            _get_tariff_rate, _diesel_price, _fsc_pct,
+        )
+        if rec.access_prog is None:
+            skipped_no_own_data += 1
+            continue
+        if rec.amount and rec.access_prog:
+            rec.cost_pct = Decimal(str(round(float(rec.amount) / float(rec.access_prog), 6)))
+        fixed += 1
+
+    db.commit()
+    logger.info(
+        "[RECOMPUTE-ACCESS-PROG] fixed=%d skipped_no_file=%d skipped_no_own_data=%d",
+        fixed, skipped_no_file, skipped_no_own_data,
+    )
+    return {"fixed": fixed, "skipped_no_file": skipped_no_file, "skipped_no_own_data": skipped_no_own_data}
 
 
 @app.post("/api/admin/poll-email", tags=["Admin"])
