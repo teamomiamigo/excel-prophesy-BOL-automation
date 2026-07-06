@@ -824,6 +824,33 @@ def _apply_bol_status(row: "BOLRecord", technique_row: dict) -> None:
         row.needs_sid_export = True
 
 
+def _compute_diffs(row: "BOLRecord") -> None:
+    """
+    weight_diff/pallet_diff/pcs_diff = ALG invoiced qty - our own recorded qty.
+    Uses Prophecy quantities as the baseline for Wolf/311 records (no technique_trip,
+    prophecy_* populated), Technique quantities otherwise — same "is this Prophecy-
+    sourced" check BOLRow.jsx uses on the frontend. Single source of truth: call this
+    anywhere a diff needs (re)computing instead of duplicating the formula.
+    """
+    is_prophecy = not row.technique_trip and (row.prophecy_weight is not None or row.prophecy_pallets is not None)
+    ref_weight  = row.prophecy_weight  if is_prophecy else row.technique_weight
+    ref_pallets = row.prophecy_pallets if is_prophecy else row.technique_pallets
+    ref_pcs     = row.prophecy_pcs     if is_prophecy else row.technique_pcs
+
+    row.weight_diff = (
+        Decimal(str(round(float(row.alg_weight) - float(ref_weight), 2)))
+        if row.alg_weight is not None and ref_weight is not None else None
+    )
+    row.pallet_diff = (
+        row.alg_pallets - ref_pallets
+        if row.alg_pallets is not None and ref_pallets is not None else None
+    )
+    row.pcs_diff = (
+        row.alg_pcs - ref_pcs
+        if row.alg_pcs is not None and ref_pcs is not None else None
+    )
+
+
 @app.post("/api/admin/pull", tags=["Admin"])
 def pull_technique_data(db: Session = Depends(get_db)):
     """
@@ -989,12 +1016,7 @@ def pull_technique_data(db: Session = Depends(get_db)):
         match_rec.alg_pallets     = stub.alg_pallets
         match_rec.alg_pcs         = stub.alg_pcs
         match_rec.match_strategy  = match_strat
-        if match_rec.alg_weight is not None and match_rec.technique_weight:
-            match_rec.weight_diff = Decimal(str(round(float(match_rec.alg_weight) - float(match_rec.technique_weight), 2)))
-        if match_rec.alg_pallets is not None and match_rec.technique_pallets is not None:
-            match_rec.pallet_diff = match_rec.alg_pallets - match_rec.technique_pallets
-        if match_rec.alg_pcs is not None and match_rec.technique_pcs is not None:
-            match_rec.pcs_diff = match_rec.alg_pcs - match_rec.technique_pcs
+        _compute_diffs(match_rec)
         db.delete(stub)
         rematched += 1
 
@@ -1503,7 +1525,7 @@ def _process_invoice_csv(
                 "notes": auto_note,
                 "status": "pending",
                 "flag_reason": None,
-                "match_strategy": "invoice_only",
+                "match_strategy": "prophecy_bol" if is_wolf_stub else "invoice_only",
                 "needs_sid_export": False,
                 "no_invoice": False,
                 "is_third_party": False,
@@ -1514,9 +1536,9 @@ def _process_invoice_csv(
             }
         else:
             stub = BOLRecord(
-                technique_weight      = Decimal("0"),
-                technique_pallets     = 0,
-                technique_pcs         = 0,
+                technique_weight      = None,
+                technique_pallets     = None,
+                technique_pcs         = None,
                 bol_number            = stub_bol_number,
                 inv_job_number        = job_name,
                 invoice_number        = invoice_no,
@@ -1530,7 +1552,7 @@ def _process_invoice_csv(
                 cost_pct              = cost_pct_s,
                 notes                 = auto_note,
                 status                = BOLStatus.PENDING,
-                match_strategy        = "invoice_only",
+                match_strategy        = "prophecy_bol" if is_wolf_stub else "invoice_only",
                 needs_sid_export      = False,
             )
             db.add(stub)
@@ -1543,6 +1565,7 @@ def _process_invoice_csv(
                     stub.prophecy_weight  = prop["prophecy_weight"]
                     stub.prophecy_pallets = prop["prophecy_pallets"]
                     stub.prophecy_pcs     = prop["prophecy_pcs"]
+                    _compute_diffs(stub)
                     db.commit()
         logger.info(
             "[INVOICE] %s → no match, stub created (bol=%s, note=%s)",
@@ -1681,7 +1704,8 @@ def _process_invoice_csv(
             matched_rec.cost_pct = Decimal(
                 str(round(float(matched_rec.amount) / float(matched_rec.access_prog), 6))
             )
-        # Wolf/311: fill Prophecy weight/pallets/pcs from ShipperPlus, then diff against Prophecy.
+        # Wolf/311: refresh Prophecy weight/pallets/pcs from ShipperPlus when this invoice
+        # matched via a Prophecy BOL number this time around.
         if match_strategy == "prophecy_bol" and effective_prophecy_bol:
             from backend.data_layer import get_prophecy_data as _get_prophecy_data
             prop = _get_prophecy_data(int(effective_prophecy_bol))
@@ -1689,24 +1713,7 @@ def _process_invoice_csv(
                 matched_rec.prophecy_weight  = prop["prophecy_weight"]
                 matched_rec.prophecy_pallets = prop["prophecy_pallets"]
                 matched_rec.prophecy_pcs     = prop["prophecy_pcs"]
-                if matched_rec.alg_weight is not None and prop["prophecy_weight"]:
-                    matched_rec.weight_diff = Decimal(str(round(
-                        float(matched_rec.alg_weight) - float(prop["prophecy_weight"]), 2
-                    )))
-                if matched_rec.alg_pallets is not None and prop["prophecy_pallets"] is not None:
-                    matched_rec.pallet_diff = matched_rec.alg_pallets - prop["prophecy_pallets"]
-                if matched_rec.alg_pcs is not None and prop["prophecy_pcs"] is not None:
-                    matched_rec.pcs_diff = matched_rec.alg_pcs - prop["prophecy_pcs"]
-        else:
-            # Corp/Technique: diff against Technique quantities.
-            if matched_rec.alg_weight is not None and matched_rec.technique_weight:
-                matched_rec.weight_diff = Decimal(str(round(
-                    float(matched_rec.alg_weight) - float(matched_rec.technique_weight), 2
-                )))
-            if matched_rec.alg_pallets is not None and matched_rec.technique_pallets is not None:
-                matched_rec.pallet_diff = matched_rec.alg_pallets - matched_rec.technique_pallets
-            if matched_rec.alg_pcs is not None and matched_rec.technique_pcs is not None:
-                matched_rec.pcs_diff = matched_rec.alg_pcs - matched_rec.technique_pcs
+        _compute_diffs(matched_rec)
         db.commit()
         db.refresh(matched_rec)
         matched_trip = matched_rec.technique_trip
@@ -1922,6 +1929,30 @@ def poll_invoice_folder(db: Session = Depends(get_db)):
     if errors:
         msg += f" {errors} error(s)."
     return {"found": len(file_queue), "processed": results, "message": msg}
+
+
+@app.post("/api/admin/recompute-diffs", tags=["Admin"])
+def recompute_diffs(db: Session = Depends(get_db)):
+    """
+    One-time backfill for records whose weight_diff/pallet_diff/pcs_diff were computed
+    incorrectly (or not at all) before the Wolf/311 diff bug fix. Pure DB read/recompute/
+    write — technique_*/prophecy_*/alg_* values are already stored correctly, only the
+    diff math and match_strategy label were wrong, so no live Technique/Prophecy query
+    is needed here.
+    """
+    if settings.USE_MOCK_DATA:
+        raise HTTPException(status_code=400, detail="Not available in mock mode.")
+    checked = 0
+    for row in db.query(BOLRecord).filter(BOLRecord.alg_weight.isnot(None)).all():
+        # Repair the historical mislabel: a record with a BOL, no technique_trip, and
+        # Prophecy quantities is a Wolf/311 load regardless of what match_strategy says.
+        if row.bol_number and not row.technique_trip and row.prophecy_weight is not None:
+            row.match_strategy = "prophecy_bol"
+        _compute_diffs(row)
+        checked += 1
+    db.commit()
+    logger.info("[RECOMPUTE-DIFFS] Checked %d record(s) with an invoice matched", checked)
+    return {"records_checked": checked}
 
 
 @app.post("/api/admin/poll-email", tags=["Admin"])
@@ -2180,12 +2211,7 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
             rec.technique_weight  = new_weight
             rec.technique_pallets = new_pallets
             rec.technique_pcs     = new_pcs
-            if rec.alg_weight is not None and rec.technique_weight:
-                rec.weight_diff = Decimal(str(round(float(rec.alg_weight) - float(rec.technique_weight), 2)))
-            if rec.alg_pallets is not None and rec.technique_pallets is not None:
-                rec.pallet_diff = rec.alg_pallets - rec.technique_pallets
-            if rec.alg_pcs is not None and rec.technique_pcs is not None:
-                rec.pcs_diff = rec.alg_pcs - rec.technique_pcs
+            _compute_diffs(rec)
             updated = True
             messages.append("Weight/pallets/pieces updated.")
 

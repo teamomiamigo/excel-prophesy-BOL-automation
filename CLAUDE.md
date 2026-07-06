@@ -112,6 +112,7 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/admin/refetch-bols` | Re-query Technique for specific manifests; updates `bol_number` after Prophecy import (live mode only) |
 | POST | `/api/admin/poll-email` | Poll O365 IMAP for unread ALG invoice emails → extract CSVs → process (live mode only) |
 | POST | `/api/admin/reset-invoices` | Dev: clear invoice fields on all records + delete invoice-only stubs |
+| POST | `/api/admin/recompute-diffs` | Backfill weight_diff/pallet_diff/pcs_diff on existing records via `_compute_diffs()` (live mode only); pure DB recompute, no live Technique/Prophecy query |
 | POST | `/api/invoices/upload` | Upload ALG invoice CSV(s) — pass a whole sender folder (`invoice_folder_name`, parsed the same way as `poll-folder`) or fall back to manual `invoice_sender`/`invoice_date`/`invoice_time` fields; response includes `conflict` key if trip already had an invoice |
 | GET | `/api/invoices/{z}/file` | Serve the invoice file for a Z-number, preferring the PDF ALG sends over the CSV; searches `INVOICE_FOLDER` root + one level of dated sender subfolders (or `test_data/` in mock mode) |
 | POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` (root + one level of dated sender subfolders) for unprocessed CSVs → process each, parsing sender/date from the subfolder name; files stay in place, dedup via DB `invoice_number` |
