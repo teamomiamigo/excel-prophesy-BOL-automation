@@ -112,9 +112,9 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort 
 }
 
 export default function BOLTable({
-  bols, loading, approvingId, unflaggingId, markingThirdPartyId, ignoringId, exportingSidId, checkingBolId,
+  bols, loading, approvingId, unflaggingId, markingThirdPartyId, ignoringId, exportingSidId, checkingBolId, retryingMatchId,
   filterText, onFilterChange, selectedIds, onToggleSelect, onToggleSelectAll, sort, onSort,
-  onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore, onExportSid, onCheckBol,
+  onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore, onExportSid, onCheckBol, onRetryMatch,
 }) {
   const lower = (filterText || '').toLowerCase();
   const matchesBol = b => !filterText || [
@@ -144,6 +144,7 @@ export default function BOLTable({
       isIgnoring:          ignoringId          === bol.id,
       isExportingSid:      exportingSidId      === bol.id,
       isCheckingBol:       checkingBolId       === bol.id,
+      isRetryingMatch:     retryingMatchId     === bol.id,
       isSelected:          selectedIds.has(bol.id),
       onToggleSelect:      () => onToggleSelect(bol.id),
       onApprove:           () => onApprove(bol.id),
@@ -155,6 +156,7 @@ export default function BOLTable({
       onIgnore:            onIgnore,
       onExportSid:         () => onExportSid(bol.id),
       onCheckBol:          () => onCheckBol(bol.id),
+      onRetryMatch:        () => onRetryMatch(bol.id),
     };
   }
 

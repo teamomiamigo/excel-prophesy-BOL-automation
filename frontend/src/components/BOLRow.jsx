@@ -62,7 +62,7 @@ const ICON_BTN = {
 // Actions column: fixed-size empty slot — same footprint as a button, reads as "nothing here"
 const PLACEHOLDER = { width: '100%', height: 26 };
 
-export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isIgnoring, isExportingSid, isCheckingBol, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore, onExportSid, onCheckBol, onToggleSelect }) {
+export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isIgnoring, isExportingSid, isCheckingBol, isRetryingMatch, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore, onExportSid, onCheckBol, onRetryMatch, onToggleSelect }) {
   const [hovered, setHovered] = useState(false);
   const [notesValue, setNotesValue] = useState(bol.notes || '');
   const [saveFlash, setSaveFlash] = useState(false);
@@ -371,6 +371,26 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
                   style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#6b7280', cursor: 'pointer', textDecoration: 'underline', width: '100%' }}
                 >
                   {isIgnoring ? '…' : 'Unignore'}
+                </button>
+              ) : bol.match_strategy === 'invoice_only' && !bol.bol_number ? (
+                <button
+                  onClick={onRetryMatch}
+                  disabled={isRetryingMatch}
+                  title="Check Technique again (21-day window) for a trip matching this invoice's job name"
+                  style={{
+                    background: isRetryingMatch ? '#e5e7eb' : '#f9fafb',
+                    color: '#374151',
+                    border: '1px solid #d1d5db',
+                    borderRadius: 4,
+                    padding: '4px 0',
+                    width: '100%',
+                    fontSize: 11,
+                    fontWeight: 600,
+                    cursor: isRetryingMatch ? 'not-allowed' : 'pointer',
+                    opacity: isRetryingMatch ? 0.7 : 1,
+                  }}
+                >
+                  {isRetryingMatch ? '…' : '🔍 Retry'}
                 </button>
               ) : (
                 <button
