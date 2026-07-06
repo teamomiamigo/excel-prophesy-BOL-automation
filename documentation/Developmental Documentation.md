@@ -15,6 +15,12 @@ Stable technical notes that don't belong to one changelog entry — add here whe
 
 One entry per closed issue. Newest on top.
 
+### 2026-07-06 — #44 Weight/pallet/pcs diff calculation broken for Wolf/311 records
+**What:** Added a shared `_compute_diffs()` helper (picks Prophecy vs. Technique baseline based on whether the record has a `technique_trip`) and routed all 5 diff-computation call sites through it, replacing duplicated/inconsistent inline branching. Fixed the root cause in Wolf/311 stub creation: `match_strategy` was hardcoded to `"invoice_only"` instead of `"prophecy_bol"`, and `technique_weight/pallets/pcs` were stored as `0` instead of `None` — both silently broke the old branch-selection logic. Added `POST /api/admin/recompute-diffs` to backfill existing records.
+**Why:** ΔWGT/ΔPAL/ΔPCS were blank for brand-new Wolf/311 invoices and wrong/partial for older ones — traced to root cause against live data (not just code inspection) before fixing, confirming the exact mechanism rather than guessing.
+**Files:** backend/main.py (`_compute_diffs` new helper, `_process_invoice_csv`, `pull_technique_data`, `refresh_bol_for_record`, new `recompute_diffs` route)
+**Gotcha:** The backfill only fixes the diff values and the `match_strategy` label — it doesn't touch the stale `technique_weight=0` on historical Wolf/311 records (cosmetic only; `_compute_diffs` ignores it correctly since it checks `technique_trip`, not `technique_weight`, to pick the baseline). New stubs going forward correctly get `None`.
+
 ### 2026-07-06 — Refresh button silently missed manifest weight/pallet/piece changes
 **What:** `POST /api/bols/{id}/refresh-bol` now also re-pulls technique_weight/technique_pallets/technique_pcs from VisualMail (`get_manifest_weights()`) in addition to the existing Prophecy BOL check, recomputing weight_diff/pallet_diff/pcs_diff when an invoice is already matched. Response message now reports both outcomes together.
 **Why:** The button's visibility/condition was already correct (shows for every genuine Technique Type A record with a manifest), but clicking it only ever checked for a new BOL number — it never re-synced weight/pallet/piece counts, so "refresh this record" didn't actually refresh all of the manifest's data.
@@ -70,3 +76,9 @@ One entry per closed issue. Newest on top.
 **Files:** path/to/file.py, path/to/File.jsx
 **Gotcha:** anything non-obvious a future dev needs to know (omit if none)
 -->
+
+
+Bugs still need to be fixed
+- pulling older specified technique manifest data
+- changing auto notes to match properly what they need to say, specifically for the type B records 
+- making things editable
