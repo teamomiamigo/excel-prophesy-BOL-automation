@@ -83,12 +83,12 @@ INVOICE_FOLDER=\\sg360-wbapp-prd\Logistics\AgentsInvoices\Invoices to Process
 TECH_PRD1_SERVER=SG360-TECH-PRD1  # direct ShipperPlus host (default); used by get_prophecy_data()
 TECH_PRD1_USER=                 # blank = Windows auth to SG360-TECH-PRD1
 TECH_PRD1_PASSWORD=
+INVOICE_S3_BUCKET=              # S3 bucket for invoice PDFs (Lambda only); empty = use INVOICE_FOLDER
 ```
 
-**Live-mode extra dependencies** (not in `requirements.txt` — install separately when going live):
-```powershell
-pip install pyodbc "sqlalchemy[mssql]"
-```
+**AWS Lambda only:** if `AWS_SECRET_NAME` env var is set, `config.py` loads all settings from AWS Secrets Manager instead of `.env`. This overrides everything above — the Lambda function uses this to pull credentials from a single Secrets Manager secret rather than individual env vars.
+
+All live-mode dependencies (`pyodbc`, `sqlalchemy[mssql]`, `boto3`, `mangum`) are already in `requirements.txt` — `pip install -r backend/requirements.txt` installs everything.
 
 ## API Routes
 
@@ -115,7 +115,7 @@ pip install pyodbc "sqlalchemy[mssql]"
 | POST | `/api/admin/recompute-diffs` | Backfill weight_diff/pallet_diff/pcs_diff on existing records via `_compute_diffs()` (live mode only); pure DB recompute, no live Technique/Prophecy query |
 | POST | `/api/admin/recompute-access-prog` | Backfill Calculated Cost on existing matched records — re-locates and re-parses each record's original invoice CSV (`_find_invoice_file(..., require_csv=True)`) since ALG's per-zone rate isn't stored anywhere else, then re-runs `_apply_access_prog_calc()` with a fresh live pallet-data query (live mode only); records whose original file can't be found are reported as `skipped_no_file`, not guessed at |
 | POST | `/api/invoices/upload` | Upload ALG invoice CSV(s) — pass a whole sender folder (`invoice_folder_name`, parsed the same way as `poll-folder`) or fall back to manual `invoice_sender`/`invoice_date`/`invoice_time` fields; response includes `conflict` key if trip already had an invoice |
-| GET | `/api/invoices/{z}/file` | Serve the invoice file for a Z-number, preferring the PDF ALG sends over the CSV; searches `INVOICE_FOLDER` root + one level of dated sender subfolders (or `test_data/` in mock mode) |
+| GET | `/api/invoices/{z}/file` | Serve the invoice file for a Z-number; checks S3 (`INVOICE_S3_BUCKET`) first with a presigned-URL redirect, then falls back to `INVOICE_FOLDER` (live) or `test_data/` (mock), searching root + one level of dated sender subfolders; prefers PDF over CSV |
 | POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` (root + one level of dated sender subfolders) for unprocessed CSVs → process each, parsing sender/date from the subfolder name; files stay in place, dedup via DB `invoice_number` |
 | GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only); also stamps `sid_exported_at` on each included record |
 | POST | `/api/bols/{id}/export-prophecy-sid` | Per-record SID export — pushes one pending Type A record to Prophecy without waiting for a batch approval; same CSV logic as the bulk route, scoped to one manifest |
@@ -295,9 +295,12 @@ Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — show
 backend/main.py          — All routes in one file (Module 1 only; split by module when Module 2 ships)
 backend/config.py        — Pydantic BaseSettings; loads .env with typed defaults for all keys (DB, SMTP,
                            EIA API, IMAP, USE_MOCK_DATA). Single source of truth for config — no hardcoded
-                           values elsewhere.
+                           values elsewhere. Also patches `socket.getaddrinfo` at import time with static
+                           IP overrides for Lambda VPC DNS (DNS resolver unreachable in current VPC/subnet;
+                           direct TCP to all real hosts works fine). If `AWS_SECRET_NAME` env var is set,
+                           Settings are loaded from AWS Secrets Manager instead of `.env`.
 backend/data_layer.py    — The integration boundary; get_prophecy_data implemented; get_alg_invoice still stub (workaround: manual CSV upload)
-backend/mock_data.py     — 14 records at real scale; safe to delete when DB is live
+backend/mock_data.py     — 16 records at real scale; safe to delete when DB is live
 backend/email_parser.py  — O365 IMAP4_SSL polling (outlook.office365.com:993); marks emails read even
                            with no CSV attachment (prevents re-scan loop on next poll)
 backend/email_service.py — SMTP STARTTLS export; returns False (soft-fail, no exception) when credentials
@@ -324,6 +327,8 @@ documentation/           — Five .md spec files (Design & Workflow, Requirement
                            is the running dev changelog — one entry per closed GitHub issue, appended
                            by the `commit` skill. Read it for recent history that isn't yet folded
                            into this file.
+Dockerfile               — Lambda container image build (see "AWS Lambda deployment" below); not yet deployed
+terraform/bootstrap/     — One-time remote-state backend (S3 + DynamoDB), local state; see "AWS Lambda deployment"
 frontend/src/main.jsx    — Vite entry point; mounts <App /> only, no router
 frontend/src/App.jsx     — Owns all state + fetch/mutation handlers; passes data+callbacks down as props
 frontend/src/components/
@@ -353,7 +358,7 @@ No Context, no reducer, no router, no `useMemo`/`useCallback` anywhere in `front
 
 **`POST /api/invoices/upload`'s folder-based sender auto-detection is not working in live testing as of 2026-07-02**, despite passing all unit-level checks (`_parse_invoice_folder_name` verified correct; the picker itself was rewritten from `webkitdirectory` to the File System Access API). Treat as broken until confirmed fixed — see `documentation/Developmental Documentation.md` Reference section for the full investigation trail.
 
-**`days_back` is now hardcoded to 1** in `pull_technique_data()` in `main.py`. This is intentional for the daily pull workflow — morning pull always grabs today's manifests only.
+**`days_back` is 20** in `pull_technique_data()` — re-pull refreshes technique-side fields (weight/pallets/pcs, BOL status) but preserves invoice matches, approvals, flags, and notes on existing records. Safe to re-run any time.
 
 **Mock state** (`_mock_state` in `main.py`): in-memory dict initialized from `MOCK_BOLS` at startup. Mutations (approvals, flags, invoice uploads) survive the process lifetime but reset on every backend restart. Restart the backend to reset all records to their initial pending state during development.
 
@@ -361,6 +366,17 @@ No Context, no reducer, no router, no `useMemo`/`useCallback` anywhere in `front
 1. Records 11 and 12 start without invoice data — upload the test CSVs to fill them in
 2. SID export (`GET /api/export/prophecy-sid`) generates synthetic pallet rows from approved records
 3. Email export logs to console instead of sending (SMTP not configured)
+
+## AWS Lambda deployment (Stage 1 — in progress, not yet live)
+
+Container-image Lambda deployment is being built out; nothing here is deployed yet.
+
+- `Dockerfile` (repo root): builds `public.ecr.aws/lambda/python:3.13`, installs `backend/requirements.txt`, copies `backend/` (including `test_data/`, needed at runtime for mock mode), entrypoint `backend.main.handler`.
+- `backend/main.py` ends with `handler = Mangum(app)` — wraps the existing FastAPI `app` for Lambda's event format. No route code changes needed for this; it's purely an adapter tacked onto the same app used by uvicorn locally.
+- `backend/requirements.txt` was switched from `>=` floors to pinned `==` versions for reproducible container builds, and gained `mangum==0.21.0`.
+- `terraform/bootstrap/` provisions only the remote-state backend (S3 bucket with versioning + encryption, DynamoDB lock table) using **local** state — deliberately, since it creates the very backend a future `terraform/` (main infra: Lambda, API Gateway, etc.) project would use. That main project doesn't exist yet.
+- `.env.example` is the Stage 1 reference `.env` — everything below its "OUT OF SCOPE for Stage 1" divider is live-mode-only and left blank/default.
+- Target architecture is serverless (Lambda + API Gateway + Aurora + CloudFront); this Dockerfile/bootstrap work is the first slice. Two known blockers for going live-mode in Lambda, not yet resolved: VPN connectivity from Lambda to the on-prem AWP-SQL-PROD/ShipperPlus SQL Servers, and UNC file share access (`INVOICE_FOLDER`) from Lambda.
 
 ## Future modules (do not implement yet)
 

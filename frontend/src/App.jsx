@@ -440,10 +440,11 @@ export default function App() {
     setUploadResults(null);
     const matched = [], unmatched = [], errors = [], conflicts = [];
     for (let i = 0; i < fileEntries.length; i++) {
-      const { file, folderName } = fileEntries[i];
+      const { file, folderName, pdfFile } = fileEntries[i];
       setUploadProgress(`${i + 1} of ${fileEntries.length}`);
       const form = new FormData();
       form.append('file', file);
+      if (pdfFile) form.append('pdf_file', pdfFile);
       if (folderName) form.append('invoice_folder_name', folderName);
       if (uploadSender) form.append('invoice_sender', uploadSender);
       if (uploadDate) form.append('invoice_date', uploadDate);
@@ -483,16 +484,42 @@ export default function App() {
       return;
     }
     const fileEntries = [];
+    // Pair by the leading Z-number, not the whole filename stem: ALG names the
+    // PDFs with a suffix the CSVs don't have ("Z558429 -Segerdahl Graphics,
+    // Inc..pdf" alongside "Z558429.CSV"), so exact-stem matching never pairs them.
+    const zNumberOf = (name) => {
+      const m = name.match(/^\s*(Z\d+)/i);
+      return m ? m[1].toUpperCase() : null;
+    };
     async function walk(dirHandle, folderName) {
+      // Collect CSVs and PDFs from this directory level first — a companion PDF
+      // lives in the same folder as its CSV, so pairing is scoped per-directory
+      // rather than across the whole tree.
+      const csvEntries = [];
+      const pdfByZ = new Map();
+      const subdirs = [];
       for await (const entry of dirHandle.values()) {
         if (entry.kind === 'file') {
-          if (entry.name.toLowerCase().endsWith('.csv')) {
-            const file = await entry.getFile();
-            fileEntries.push({ file, folderName });
+          const lower = entry.name.toLowerCase();
+          if (lower.endsWith('.csv')) {
+            csvEntries.push(entry);
+          } else if (lower.endsWith('.pdf')) {
+            const z = zNumberOf(entry.name);
+            if (z) pdfByZ.set(z, entry);
           }
         } else if (entry.kind === 'directory') {
-          await walk(entry, entry.name);
+          subdirs.push(entry);
         }
+      }
+      for (const csvEntry of csvEntries) {
+        const file = await csvEntry.getFile();
+        const z = zNumberOf(csvEntry.name);
+        const pdfEntry = z ? pdfByZ.get(z) : undefined;
+        const pdfFile = pdfEntry ? await pdfEntry.getFile() : undefined;
+        fileEntries.push({ file, folderName, pdfFile });
+      }
+      for (const subdir of subdirs) {
+        await walk(subdir, subdir.name);
       }
     }
     try {
@@ -531,7 +558,27 @@ export default function App() {
     if (!files.some(f => f.webkitRelativePath)) {
       setError('The browser did not report folder paths for these files — it may have opened a plain file picker instead of a folder picker. Sender/date will not be auto-detected; use the manual "Sender" fields below, or try again.');
     }
-    await uploadInvoiceFiles(files.map(file => ({ file, folderName: parentFolderName(file) })));
+    // Pair each CSV with its companion PDF in the same folder by leading Z-number
+    // (ALG's PDFs carry a name suffix the CSVs don't — "Z558429 -Segerdahl
+    // Graphics, Inc..pdf" — so exact-stem matching never pairs). Scoped per-folder
+    // via parentFolderName so a Z-number collision across sender folders can't
+    // cross-pair.
+    const zNumberOf = (name) => {
+      const m = name.match(/^\s*(Z\d+)/i);
+      return m ? m[1].toUpperCase() : null;
+    };
+    const pdfByKey = new Map();
+    for (const f of allFiles) {
+      if (f.name.toLowerCase().endsWith('.pdf')) {
+        const z = zNumberOf(f.name);
+        if (z) pdfByKey.set(`${parentFolderName(f)}::${z}`, f);
+      }
+    }
+    await uploadInvoiceFiles(files.map(file => {
+      const folderName = parentFolderName(file);
+      const z = zNumberOf(file.name);
+      return { file, folderName, pdfFile: z ? pdfByKey.get(`${folderName}::${z}`) : undefined };
+    }));
   }
 
   async function handleUnflag(recordId) {

@@ -9,11 +9,19 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
+import boto3
+from botocore.config import Config as BotoConfig
 from fastapi import FastAPI, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+
+# Networking problems must degrade to a logged error in ~2s, never a hang that
+# eats Lambda's whole 29s budget and surfaces as an opaque 500 (which is exactly
+# what the S3 PDF route did while this VPC's DNS was broken).
+_S3_FAST_FAIL = BotoConfig(connect_timeout=2, read_timeout=5, retries={"max_attempts": 1})
 
 from backend.config import settings
 from backend.database import get_db, engine
@@ -37,7 +45,19 @@ logging.basicConfig(level=logging.INFO)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not settings.USE_MOCK_DATA:
-        Base.metadata.create_all(bind=engine)
+        try:
+            Base.metadata.create_all(bind=engine)
+        except IntegrityError as exc:
+            # SQLAlchemy's create_all() checks "does this Postgres ENUM type
+            # exist" and creates it in two separate, non-atomic steps. Under
+            # Lambda's concurrent cold starts, two instances can both see
+            # "not yet created" and race to CREATE TYPE — the loser hits this
+            # UniqueViolation even though the schema is now in the desired
+            # state. Safe to swallow only for that specific "already exists"
+            # case; anything else is a real migration failure.
+            if "already exists" not in str(exc.orig):
+                raise
+            logger.info("DB schema already created by a concurrent cold start; continuing.")
         logger.info("DB tables verified/created.")
         with engine.connect() as _conn:
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS base_tariff NUMERIC(10,2)"))
@@ -824,6 +844,62 @@ def _apply_bol_status(row: "BOLRecord", technique_row: dict) -> None:
         row.needs_sid_export = True
 
 
+def _select_canonical_technique_row(rows: list[dict]) -> dict:
+    """
+    Given all Technique rows sharing one (technique_trip, manifest) key — which can
+    be more than one, since _TECHNIQUE_QUERY's GROUP BY includes pooled_to_load_id/
+    load_id/TranType and those can legitimately differ pallet-to-pallet within one
+    real manifest — deterministically pick the canonical row. Mirrors Katie's own
+    manual process on the Technique report: sort by Pool to Load = 0, then Tran Type
+    = Prepaid, then dedupe.
+
+    load_id/pooled_to_load_id on the result are resolved independently via max()
+    across ALL rows in the group, not just taken from the tie-break winner — a
+    manifest that's already pooled into a load (Type B) must never be silently
+    downgraded to Type A just because a sibling duplicate row happens to look
+    "cleaner" (Prepaid + unpooled). 0 always means "no signal from this row"; any
+    positive value is authoritative, so max() can only turn a would-be Type A into a
+    correctly-detected Type B, never the reverse.
+    """
+    if len(rows) == 1:
+        return rows[0]
+
+    def _sort_key(r: dict) -> tuple:
+        tran_rank = 0 if (r.get("tran_type") or "").strip().lower() == "prepaid" else 1
+        pooled_rank = 0 if not (r.get("pooled_to_load_id") or 0) else 1
+        return (tran_rank, pooled_rank)
+
+    ordered = sorted(rows, key=_sort_key)
+    canonical = dict(ordered[0])
+    canonical["load_id"] = max((r.get("load_id") or 0) for r in rows)
+    canonical["pooled_to_load_id"] = max((r.get("pooled_to_load_id") or 0) for r in rows)
+    logger.info(
+        "[TECHNIQUE DEDUP] %s / %s: %d duplicate rows collapsed -> load_id=%s pooled_id=%s",
+        canonical.get("technique_trip"), canonical.get("manifest"), len(rows),
+        canonical["load_id"], canonical["pooled_to_load_id"],
+    )
+    return canonical
+
+
+def _dedupe_technique_rows(rows: list[dict]) -> list[dict]:
+    """
+    Collapse a flat get_technique_data() result down to one row per
+    (technique_trip, manifest), via _select_canonical_technique_row(). Every call
+    site that resolves Technique-row duplicates should go through this — previously
+    each did it differently (first-wins here, last-wins there, arbitrary DB row
+    order), which is how the wrong duplicate ended up winning.
+    """
+    groups: dict[tuple, list[dict]] = {}
+    order: list[tuple] = []
+    for r in rows:
+        key = (r.get("technique_trip"), r.get("manifest"))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+    return [_select_canonical_technique_row(groups[k]) for k in order]
+
+
 def _compute_diffs(row: "BOLRecord") -> None:
     """
     weight_diff/pallet_diff/pcs_diff = ALG invoiced qty - our own recorded qty.
@@ -885,8 +961,11 @@ def pull_technique_data(db: Session = Depends(get_db)):
     Morning data pull: fetch real Technique manifests from AWP-SQL-PROD and
     upsert into bol_records. Invoice fields are left null when MOCK_INVOICES=True.
 
-    Auto-detects days_back: 21 days on first pull (empty DB), 1 day on subsequent
-    pulls (incremental). Old data is persistent — daily pulls add new records only.
+    Pulls the last 20 days of Technique manifests on every call. Existing records
+    (matched on technique_trip + manifest) are refreshed with the latest
+    technique-side data (weight/pallets/pcs, BOL status) but never lose invoice
+    matches, approvals, or flags -- safe to re-run any time. Use
+    POST /api/admin/reset-invoices for a deliberate invoice-data reset.
 
     Call this once each morning (or via the dashboard Pull Manifests button).
     Not available in mock mode.
@@ -899,20 +978,12 @@ def pull_technique_data(db: Session = Depends(get_db)):
 
     from backend.data_layer import get_technique_data, get_manifest_weights
 
-    days_back = 1
+    days_back = 20
 
-    manifests = get_technique_data(days_back=days_back)
-
-    # Deduplicate by (technique_trip, manifest) — the SQL query can return multiple
-    # rows for the same manifest when pooled_to_load_id or other GROUP BY fields differ.
-    seen: set[tuple] = set()
-    deduped: list[dict] = []
-    for m in manifests:
-        key = (m.get("technique_trip"), m.get("manifest"))
-        if key not in seen:
-            seen.add(key)
-            deduped.append(m)
-    manifests = deduped
+    # Dedup: the SQL query can return multiple rows for the same manifest when
+    # pooled_to_load_id/load_id/TranType differ pallet-to-pallet — see
+    # _select_canonical_technique_row() for the tie-break rule.
+    manifests = _dedupe_technique_rows(get_technique_data(days_back=days_back))
 
     manifest_numbers = [m["manifest"] for m in manifests if m.get("manifest")]
     weights_by_manifest = get_manifest_weights(manifest_numbers) if manifest_numbers else {}
@@ -933,23 +1004,11 @@ def pull_technique_data(db: Session = Depends(get_db)):
         )
 
         if existing:
+            # Re-pull only refreshes technique-side fields below (weight/pallets/
+            # pcs, BOL status) -- invoice matches, approvals, and flags are
+            # deliberately left untouched. Safe with a 20-day window where the
+            # same manifest legitimately reappears on every subsequent pull.
             row = existing
-            # Clear all invoice-derived fields — fresh slate for today's CSV upload
-            row.invoice_number = None
-            row.amount         = None
-            row.alg_weight     = None
-            row.alg_pallets    = None
-            row.alg_pcs        = None
-            row.access_prog    = None
-            row.cost_pct       = None
-            row.match_strategy = None
-            row.inv_job_number = None
-            row.weight_diff    = None
-            row.pallet_diff    = None
-            row.pcs_diff       = None
-            if row.status != BOLStatus.APPROVED:
-                row.status      = BOLStatus.PENDING
-                row.flag_reason = None
         else:
             row = BOLRecord()
             db.add(row)
@@ -1059,7 +1118,7 @@ def pull_technique_data(db: Session = Depends(get_db)):
     ).all()
     wide_resolved = 0
     if remaining_stubs:
-        wide_manifests = get_technique_data(days_back=21)
+        wide_manifests = _dedupe_technique_rows(get_technique_data(days_back=21))
         wide_by_suffix = {_trip_to_suffix(m["technique_trip"]): m for m in wide_manifests if m.get("technique_trip")}
         to_resolve = [
             (s, wide_by_suffix[s.inv_job_number])
@@ -1114,7 +1173,7 @@ def refetch_bols_for_manifests(body: dict, db: Session = Depends(get_db)):
 
     from backend.data_layer import get_technique_data as _get_technique_data
     try:
-        all_manifests = _get_technique_data(days_back=30)
+        all_manifests = _dedupe_technique_rows(_get_technique_data(days_back=30))
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Technique query failed: {exc}")
 
@@ -1244,6 +1303,44 @@ def _find_invoice_file(folder: str, z: str, require_csv: bool = False) -> "tuple
     return None
 
 
+# How far apart (numerically) a pallet's zip3 and an invoice's billed zip3 can
+# be and still be treated as the same zone. Confirmed against real data
+# (Z558429): Prophecy destination_ids carry SCF *zone* codes (e.g. "SCF350")
+# while ALG bills the actual postal zip3 the SCF serves ("352") — the pairs
+# are always within a few digits (085↔086, 350↔352, 890↔891) but almost never
+# equal, so an exact join missed 33 of 33 zones on that invoice.
+_ALG_ZONE_TOLERANCE = 5
+
+
+def _lookup_alg_rate(alg_rate_by_zip3: dict, zip3: str) -> "float | None":
+    """Exact zip3 hit first; otherwise the numerically nearest invoice zone
+    within _ALG_ZONE_TOLERANCE. Adjacent-zone rates are close ($/cwt within
+    ~10%), so a near miss is a far better estimate than dropping the zone."""
+    rate = alg_rate_by_zip3.get(zip3)
+    if rate is not None:
+        return rate
+    try:
+        z = int(zip3)
+    except (ValueError, TypeError):
+        return None
+    best_rate, best_dist = None, _ALG_ZONE_TOLERANCE + 1
+    for key, key_rate in alg_rate_by_zip3.items():
+        try:
+            dist = abs(int(key) - z)
+        except (ValueError, TypeError):
+            continue
+        if dist < best_dist:
+            best_rate, best_dist = key_rate, dist
+    return best_rate if best_dist <= _ALG_ZONE_TOLERANCE else None
+
+
+# Below this fraction of our load's weight successfully rated per-zone, the
+# per-zone sum is discarded as unrepresentative (it produced 800%-1300% Cost %
+# numbers when only 1-2 of 60 zones matched) in favor of the invoice's own
+# blended rate, or an honest null when no blended rate is available either.
+_RATE_COVERAGE_THRESHOLD = 0.8
+
+
 def _apply_access_prog_calc(
     matched_rec: "BOLRecord",
     match_strategy: "str | None",
@@ -1254,6 +1351,7 @@ def _apply_access_prog_calc(
     _get_tariff_rate,
     _diesel_price,
     _fsc_pct,
+    alg_blended_rate: "float | None" = None,
 ) -> None:
     """
     Compute access_prog/base_tariff/fsc_pct from SG360's OWN weight/pallet/piece data —
@@ -1263,6 +1361,10 @@ def _apply_access_prog_calc(
     alg_fsc_pct/alg_fsc_cost and the tariff_zone_approximate/weight_source_fallback flags.
     Shared by _process_invoice_csv() (every invoice upload) and the
     POST /api/admin/recompute-access-prog backfill.
+
+    alg_blended_rate — the invoice's own freight-total / total-cwt ($/cwt, FSC excluded),
+    used as a whole-load fallback when per-zone rating covers less than
+    _RATE_COVERAGE_THRESHOLD of our weight.
 
     See CLAUDE.md's "access_prog calculation" section for the full rationale/priority order.
     """
@@ -1276,7 +1378,11 @@ def _apply_access_prog_calc(
         for prow in _get_prophecy_pallet_data(int(effective_prophecy_bol)):
             dest_id = prow.get("destination_id")
             dest_zip = prow.get("destination_zip")
-            zip3 = dest_id[3:6] if dest_id and len(dest_id) >= 6 else (dest_zip[:3] if dest_zip else None)
+            # Prefer the actual postal zip3 (destination_zip) over the SCF zone code
+            # (destination_id "SCF350" → "350"): ALG's invoice bills actual zip3s, so
+            # this is what joins against alg_rate_by_zip3 — the SCF code is the reason
+            # exact joins used to miss on every zone (see _ALG_ZONE_TOLERANCE).
+            zip3 = (dest_zip[:3] if dest_zip else None) or (dest_id[3:6] if dest_id and len(dest_id) >= 6 else None)
             weight = float(prow.get("weight") or 0)
             if zip3 and weight > 0:
                 own_pallets.append((zip3, weight))
@@ -1299,35 +1405,92 @@ def _apply_access_prog_calc(
     new_tariff_sum = Decimal("0")
     new_base_sum = Decimal("0")
     any_approximate = False
+    total_weight = sum(w for _, w in own_pallets)
+    rated_weight = 0.0
     for zip3, weight in own_pallets:
         # Rate/zone structure is ALG's own pricing — use their invoiced rate for this
         # zone first; our internal rate card is only a fallback for a zone this invoice
         # didn't happen to bill.
-        alg_rate = alg_rate_by_zip3.get(zip3)
+        alg_rate = _lookup_alg_rate(alg_rate_by_zip3, zip3)
         if alg_rate is not None:
             base = Decimal(str(round(alg_rate * weight / 100.0, 2)))
             with_fsc = base * (Decimal("1") + _effective_fsc_pct) if _effective_fsc_pct is not None else base
             new_base_sum += base
             new_tariff_sum += with_fsc
+            rated_weight += weight
             continue
         tariff = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
         if tariff:
             new_tariff_sum += tariff["access_prog"]
             new_base_sum += tariff.get("base_tariff") or Decimal("0")
+            rated_weight += weight
             if not tariff.get("is_exact_zone_match"):
                 any_approximate = True
+                logger.warning(
+                    "[ZONE GAP] invoice=%s zip3=%s weight=%.2f — no exact tariff_rates match, "
+                    "fell back to nearest zone (Phil needs a real rate for this zip3)",
+                    getattr(matched_rec, "invoice_number", None), zip3, weight,
+                )
         else:
             any_approximate = True
+            logger.warning(
+                "[ZONE GAP] invoice=%s zip3=%s weight=%.2f — no tariff_rates entry at all, "
+                "no ALG rate either, zone dropped from access_prog entirely (Phil needs a real rate for this zip3)",
+                getattr(matched_rec, "invoice_number", None), zip3, weight,
+            )
 
-    matched_rec.tariff_zone_approximate = any_approximate
-    if new_tariff_sum > 0:
-        # Recomputed fresh from our own manifest/BOL data each time (not accumulated
-        # per-invoice) — our own weight doesn't change across multiple Z-invoices for the
-        # same trip, unlike the old ALG-weight-based calc which needed to add each
-        # invoice's own partial line items.
-        matched_rec.access_prog = new_tariff_sum
-        matched_rec.base_tariff = new_base_sum if new_base_sum > 0 else None
+    coverage = (rated_weight / total_weight) if total_weight > 0 else 0.0
+
+    def _append_note(text: str) -> None:
+        # Live-only path (mock mode never calls this function), and idempotent —
+        # a second invoice upload for the same trip must not duplicate the note.
+        if text not in (matched_rec.notes or ""):
+            matched_rec.notes = f"{matched_rec.notes} {text}".strip() if matched_rec.notes else text
+
+    if coverage >= _RATE_COVERAGE_THRESHOLD:
+        matched_rec.tariff_zone_approximate = any_approximate
+        if new_tariff_sum > 0:
+            # Recomputed fresh from our own manifest/BOL data each time (not accumulated
+            # per-invoice) — our own weight doesn't change across multiple Z-invoices for the
+            # same trip, unlike the old ALG-weight-based calc which needed to add each
+            # invoice's own partial line items.
+            matched_rec.access_prog = new_tariff_sum
+            matched_rec.base_tariff = new_base_sum if new_base_sum > 0 else None
+            matched_rec.fsc_pct = _effective_fsc_pct
+    elif alg_blended_rate is not None and alg_blended_rate > 0:
+        # Not enough per-zone coverage for a representative sum — price our whole
+        # weight at the invoice's own blended $/cwt instead. Still our weight ×
+        # their rate, just without per-zone resolution; Cost % then meaningfully
+        # measures billed-weight variance rather than exploding on missing zones.
+        base = Decimal(str(round(alg_blended_rate * total_weight / 100.0, 2)))
+        with_fsc = base * (Decimal("1") + _effective_fsc_pct) if _effective_fsc_pct is not None else base
+        matched_rec.access_prog = with_fsc
+        matched_rec.base_tariff = base
         matched_rec.fsc_pct = _effective_fsc_pct
+        matched_rec.tariff_zone_approximate = True
+        _append_note(
+            f"Calc Cost uses the invoice's blended rate (${alg_blended_rate:.2f}/cwt) — "
+            f"per-zone rates covered only {coverage:.0%} of our weight."
+        )
+        logger.info(
+            "[RATE] invoice=%s blended-rate fallback used (coverage %.0f%%, blended $%.2f/cwt)",
+            getattr(matched_rec, "invoice_number", None), coverage * 100, alg_blended_rate,
+        )
+    else:
+        # Neither per-zone coverage nor a usable blended rate — an honest null beats
+        # publishing a number built from a sliver of the load.
+        matched_rec.access_prog = None
+        matched_rec.base_tariff = None
+        matched_rec.cost_pct = None
+        matched_rec.tariff_zone_approximate = True
+        _append_note(
+            f"Calc Cost unavailable — rate data covered only {coverage:.0%} of our weight "
+            f"({rated_weight:,.0f} of {total_weight:,.0f} lbs)."
+        )
+        logger.warning(
+            "[RATE] invoice=%s access_prog left null (coverage %.0f%%, no blended rate available)",
+            getattr(matched_rec, "invoice_number", None), coverage * 100,
+        )
 
 
 def _parse_alg_csv_context(reader: "csv.DictReader") -> dict:
@@ -1350,6 +1513,10 @@ def _parse_alg_csv_context(reader: "csv.DictReader") -> dict:
         "fsc_cost_val": None,
         "total_billed": None,
         "alg_rate_by_zip3": {},
+        # Freight-only dollar total (sum of freight-row Billed$, excludes the FSC
+        # footer) — feeds the blended-rate fallback in _apply_access_prog_calc when
+        # per-zone joins can't cover enough of the load.
+        "alg_freight_total": 0.0,
     }
     for row in reader:
         inv = (row.get("Invoice No") or "").strip()
@@ -1394,289 +1561,79 @@ def _parse_alg_csv_context(reader: "csv.DictReader") -> dict:
                 ctx["alg_rate_by_zip3"].setdefault(raw_zip[:3], rate_val)
         except (ValueError, TypeError):
             pass
+        try:
+            ctx["alg_freight_total"] += float(row.get("Billed$") or 0)
+        except (ValueError, TypeError):
+            pass
     return ctx
 
 
-def _process_invoice_csv(
-    content: bytes,
-    filename: str,
+_CLOSE_MATCH_THRESHOLD = 0.15  # combined relative difference across weight/pallets/pcs;
+                                # above this, log a warning and note the record for manual
+                                # verification, but still commit to the closest candidate —
+                                # tune against real invoices once this is live.
+
+
+def _closest_technique_match(candidates: list, total_weight, total_pallets, total_pcs):
+    """
+    Given several BOLRecords/dicts sharing one trip suffix, score each by combined
+    relative difference between its own technique_weight/pallets/pcs and the
+    invoice's billed quantities, and return (best_candidate, best_score). Reuses the
+    same quantity-comparison idea as the pallets+pieces last-resort strategy below,
+    just scoped to disambiguate within one trip instead of matching globally by
+    exact equality only. Missing quantity data on a candidate scores as a full
+    mismatch (1.0) on that axis rather than being skipped, so a record with no
+    technique data never wins over one with real, closely-matching data.
+    """
+    def _get(c, field):
+        return c.get(field) if isinstance(c, dict) else getattr(c, field, None)
+
+    def _rel_diff(actual, expected):
+        if actual is None or not expected:
+            return 1.0
+        return abs(float(actual) - float(expected)) / float(expected)
+
+    def _score(c):
+        return (
+            _rel_diff(_get(c, "technique_weight"), total_weight)
+            + _rel_diff(_get(c, "technique_pallets"), total_pallets)
+            + _rel_diff(_get(c, "technique_pcs"), total_pcs)
+        )
+
+    scored = sorted(((c, _score(c)) for c in candidates), key=lambda pair: pair[1])
+    return scored[0]
+
+
+def _apply_invoice_match(
+    matched_rec,
+    match_strategy: str,
+    effective_prophecy_bol: "Optional[str]",
+    invoice_no: str,
+    job_name: "Optional[str]",
+    total_billed: "Optional[float]",
+    total_weight: "Optional[float]",
+    total_pallets: "Optional[int]",
+    total_pcs: "Optional[int]",
+    alg_rate_by_zip3: dict,
+    fsc_rate_val: "Optional[float]",
+    fsc_cost_val: "Optional[float]",
+    invoice_email_sender: "Optional[str]",
+    invoice_sent_at: "Optional[datetime]",
+    _get_tariff_rate,
+    _diesel_price,
+    _fsc_pct,
     db: Session,
-    invoice_email_sender: "str | None" = None,
-    invoice_sent_at: "datetime | None" = None,
+    alg_blended_rate: "Optional[float]" = None,
 ) -> dict:
     """
-    Parse an ALG invoice CSV and match it to a BOLRecord.
-
-    Matching key: "Job Name" field = Technique DespatchID suffix
-    (e.g. "110633" → TEC_T_0110633). "BOL No" is ALG's internal ref and
-    is NOT used for matching.
-
-    Called by both the manual upload endpoint and the email-poll endpoint so
-    both paths apply identical matching and calculation logic.
-
-    invoice_email_sender / invoice_sent_at: populated from the subfolder name
-    (e.g. 'Tania 6/25/2026 4:16PM' and datetime(2026,6,25,16,16,tzinfo=utc)).
-    Left null when invoked from a flat-file scan or without metadata.
+    Apply one parsed invoice's data to one already-matched record (dict in mock
+    mode, BOLRecord in live mode): conflict detection, invoice-number merge,
+    amount additive across multiple Z-invoices per trip, access_prog recompute,
+    diff computation. Extracted out of _process_invoice_csv() so it can be called
+    once per record when Strategy 2 (Job Name as trip suffix) fans out to several
+    manifests sharing one trip, instead of only ever handling a single match.
+    Returns {"matched_trip", "matched_manifest", "conflict"}.
     """
-    text_content = content.decode("utf-8", errors="replace")
-
-    reader = csv.DictReader(io.StringIO(text_content))
-    ctx = _parse_alg_csv_context(reader)
-    invoice_no: Optional[str]       = ctx["invoice_no"]
-    job_name: Optional[str]         = ctx["job_name"]        # Technique DespatchID suffix — the real matching key
-    alg_bol_no: Optional[str]       = ctx["alg_bol_no"]      # ALG's internal BOL reference (stored for info only)
-    total_pcs                       = ctx["total_pcs"]
-    total_weight                    = ctx["total_weight"]
-    total_pallets                   = ctx["total_pallets"]
-    fsc_rate_val: Optional[float]   = ctx["fsc_rate_val"]
-    fsc_cost_val: Optional[float]   = ctx["fsc_cost_val"]
-    total_billed: Optional[float]   = ctx["total_billed"]
-    cust_job_no: Optional[str]      = ctx["cust_job_no"]
-    # ALG's own per-zone rate, used as the primary rate source in _apply_access_prog_calc()
-    # (the tariff/zone structure is legitimately ALG's pricing) — our internal rate card is
-    # only a fallback for a zone this invoice didn't happen to bill.
-    alg_rate_by_zip3: dict[str, float] = ctx["alg_rate_by_zip3"]
-
-    if not settings.USE_MOCK_DATA:
-        from backend.data_layer import get_tariff_rate as _get_tariff_rate
-        from backend.data_layer import get_current_diesel_price, get_fsc_rate as _get_fsc_rate
-        _diesel_price = get_current_diesel_price()
-        _fsc_pct = _get_fsc_rate(_diesel_price) if _diesel_price is not None else None
-        logger.info("[INVOICE] diesel=$%.3f fsc_pct=%s", _diesel_price or 0, _fsc_pct)
-    else:
-        _get_tariff_rate = None
-        _diesel_price = None
-        _fsc_pct = None
-
-    if not invoice_no:
-        raise HTTPException(
-            status_code=422,
-            detail="Could not parse Invoice No from the CSV. Check file format.",
-        )
-
-    def _is_prophecy_bol(bol_no: str) -> bool:
-        """Prophecy BOLs are 6-digit numbers starting with '14' (140000–149999).
-        The ALG CSV 'BOL No' column contains Post Office permit numbers (e.g. 401212)
-        which also exceed 140000, so we must check the prefix, not just the magnitude.
-        Only the Job Name column carries the actual Prophecy BOL.
-        """
-        try:
-            return str(int(bol_no)).startswith("14") and len(str(int(bol_no))) == 6
-        except (ValueError, TypeError):
-            return False
-
-    matched_rec = None
-    match_strategy: Optional[str] = None
-    effective_prophecy_bol: Optional[str] = None
-
-    # Try exact, reliable matches first — a real match always beats a "Job Name looks like
-    # a Prophecy BOL number" guess, since ordinary trip suffixes can coincidentally fall in
-    # the same 140000-149999 numeric range as real Prophecy BOLs (see _is_prophecy_bol).
-    # Job Name normally carries the trip suffix (e.g. "110810" → TEC_T_0110810); for a
-    # genuine Wolf/311 load with no Technique trip, it instead carries the Prophecy BOL
-    # itself — that's only checked below, after ruling out a real trip match.
-
-    # 1. Already uploaded: match by Z-number.
-    if settings.USE_MOCK_DATA:
-        for rec in _mock_state.values():
-            if rec.get("invoice_number") == invoice_no:
-                matched_rec = rec
-                match_strategy = "invoice_number"
-                break
-    else:
-        matched_rec = (
-            db.query(BOLRecord)
-            .filter(BOLRecord.invoice_number == invoice_no)
-            .first()
-        )
-        if matched_rec is not None:
-            match_strategy = "invoice_number"
-
-    # 2. Job Name as trip suffix.
-    if matched_rec is None and job_name:
-        if settings.USE_MOCK_DATA:
-            for rec in _mock_state.values():
-                trip = rec.get("technique_trip") or ""
-                if trip and _trip_to_suffix(trip) == job_name:
-                    matched_rec = rec
-                    match_strategy = "job_name"
-                    break
-        else:
-            for row_obj in db.query(BOLRecord).filter(
-                BOLRecord.technique_trip.isnot(None)
-            ).all():
-                if _trip_to_suffix(row_obj.technique_trip or "") == job_name:
-                    matched_rec = row_obj
-                    match_strategy = "job_name"
-                    break
-
-    # 3. Job Name as a Prophecy BOL (Wolf/311 — no Technique trip for this load). Only
-    # reached once steps 1-2 have ruled out this being an ordinary trip suffix.
-    if matched_rec is None and job_name and _is_prophecy_bol(job_name):
-        effective_prophecy_bol = job_name
-        bol_num = int(effective_prophecy_bol)
-        if settings.USE_MOCK_DATA:
-            for rec in _mock_state.values():
-                if rec.get("bol_number") == bol_num:
-                    matched_rec = rec
-                    match_strategy = "prophecy_bol"
-                    break
-        else:
-            matched_rec = (
-                db.query(BOLRecord)
-                .filter(BOLRecord.bol_number == bol_num)
-                .first()
-            )
-            if matched_rec is not None:
-                match_strategy = "prophecy_bol"
-
-    # 4. Pallets + pieces (last resort, non-comingle only).
-    if matched_rec is None and not (cust_job_no or "").upper().startswith("CM") \
-            and total_pallets and total_pcs:
-        if settings.USE_MOCK_DATA:
-            candidates = [
-                rec for rec in _mock_state.values()
-                if rec.get("technique_pallets") == total_pallets
-                and rec.get("technique_pcs") == total_pcs
-                and not rec.get("invoice_number")
-                and rec.get("technique_trip") is not None
-            ]
-            if len(candidates) == 1:
-                matched_rec = candidates[0]
-                match_strategy = "pallets_pieces"
-                logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
-                               invoice_no, matched_rec.get("technique_trip"))
-        else:
-            candidates = db.query(BOLRecord).filter(
-                BOLRecord.technique_pallets == total_pallets,
-                BOLRecord.technique_pcs == total_pcs,
-                BOLRecord.invoice_number.is_(None),
-                BOLRecord.technique_trip.isnot(None),
-            ).all()
-            if len(candidates) == 1:
-                matched_rec = candidates[0]
-                match_strategy = "pallets_pieces"
-                logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
-                               invoice_no, matched_rec.technique_trip)
-
-    if matched_rec is None:
-        is_wolf_stub = bool(effective_prophecy_bol)
-        stub_bol_number = int(effective_prophecy_bol) if is_wolf_stub else None
-        if is_wolf_stub:
-            auto_note = f"Wolf/311 load — Prophecy BOL {alg_bol_no}. No matching morning record found."
-        elif (cust_job_no or "").upper().startswith("CM"):
-            auto_note = f"Comingle — no Technique match. Cust Job No: {cust_job_no}"
-        else:
-            auto_note = f"No Technique trip for job name '{job_name}'. Validate manually."
-
-        amount_dec_s = Decimal(str(round(total_billed, 2))) if total_billed is not None else None
-        alg_weight_dec_s = Decimal(str(round(total_weight, 2))) if total_weight else None
-        # access_prog requires Technique weight/ZIP data — not available for unmatched stubs.
-        access_prog_s = None
-        cost_pct_s = None
-        if settings.USE_MOCK_DATA:
-            stub_id = str(uuid.uuid4())
-            _mock_state[stub_id] = {
-                "id": stub_id,
-                "technique_trip": None,
-                "manifest": None,
-                "bol_number": stub_bol_number,
-                "inv_job_number": job_name,
-                "invoice_number": invoice_no,
-                "amount": amount_dec_s,
-                "alg_weight": alg_weight_dec_s,
-                "alg_pallets": total_pallets or None,
-                "alg_pcs": total_pcs or None,
-                "access_prog": access_prog_s,
-                "cost_pct": cost_pct_s,
-                "technique_weight": None,
-                "technique_pallets": None,
-                "technique_pcs": None,
-                "weight_diff": None,
-                "pallet_diff": None,
-                "pcs_diff": None,
-                "prophecy_weight": None,
-                "prophecy_pallets": None,
-                "prophecy_pcs": None,
-                "invoice_email_sender": invoice_email_sender,
-                "invoice_sent_at": invoice_sent_at,
-                "notes": auto_note,
-                "status": "pending",
-                "flag_reason": None,
-                "match_strategy": "prophecy_bol" if is_wolf_stub else "invoice_only",
-                "needs_sid_export": False,
-                "no_invoice": False,
-                "is_third_party": False,
-                "approved_at": None,
-                "approved_by": None,
-                "created_at": datetime.now(timezone.utc),
-                "updated_at": datetime.now(timezone.utc),
-            }
-        else:
-            stub = BOLRecord(
-                technique_weight      = None,
-                technique_pallets     = None,
-                technique_pcs         = None,
-                bol_number            = stub_bol_number,
-                inv_job_number        = job_name,
-                invoice_number        = invoice_no,
-                invoice_email_sender  = invoice_email_sender,
-                invoice_sent_at       = invoice_sent_at,
-                amount                = amount_dec_s,
-                alg_weight            = alg_weight_dec_s,
-                alg_pallets           = total_pallets or None,
-                alg_pcs               = total_pcs or None,
-                access_prog           = access_prog_s,
-                cost_pct              = cost_pct_s,
-                notes                 = auto_note,
-                status                = BOLStatus.PENDING,
-                match_strategy        = "prophecy_bol" if is_wolf_stub else "invoice_only",
-                needs_sid_export      = False,
-            )
-            db.add(stub)
-            db.commit()
-            # For Wolf/311 stubs: try to fill Prophecy quantities immediately, and — since
-            # we already have everything _apply_access_prog_calc() needs (a Prophecy BOL
-            # number) — compute Calculated Cost here too, instead of leaving it null until
-            # some future invoice happens to re-touch this record.
-            if is_wolf_stub and stub_bol_number:
-                from backend.data_layer import get_prophecy_data as _get_prophecy_data
-                prop = _get_prophecy_data(stub_bol_number)
-                if prop:
-                    stub.prophecy_weight  = prop["prophecy_weight"]
-                    stub.prophecy_pallets = prop["prophecy_pallets"]
-                    stub.prophecy_pcs     = prop["prophecy_pcs"]
-                    _compute_diffs(stub)
-                if _get_tariff_rate is not None:
-                    _apply_access_prog_calc(
-                        stub, "prophecy_bol", effective_prophecy_bol,
-                        alg_rate_by_zip3, fsc_rate_val, fsc_cost_val,
-                        _get_tariff_rate, _diesel_price, _fsc_pct,
-                    )
-                    if stub.amount and stub.access_prog:
-                        stub.cost_pct = Decimal(str(round(float(stub.amount) / float(stub.access_prog), 6)))
-                db.commit()
-        logger.info(
-            "[INVOICE] %s → no match, stub created (bol=%s, note=%s)",
-            invoice_no, stub_bol_number, auto_note,
-        )
-        return {
-            "matched": False,
-            "invoice_number": invoice_no,
-            "job_name": job_name,
-            "alg_bol_no": alg_bol_no,
-            "matched_trip": None,
-            "manifest": None,
-            "match_strategy": "invoice_only",
-            "alg_pcs": total_pcs,
-            "alg_weight": round(total_weight, 2),
-            "alg_pallets": total_pallets,
-            "amount": total_billed,
-            "fsc_pct": fsc_rate_val,
-            "fsc_cost": fsc_cost_val,
-            "message": f"Invoice {invoice_no} has no match — stub record created. {auto_note}",
-        }
-
     amount_dec = Decimal(str(round(total_billed, 2))) if total_billed is not None else None
     alg_weight_dec = Decimal(str(round(total_weight, 2))) if total_weight else None
 
@@ -1788,6 +1745,7 @@ def _process_invoice_csv(
                 matched_rec, match_strategy, effective_prophecy_bol,
                 alg_rate_by_zip3, fsc_rate_val, fsc_cost_val,
                 _get_tariff_rate, _diesel_price, _fsc_pct,
+                alg_blended_rate=alg_blended_rate,
             )
         if matched_rec.amount and matched_rec.access_prog:
             matched_rec.cost_pct = Decimal(
@@ -1808,6 +1766,421 @@ def _process_invoice_csv(
         matched_trip = matched_rec.technique_trip
         matched_manifest = matched_rec.manifest
 
+    return {"matched_trip": matched_trip, "matched_manifest": matched_manifest, "conflict": conflict_info}
+
+
+def _process_invoice_csv(
+    content: bytes,
+    filename: str,
+    db: Session,
+    invoice_email_sender: "str | None" = None,
+    invoice_sent_at: "datetime | None" = None,
+) -> dict:
+    """
+    Parse an ALG invoice CSV and match it to a BOLRecord.
+
+    Matching key: "Job Name" field = Technique DespatchID suffix
+    (e.g. "110633" → TEC_T_0110633). "BOL No" is ALG's internal ref and
+    is NOT used for matching.
+
+    Called by both the manual upload endpoint and the email-poll endpoint so
+    both paths apply identical matching and calculation logic.
+
+    invoice_email_sender / invoice_sent_at: populated from the subfolder name
+    (e.g. 'Tania 6/25/2026 4:16PM' and datetime(2026,6,25,16,16,tzinfo=utc)).
+    Left null when invoked from a flat-file scan or without metadata.
+    """
+    text_content = content.decode("utf-8", errors="replace")
+
+    reader = csv.DictReader(io.StringIO(text_content))
+    ctx = _parse_alg_csv_context(reader)
+    invoice_no: Optional[str]       = ctx["invoice_no"]
+    job_name: Optional[str]         = ctx["job_name"]        # Technique DespatchID suffix — the real matching key
+    alg_bol_no: Optional[str]       = ctx["alg_bol_no"]      # ALG's internal BOL reference (stored for info only)
+    total_pcs                       = ctx["total_pcs"]
+    total_weight                    = ctx["total_weight"]
+    total_pallets                   = ctx["total_pallets"]
+    fsc_rate_val: Optional[float]   = ctx["fsc_rate_val"]
+    fsc_cost_val: Optional[float]   = ctx["fsc_cost_val"]
+    total_billed: Optional[float]   = ctx["total_billed"]
+    cust_job_no: Optional[str]      = ctx["cust_job_no"]
+    # ALG's own per-zone rate, used as the primary rate source in _apply_access_prog_calc()
+    # (the tariff/zone structure is legitimately ALG's pricing) — our internal rate card is
+    # only a fallback for a zone this invoice didn't happen to bill.
+    alg_rate_by_zip3: dict[str, float] = ctx["alg_rate_by_zip3"]
+    # Whole-invoice blended $/cwt (freight only, FSC excluded) — the fallback rate when
+    # per-zone joins can't cover enough of our load's weight.
+    alg_blended_rate: Optional[float] = (
+        round(ctx["alg_freight_total"] / (total_weight / 100.0), 4)
+        if ctx.get("alg_freight_total") and total_weight else None
+    )
+
+    if not settings.USE_MOCK_DATA:
+        from backend.data_layer import get_tariff_rate as _get_tariff_rate
+        from backend.data_layer import get_current_diesel_price, get_fsc_rate as _get_fsc_rate
+        if fsc_rate_val is not None:
+            # The invoice carries its own FSC rate (every real ALG CSV does) — that
+            # always wins, so don't burn time on the EIA fallback lookup at all.
+            # This call used to cost ~20s per file while the VPC's DNS was broken.
+            _diesel_price = None
+            _fsc_pct = None
+        else:
+            _diesel_price = get_current_diesel_price()
+            _fsc_pct = _get_fsc_rate(_diesel_price) if _diesel_price is not None else None
+            logger.info("[INVOICE] diesel=$%.3f fsc_pct=%s", _diesel_price or 0, _fsc_pct)
+    else:
+        _get_tariff_rate = None
+        _diesel_price = None
+        _fsc_pct = None
+
+    if not invoice_no:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not parse Invoice No from the CSV. Check file format.",
+        )
+
+    def _is_prophecy_bol(bol_no: str) -> bool:
+        """Prophecy BOLs are 6-digit numbers starting with '14' (140000–149999).
+        The ALG CSV 'BOL No' column contains Post Office permit numbers (e.g. 401212)
+        which also exceed 140000, so we must check the prefix, not just the magnitude.
+        Only the Job Name column carries the actual Prophecy BOL.
+        """
+        try:
+            return str(int(bol_no)).startswith("14") and len(str(int(bol_no))) == 6
+        except (ValueError, TypeError):
+            return False
+
+    matched_rec = None
+    match_strategy: Optional[str] = None
+    effective_prophecy_bol: Optional[str] = None
+
+    # Try exact, reliable matches first — a real match always beats a "Job Name looks like
+    # a Prophecy BOL number" guess, since ordinary trip suffixes can coincidentally fall in
+    # the same 140000-149999 numeric range as real Prophecy BOLs (see _is_prophecy_bol).
+    # Job Name normally carries the trip suffix (e.g. "110810" → TEC_T_0110810); for a
+    # genuine Wolf/311 load with no Technique trip, it instead carries the Prophecy BOL
+    # itself — that's only checked below, after ruling out a real trip match.
+
+    # 1. Already uploaded: match by Z-number.
+    if settings.USE_MOCK_DATA:
+        for rec in _mock_state.values():
+            if rec.get("invoice_number") == invoice_no:
+                matched_rec = rec
+                match_strategy = "invoice_number"
+                break
+    else:
+        matched_rec = (
+            db.query(BOLRecord)
+            .filter(BOLRecord.invoice_number == invoice_no)
+            .first()
+        )
+        if matched_rec is not None:
+            match_strategy = "invoice_number"
+
+    # 2. Job Name as trip suffix. One trip can have several distinct manifests —
+    # collect every BOLRecord sharing this trip suffix, then resolve to the single
+    # closest one by comparing quantities (weight/pallets/pcs) against the invoice's
+    # own billed quantities. The invoice's order number keys to the trip, not any
+    # one manifest, so when a trip has multiple manifests we can't tell which one
+    # it's for from Job Name alone — but the manifest whose own numbers are closest
+    # to what ALG billed is almost certainly the right one.
+    loose_match_note: Optional[str] = None
+    trip_sum_ctx: Optional[dict] = None
+    if matched_rec is None and job_name:
+        if settings.USE_MOCK_DATA:
+            candidates = [
+                rec for rec in _mock_state.values()
+                if (rec.get("technique_trip") or "") and _trip_to_suffix(rec["technique_trip"]) == job_name
+            ]
+        else:
+            candidates = [
+                row_obj for row_obj in db.query(BOLRecord).filter(BOLRecord.technique_trip.isnot(None)).all()
+                if _trip_to_suffix(row_obj.technique_trip or "") == job_name
+            ]
+        if len(candidates) == 1:
+            matched_rec = candidates[0]
+            match_strategy = "job_name"
+        elif len(candidates) > 1:
+            def _cget(c, field):
+                return c.get(field) if isinstance(c, dict) else getattr(c, field, None)
+
+            # Some ALG invoices bill the whole trip, not one manifest (confirmed
+            # live: Z558228 billed 19,076 lbs against manifests of 18,138 + 1,048).
+            # Score the combined totals of every manifest on the trip as one more
+            # candidate alongside each individual manifest — whichever fits the
+            # invoice's quantities best wins.
+            combined = {
+                "technique_weight": sum(float(_cget(c, "technique_weight") or 0) for c in candidates),
+                "technique_pallets": sum(int(_cget(c, "technique_pallets") or 0) for c in candidates),
+                "technique_pcs": sum(int(_cget(c, "technique_pcs") or 0) for c in candidates),
+                "_is_trip_sum": True,
+            }
+            best, score = _closest_technique_match(candidates + [combined], total_weight, total_pallets, total_pcs)
+            match_strategy = "job_name"
+            if isinstance(best, dict) and best.get("_is_trip_sum"):
+                # Trip-level invoice: attach to the primary manifest (prefer one
+                # that already has a BOL, else the heaviest), remember the trip
+                # totals so diffs get computed against them after the match applies.
+                primary = next((c for c in candidates if _cget(c, "bol_number")), None)
+                if primary is None:
+                    primary = max(candidates, key=lambda c: float(_cget(c, "technique_weight") or 0))
+                matched_rec = primary
+                manifest_names = ", ".join(str(_cget(c, "manifest")) for c in candidates)
+                trip_sum_ctx = {
+                    "weight": combined["technique_weight"],
+                    "pallets": combined["technique_pallets"],
+                    "pcs": combined["technique_pcs"],
+                    "siblings": [c for c in candidates if c is not primary],
+                    "manifest_names": manifest_names,
+                }
+                logger.info(
+                    "[INVOICE] %s -> trip-level match on suffix '%s': invoice totals fit the "
+                    "combined %d manifests (%s) better than any single one (score=%.3f)",
+                    invoice_no, job_name, len(candidates), manifest_names, score,
+                )
+            else:
+                matched_rec = best
+            if score > _CLOSE_MATCH_THRESHOLD:
+                loose_match_note = (
+                    f"Matched via closest-quantity heuristic among {len(candidates)} "
+                    f"manifests on this trip (discrepancy score {score:.2f}) — verify manually."
+                )
+                logger.warning(
+                    "[INVOICE] %s -> closest match among %d candidates on trip suffix '%s' "
+                    "still has a large discrepancy (score=%.3f) - verify manually",
+                    invoice_no, len(candidates), job_name, score,
+                )
+            else:
+                logger.info(
+                    "[INVOICE] %s -> matched to closest of %d candidates on trip suffix '%s' (score=%.3f)",
+                    invoice_no, len(candidates), job_name, score,
+                )
+            if loose_match_note:
+                if settings.USE_MOCK_DATA:
+                    existing_notes = matched_rec.get("notes")
+                    matched_rec["notes"] = f"{existing_notes} {loose_match_note}" if existing_notes else loose_match_note
+                else:
+                    matched_rec.notes = f"{matched_rec.notes} {loose_match_note}" if matched_rec.notes else loose_match_note
+
+    # 3. Job Name as a Prophecy BOL (Wolf/311 — no Technique trip for this load). Only
+    # reached once steps 1-2 have ruled out this being an ordinary trip suffix.
+    if matched_rec is None and job_name and _is_prophecy_bol(job_name):
+        effective_prophecy_bol = job_name
+        bol_num = int(effective_prophecy_bol)
+        if settings.USE_MOCK_DATA:
+            for rec in _mock_state.values():
+                if rec.get("bol_number") == bol_num:
+                    matched_rec = rec
+                    match_strategy = "prophecy_bol"
+                    break
+        else:
+            matched_rec = (
+                db.query(BOLRecord)
+                .filter(BOLRecord.bol_number == bol_num)
+                .first()
+            )
+            if matched_rec is not None:
+                match_strategy = "prophecy_bol"
+
+    # 4. Pallets + pieces (last resort, non-comingle only).
+    if matched_rec is None and not (cust_job_no or "").upper().startswith("CM") \
+            and total_pallets and total_pcs:
+        if settings.USE_MOCK_DATA:
+            candidates = [
+                rec for rec in _mock_state.values()
+                if rec.get("technique_pallets") == total_pallets
+                and rec.get("technique_pcs") == total_pcs
+                and not rec.get("invoice_number")
+                and rec.get("technique_trip") is not None
+            ]
+            if len(candidates) == 1:
+                matched_rec = candidates[0]
+                match_strategy = "pallets_pieces"
+                logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
+                               invoice_no, matched_rec.get("technique_trip"))
+        else:
+            candidates = db.query(BOLRecord).filter(
+                BOLRecord.technique_pallets == total_pallets,
+                BOLRecord.technique_pcs == total_pcs,
+                BOLRecord.invoice_number.is_(None),
+                BOLRecord.technique_trip.isnot(None),
+            ).all()
+            if len(candidates) == 1:
+                matched_rec = candidates[0]
+                match_strategy = "pallets_pieces"
+                logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
+                               invoice_no, matched_rec.technique_trip)
+
+    if matched_rec is None:
+        is_wolf_stub = bool(effective_prophecy_bol)
+        stub_bol_number = int(effective_prophecy_bol) if is_wolf_stub else None
+        if is_wolf_stub:
+            auto_note = f"Wolf/311 load — Prophecy BOL {effective_prophecy_bol}. No matching morning record found."
+        elif (cust_job_no or "").upper().startswith("CM"):
+            auto_note = f"Comingle — no Technique match. Cust Job No: {cust_job_no}"
+        else:
+            auto_note = f"No Technique trip for job name '{job_name}'. Validate manually."
+
+        amount_dec_s = Decimal(str(round(total_billed, 2))) if total_billed is not None else None
+        alg_weight_dec_s = Decimal(str(round(total_weight, 2))) if total_weight else None
+        # access_prog requires Technique weight/ZIP data — not available for unmatched stubs.
+        access_prog_s = None
+        cost_pct_s = None
+        if settings.USE_MOCK_DATA:
+            stub_id = str(uuid.uuid4())
+            _mock_state[stub_id] = {
+                "id": stub_id,
+                "technique_trip": None,
+                "manifest": None,
+                "bol_number": stub_bol_number,
+                "inv_job_number": job_name,
+                "invoice_number": invoice_no,
+                "amount": amount_dec_s,
+                "alg_weight": alg_weight_dec_s,
+                "alg_pallets": total_pallets or None,
+                "alg_pcs": total_pcs or None,
+                "access_prog": access_prog_s,
+                "cost_pct": cost_pct_s,
+                "technique_weight": 0,
+                "technique_pallets": 0,
+                "technique_pcs": 0,
+                "weight_diff": None,
+                "pallet_diff": None,
+                "pcs_diff": None,
+                "prophecy_weight": None,
+                "prophecy_pallets": None,
+                "prophecy_pcs": None,
+                "invoice_email_sender": invoice_email_sender,
+                "invoice_sent_at": invoice_sent_at,
+                "notes": auto_note,
+                "status": "pending",
+                "flag_reason": None,
+                "match_strategy": "prophecy_bol" if is_wolf_stub else "invoice_only",
+                "needs_sid_export": False,
+                "no_invoice": False,
+                "is_third_party": False,
+                "approved_at": None,
+                "approved_by": None,
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        else:
+            stub = BOLRecord(
+                technique_weight      = 0,
+                technique_pallets     = 0,
+                technique_pcs         = 0,
+                bol_number            = stub_bol_number,
+                inv_job_number        = job_name,
+                invoice_number        = invoice_no,
+                invoice_email_sender  = invoice_email_sender,
+                invoice_sent_at       = invoice_sent_at,
+                amount                = amount_dec_s,
+                alg_weight            = alg_weight_dec_s,
+                alg_pallets           = total_pallets or None,
+                alg_pcs               = total_pcs or None,
+                access_prog           = access_prog_s,
+                cost_pct              = cost_pct_s,
+                notes                 = auto_note,
+                status                = BOLStatus.PENDING,
+                match_strategy        = "prophecy_bol" if is_wolf_stub else "invoice_only",
+                needs_sid_export      = False,
+            )
+            db.add(stub)
+            db.commit()
+            # For Wolf/311 stubs: try to fill Prophecy quantities immediately, and — since
+            # we already have everything _apply_access_prog_calc() needs (a Prophecy BOL
+            # number) — compute Calculated Cost here too, instead of leaving it null until
+            # some future invoice happens to re-touch this record.
+            if is_wolf_stub and stub_bol_number:
+                from backend.data_layer import get_prophecy_data as _get_prophecy_data
+                prop = _get_prophecy_data(stub_bol_number)
+                if prop:
+                    stub.prophecy_weight  = prop["prophecy_weight"]
+                    stub.prophecy_pallets = prop["prophecy_pallets"]
+                    stub.prophecy_pcs     = prop["prophecy_pcs"]
+                    _compute_diffs(stub)
+                if _get_tariff_rate is not None:
+                    _apply_access_prog_calc(
+                        stub, "prophecy_bol", effective_prophecy_bol,
+                        alg_rate_by_zip3, fsc_rate_val, fsc_cost_val,
+                        _get_tariff_rate, _diesel_price, _fsc_pct,
+                        alg_blended_rate=alg_blended_rate,
+                    )
+                    if stub.amount and stub.access_prog:
+                        stub.cost_pct = Decimal(str(round(float(stub.amount) / float(stub.access_prog), 6)))
+                db.commit()
+        logger.info(
+            "[INVOICE] %s → no match, stub created (bol=%s, note=%s)",
+            invoice_no, stub_bol_number, auto_note,
+        )
+        return {
+            "matched": False,
+            "invoice_number": invoice_no,
+            "job_name": job_name,
+            "alg_bol_no": alg_bol_no,
+            "matched_trip": None,
+            "manifest": None,
+            "match_strategy": "invoice_only",
+            "alg_pcs": total_pcs,
+            "alg_weight": round(total_weight, 2),
+            "alg_pallets": total_pallets,
+            "amount": total_billed,
+            "fsc_pct": fsc_rate_val,
+            "fsc_cost": fsc_cost_val,
+            "message": f"Invoice {invoice_no} has no match — stub record created. {auto_note}",
+        }
+
+    result = _apply_invoice_match(
+        matched_rec, match_strategy, effective_prophecy_bol, invoice_no, job_name,
+        total_billed, total_weight, total_pallets, total_pcs,
+        alg_rate_by_zip3, fsc_rate_val, fsc_cost_val,
+        invoice_email_sender, invoice_sent_at,
+        _get_tariff_rate, _diesel_price, _fsc_pct, db,
+        alg_blended_rate=alg_blended_rate,
+    )
+    matched_trip = result["matched_trip"]
+    matched_manifest = result["matched_manifest"]
+    conflict_info = result["conflict"]
+
+    if trip_sum_ctx is not None:
+        # Trip-level invoice: the quantity diffs _apply_invoice_match computed compare
+        # against the primary manifest alone — recompute them against the trip's
+        # combined totals, which is what this invoice actually bills, and leave an
+        # explanatory note on every record involved.
+        primary_note = (
+            f"Invoice {invoice_no} covers the entire trip "
+            f"({len(trip_sum_ctx['siblings']) + 1} manifests: {trip_sum_ctx['manifest_names']}) — "
+            f"quantity diffs are vs the trip's combined totals."
+        )
+        sibling_note = f"Billed under {invoice_no} — trip-level invoice attached to manifest {matched_manifest}."
+        if settings.USE_MOCK_DATA:
+            if matched_rec.get("alg_weight") is not None and trip_sum_ctx["weight"]:
+                matched_rec["weight_diff"] = round(float(matched_rec["alg_weight"]) - trip_sum_ctx["weight"], 2)
+            if matched_rec.get("alg_pallets") is not None:
+                matched_rec["pallet_diff"] = matched_rec["alg_pallets"] - trip_sum_ctx["pallets"]
+            if matched_rec.get("alg_pcs") is not None:
+                matched_rec["pcs_diff"] = matched_rec["alg_pcs"] - trip_sum_ctx["pcs"]
+            if primary_note not in (matched_rec.get("notes") or ""):
+                existing = matched_rec.get("notes")
+                matched_rec["notes"] = f"{existing} {primary_note}" if existing else primary_note
+            for sib in trip_sum_ctx["siblings"]:
+                if sibling_note not in (sib.get("notes") or ""):
+                    existing = sib.get("notes")
+                    sib["notes"] = f"{existing} {sibling_note}" if existing else sibling_note
+        else:
+            if matched_rec.alg_weight is not None and trip_sum_ctx["weight"]:
+                matched_rec.weight_diff = Decimal(str(round(float(matched_rec.alg_weight) - trip_sum_ctx["weight"], 2)))
+            if matched_rec.alg_pallets is not None:
+                matched_rec.pallet_diff = matched_rec.alg_pallets - trip_sum_ctx["pallets"]
+            if matched_rec.alg_pcs is not None:
+                matched_rec.pcs_diff = matched_rec.alg_pcs - trip_sum_ctx["pcs"]
+            if primary_note not in (matched_rec.notes or ""):
+                matched_rec.notes = f"{matched_rec.notes} {primary_note}" if matched_rec.notes else primary_note
+            for sib in trip_sum_ctx["siblings"]:
+                if sibling_note not in (sib.notes or ""):
+                    sib.notes = f"{sib.notes} {sibling_note}" if sib.notes else sibling_note
+            db.commit()
+
     logger.info(
         "[INVOICE] Uploaded %s → matched trip %s (job_name=%s alg_bol=%s), amount=$%.2f",
         invoice_no, matched_trip, job_name, alg_bol_no, total_billed or 0,
@@ -1827,7 +2200,13 @@ def _process_invoice_csv(
         "fsc_pct": fsc_rate_val,
         "fsc_cost": fsc_cost_val,
         "conflict": conflict_info,
-        "message": f"Invoice {invoice_no} matched to trip {matched_trip} and updated.",
+        "trip_level": trip_sum_ctx is not None,
+        "message": (
+            f"Invoice {invoice_no} matched trip {matched_trip} as a trip-level invoice "
+            f"(covers {len(trip_sum_ctx['siblings']) + 1} manifests)."
+            if trip_sum_ctx is not None
+            else f"Invoice {invoice_no} matched to trip {matched_trip} and updated."
+        ),
     }
 
 
@@ -1835,6 +2214,7 @@ def _process_invoice_csv(
 async def upload_alg_invoice(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    pdf_file: Optional[UploadFile] = File(None),
     invoice_folder_name: Optional[str] = Form(None),
     invoice_sender: Optional[str] = Form(None),
     invoice_date: Optional[str] = Form(None),
@@ -1847,6 +2227,12 @@ async def upload_alg_invoice(
       passed when the user selects a whole folder in the frontend. Parsed with the same
       _parse_invoice_folder_name() used by poll_invoice_folder, so sender metadata matches
       regardless of which path the CSV came in through.
+
+    pdf_file — optional companion PDF (same Z-number stem as the CSV), when the frontend's
+      folder walk finds one alongside it. Stored in S3 (INVOICE_S3_BUCKET) keyed by
+      Z-number so GET /api/invoices/{z}/file can serve it back without needing
+      INVOICE_FOLDER/UNC access — Lambda has no route to the on-prem file share, but
+      S3 it can reach directly.
 
     Optional form fields for manual uploads (fallback when invoice_folder_name is absent
     or doesn't parse):
@@ -1890,6 +2276,20 @@ async def upload_alg_invoice(
                                    invoice_email_sender=sender_str,
                                    invoice_sent_at=sent_at)
     result["invoice_email_sender"] = sender_str
+
+    if pdf_file is not None and settings.INVOICE_S3_BUCKET and result.get("invoice_number"):
+        pdf_bytes = await pdf_file.read()
+        try:
+            boto3.client("s3", config=_S3_FAST_FAIL).put_object(
+                Bucket=settings.INVOICE_S3_BUCKET,
+                Key=f"{result['invoice_number']}.pdf",
+                Body=pdf_bytes,
+                ContentType="application/pdf",
+            )
+            logger.info("[UPLOAD] Stored PDF for %s in s3://%s", result["invoice_number"], settings.INVOICE_S3_BUCKET)
+        except Exception as exc:
+            logger.error("[UPLOAD] Failed to store PDF for %s in S3: %s", result["invoice_number"], exc)
+
     return result
 
 
@@ -1898,10 +2298,32 @@ def get_invoice_file(invoice_number: str):
     """
     Serve the original invoice file for a given Z-number, preferring the
     human-readable PDF ALG sends (falls back to CSV if no PDF exists, e.g.
-    mock/test data). Searches INVOICE_FOLDER (live) or backend/test_data/
-    (mock), including one level of dated sender subfolders
-    (e.g. "Tania 6-25-2026  4-16PM/") created by poll_invoice_folder.
+    mock/test data).
+
+    Checks S3 (INVOICE_S3_BUCKET) first — the PDF a companion upload stored there,
+    which Lambda can actually reach (unlike the on-prem UNC share). Falls back to
+    INVOICE_FOLDER (live) or backend/test_data/ (mock), including one level of dated
+    sender subfolders (e.g. "Tania 6-25-2026  4-16PM/") created by poll_invoice_folder,
+    for CSVs or any invoice uploaded before S3 storage existed.
     """
+    z = invoice_number.strip().upper()
+
+    if not settings.USE_MOCK_DATA and settings.INVOICE_S3_BUCKET:
+        from botocore.exceptions import ClientError
+        s3 = boto3.client("s3", config=_S3_FAST_FAIL)
+        key = f"{z}.pdf"
+        try:
+            s3.head_object(Bucket=settings.INVOICE_S3_BUCKET, Key=key)
+            url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": settings.INVOICE_S3_BUCKET, "Key": key},
+                ExpiresIn=300,
+            )
+            return RedirectResponse(url)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "404":
+                logger.error("[INVOICE FILE] S3 lookup failed for %s: %s", z, exc)
+
     if settings.USE_MOCK_DATA:
         folder = os.path.join(os.path.dirname(__file__), "test_data")
     else:
@@ -1910,7 +2332,6 @@ def get_invoice_file(invoice_number: str):
     if not folder:
         raise HTTPException(status_code=404, detail="No invoice folder configured (set INVOICE_FOLDER in .env)")
 
-    z = invoice_number.strip().upper()
     hit = _find_invoice_file(folder, z)
     if hit is None:
         raise HTTPException(status_code=404, detail=f"File not found for {invoice_number}. Checked: {folder}")
@@ -1946,7 +2367,10 @@ def poll_invoice_folder(db: Session = Depends(get_db)):
     if not folder:
         raise HTTPException(
             status_code=503,
-            detail="INVOICE_FOLDER is not configured. Set INVOICE_FOLDER in .env.",
+            detail=(
+                "Folder-based invoice polling isn't available in this environment "
+                "(no network path to the shared drive) — use Upload Invoice CSV instead."
+            ),
         )
     if not os.path.isdir(folder):
         raise HTTPException(
@@ -2020,6 +2444,78 @@ def poll_invoice_folder(db: Session = Depends(get_db)):
     return {"found": len(file_queue), "processed": results, "message": msg}
 
 
+@app.post("/api/admin/fix-duplicate-invoice-matches", tags=["Admin"])
+def fix_duplicate_invoice_matches(db: Session = Depends(get_db)):
+    """
+    One-time backfill for the old Strategy 2 bug: before _closest_technique_match()
+    existed, an invoice matching several manifests on one trip suffix was applied to
+    EVERY one of them with the same full amount/weight/pallets/pcs, instead of the
+    single closest-matching manifest. The bug's signature is unambiguous — the exact
+    same invoice_number on two or more separate records, which never happens
+    otherwise (a second Z-invoice for the same manifest is comma-joined onto one
+    record's invoice_number, not written to a second record).
+
+    For each such group, re-scores every member against the group's own stored
+    alg_weight/alg_pallets/alg_pcs (identical across the group, since that's exactly
+    what the bug copied everywhere) using the same _closest_technique_match() logic
+    the fixed matching code now uses. The best-scoring member is left untouched; every
+    other member is reverted to a clean unmatched state (as if that invoice had never
+    matched it) so it goes back into the normal pending queue for a real match later.
+    """
+    if settings.USE_MOCK_DATA:
+        raise HTTPException(status_code=400, detail="Not available in mock mode.")
+
+    rows = db.query(BOLRecord).filter(BOLRecord.invoice_number.isnot(None)).all()
+    groups: dict[str, list] = {}
+    for row in rows:
+        for inv in [p.strip() for p in row.invoice_number.split(",")]:
+            groups.setdefault(inv, []).append(row)
+
+    fixed = []
+    for inv, members in groups.items():
+        if len(members) < 2:
+            continue
+        ref = members[0]
+        total_weight = float(ref.alg_weight) if ref.alg_weight is not None else None
+        total_pallets = ref.alg_pallets
+        total_pcs = ref.alg_pcs
+        winner, score = _closest_technique_match(members, total_weight, total_pallets, total_pcs)
+        losers = [m for m in members if m.id != winner.id]
+        reverted = []
+        for loser in losers:
+            reverted.append({"manifest": loser.manifest, "technique_trip": loser.technique_trip})
+            loser.invoice_number = None
+            loser.amount         = None
+            loser.alg_weight     = None
+            loser.alg_pallets    = None
+            loser.alg_pcs        = None
+            loser.access_prog    = None
+            loser.cost_pct       = None
+            loser.match_strategy = None
+            loser.inv_job_number = None
+            loser.weight_diff    = None
+            loser.pallet_diff    = None
+            loser.pcs_diff       = None
+            loser.tariff_zone_approximate = False
+            loser.weight_source_fallback  = False
+            loser.notes = None
+            if loser.status != BOLStatus.APPROVED:
+                loser.status = BOLStatus.PENDING
+                loser.flag_reason = None
+        fixed.append({
+            "invoice_number": inv,
+            "kept": {"manifest": winner.manifest, "technique_trip": winner.technique_trip, "score": round(score, 4)},
+            "reverted": reverted,
+        })
+        logger.info(
+            "[FIX-DUP-INVOICE] %s: kept manifest=%s (score=%.3f), reverted %d other match(es)",
+            inv, winner.manifest, score, len(reverted),
+        )
+
+    db.commit()
+    return {"groups_fixed": len(fixed), "details": fixed}
+
+
 @app.post("/api/admin/recompute-diffs", tags=["Admin"])
 def recompute_diffs(db: Session = Depends(get_db)):
     """
@@ -2091,10 +2587,15 @@ def recompute_access_prog(db: Session = Depends(get_db)):
         effective_prophecy_bol = (
             str(rec.bol_number) if rec.match_strategy == "prophecy_bol" and rec.bol_number else None
         )
+        _blended = (
+            round(ctx["alg_freight_total"] / (ctx["total_weight"] / 100.0), 4)
+            if ctx.get("alg_freight_total") and ctx.get("total_weight") else None
+        )
         _apply_access_prog_calc(
             rec, rec.match_strategy, effective_prophecy_bol,
             ctx["alg_rate_by_zip3"], ctx["fsc_rate_val"], ctx["fsc_cost_val"],
             _get_tariff_rate, _diesel_price, _fsc_pct,
+            alg_blended_rate=_blended,
         )
         if rec.access_prog is None:
             skipped_no_own_data += 1
@@ -2372,7 +2873,7 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
             messages.append("Weight/pallets/pieces updated.")
 
     # (2) Check BOL status from Technique/ShipperPlus (Query A)
-    manifests = get_technique_data(days_back=21)
+    manifests = _dedupe_technique_rows(get_technique_data(days_back=21))
     match = next((m for m in manifests if m.get("manifest") == rec.manifest), None)
     if match is None:
         messages.append("Manifest not found in Technique for BOL check — try again later.")
@@ -2417,7 +2918,7 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
 
     from backend.data_layer import get_technique_data, get_manifest_weights
 
-    manifests = get_technique_data(days_back=21)
+    manifests = _dedupe_technique_rows(get_technique_data(days_back=21))
     match = next((m for m in manifests if _trip_to_suffix(m.get("technique_trip") or "") == job_name_s), None)
     if match is None:
         return {"matched": False, "message": "Still not found in Technique (checked last 21 days)."}
@@ -2587,3 +3088,11 @@ def export_approved_bols(
             f"Email {'sent to Mary and Katie' if email_sent else 'not sent — SMTP not configured, check logs'}."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# AWS Lambda entrypoint (Stage 1 — container image deployment)
+# ---------------------------------------------------------------------------
+from mangum import Mangum  # noqa: E402
+
+handler = Mangum(app)

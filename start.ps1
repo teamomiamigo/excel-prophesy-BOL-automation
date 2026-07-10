@@ -23,7 +23,7 @@ Start-Sleep -Seconds 1
 
 Write-Host "Starting SG360 BOL backend on :8000..." -ForegroundColor Green
 Start-Process -FilePath "python" `
-    -ArgumentList "-m", "uvicorn", "backend.main:app", "--reload", "--port", "8000" `
+    -ArgumentList "-m", "uvicorn", "backend.main:app", "--reload", "--host", "0.0.0.0", "--port", "8000" `
     -WorkingDirectory $root `
     -NoNewWindow
 

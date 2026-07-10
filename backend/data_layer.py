@@ -30,37 +30,46 @@ def _get_tech_prd1_connection():
     import pyodbc
     from backend.config import settings
     conn_str = (
-        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
         f"SERVER={settings.TECH_PRD1_SERVER};"
         f"DATABASE=ShipperPlus_Segerdahl;"
         f"UID={settings.TECH_PRD1_USER};"
         f"PWD={settings.TECH_PRD1_PASSWORD};"
+        f"Encrypt=yes;TrustServerCertificate=yes;"
     )
     return pyodbc.connect(conn_str, timeout=30)
 
 
-def _get_connection(server: str = "AWP-SQL-PROD", database: str = "VisualMail"):
+def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail"):
     """
     Return a pyodbc connection to the given SQL Server instance.
     Uses SQL auth when SQLSERVER_USER/SQLSERVER_PASSWORD are set in .env,
     otherwise falls back to Windows auth (Trusted_Connection=yes).
+
+    Default server is AWP-SQL-PROD's IP, not its hostname: unixODBC's driver
+    manager does its own native DNS resolution (like psycopg2/libpq), which
+    bypasses Python's socket.getaddrinfo -- the same reason Aurora's
+    DATABASE_URL had to switch to an IP. See backend/config.py's
+    _STATIC_DNS_OVERRIDES for the confirmed IP.
     """
     import pyodbc
     from backend.config import settings
     if settings.SQLSERVER_USER and settings.SQLSERVER_PASSWORD:
         conn_str = (
-            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
             f"SERVER={server};"
             f"DATABASE={database};"
             f"UID={settings.SQLSERVER_USER};"
             f"PWD={settings.SQLSERVER_PASSWORD};"
+            f"Encrypt=yes;TrustServerCertificate=yes;"
         )
     else:
         conn_str = (
-            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
             f"SERVER={server};"
             f"DATABASE={database};"
             f"Trusted_Connection=yes;"
+            f"Encrypt=yes;TrustServerCertificate=yes;"
         )
     return pyodbc.connect(conn_str, timeout=30)
 
@@ -446,6 +455,15 @@ def get_prophecy_pallet_data(bol_number: int) -> list[dict]:
 # Tariff / Access rates  (seeded from CSV via backend/seed_rates.py)
 # ---------------------------------------------------------------------------
 
+# Result cache for get_current_diesel_price() — the EIA price is weekly, so an
+# hour-long cache per warm container is far fresher than needed. Crucially this
+# also caches FAILURE: when the network path to api.eia.gov is down (e.g. the
+# broken-DNS episode), the ~20s hang is paid once per container, not once per
+# invoice file.
+_DIESEL_CACHE: dict = {"value": None, "at": 0.0}
+_DIESEL_CACHE_TTL_SECONDS = 3600.0
+
+
 def get_current_diesel_price() -> Optional[float]:
     """
     Fetch the most recent weekly US on-highway diesel retail price from the EIA API.
@@ -453,10 +471,15 @@ def get_current_diesel_price() -> Optional[float]:
 
     Returns the price in $/gal, or None if EIA_API_KEY is not set or the call fails.
     The price is used to look up the FSC band in fuel_surcharge_rates via get_fsc_rate().
+    Cached (including failures) for an hour per process — see _DIESEL_CACHE.
     """
     import json
+    import time
     import urllib.request
     from backend.config import settings
+
+    if _DIESEL_CACHE["at"] and (time.monotonic() - _DIESEL_CACHE["at"]) < _DIESEL_CACHE_TTL_SECONDS:
+        return _DIESEL_CACHE["value"]
 
     if not settings.EIA_API_KEY:
         logger.warning(
@@ -475,19 +498,21 @@ def get_current_diesel_price() -> Optional[float]:
         "&sort[0][direction]=desc"
         "&length=1"
     )
+    price: Optional[float] = None
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
             payload = json.loads(resp.read())
         rows = payload.get("response", {}).get("data", [])
-        if not rows:
+        if rows:
+            price = float(rows[0]["value"])
+            logger.info("[EIA] Diesel $%.3f/gal (period: %s)", price, rows[0].get("period"))
+        else:
             logger.warning("[EIA] No data rows returned from EIA API")
-            return None
-        price = float(rows[0]["value"])
-        logger.info("[EIA] Diesel $%.3f/gal (period: %s)", price, rows[0].get("period"))
-        return price
     except Exception as exc:
         logger.error("[EIA] Failed to fetch diesel price: %s", exc)
-        return None
+    _DIESEL_CACHE["value"] = price
+    _DIESEL_CACHE["at"] = time.monotonic()
+    return price
 
 
 def get_fsc_rate(fuel_price_per_gallon: float) -> Optional[Decimal]:

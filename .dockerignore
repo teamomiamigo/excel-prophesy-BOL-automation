@@ -1,0 +1,28 @@
+# Frontend — not served by this API image at all
+frontend/
+
+# Scratch/local test data — gitignored, not part of the app
+test_invoices_*/
+
+# Docs — not needed at runtime
+documentation/
+CLAUDE.md
+ONBOARDING.md
+README.md
+
+# VCS and local dev noise
+.git/
+.gitignore
+.env
+*.pyc
+*.pyo
+__pycache__/
+backend/__pycache__/
+
+# Terraform — never belongs in the app image
+terraform/
+
+# Misc
+start.ps1
+.dockerignore
+Dockerfile
