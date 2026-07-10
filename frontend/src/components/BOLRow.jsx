@@ -175,13 +175,27 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
       </td>
       <td style={{ ...TD, fontWeight: 600 }}>
         {bol.invoice_number
-          ? <button
-              onClick={() => onReassignOpen && onReassignOpen(bol.id)}
-              title="Click to reassign this invoice to a different trip"
-              style={{ background: 'none', border: 'none', padding: 0, fontWeight: 600, fontSize: 13, cursor: 'pointer', color: '#1e40af', textDecoration: 'underline dotted', textUnderlineOffset: 3 }}
-            >
-              {bol.invoice_number}
-            </button>
+          ? <span style={{ display: 'flex', flexWrap: 'wrap', gap: 4, alignItems: 'center' }}>
+              {(bol.invoice_number || '').split(',').map(z => z.trim()).filter(Boolean).map(z => (
+                <a
+                  key={z}
+                  href={`/api/invoices/${z}/file`}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={`Open invoice PDF for ${z}`}
+                  style={{ fontSize: 12, color: '#1e40af', textDecoration: 'none', background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 4, padding: '2px 7px', fontWeight: 600, whiteSpace: 'nowrap' }}
+                >
+                  {z}
+                </a>
+              ))}
+              <button
+                onClick={() => onReassignOpen && onReassignOpen(bol.id)}
+                title="Reassign invoice to a different trip"
+                style={{ background: 'none', border: 'none', padding: '0 2px', cursor: 'pointer', color: '#9ca3af', fontSize: 13, lineHeight: 1 }}
+              >
+                ↔
+              </button>
+            </span>
           : <span style={{ color: '#d1d5db' }}>—</span>
         }
         {isIgnored && <span style={{ marginLeft: 6, fontSize: 10, background: '#e5e7eb', color: '#6b7280', borderRadius: 3, padding: '1px 5px', fontWeight: 700, letterSpacing: '0.04em' }}>IGNORED</span>}

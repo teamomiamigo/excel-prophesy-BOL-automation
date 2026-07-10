@@ -1303,6 +1303,31 @@ def _find_invoice_file(folder: str, z: str, require_csv: bool = False) -> "tuple
     return None
 
 
+def _fetch_invoice_pdf_bytes(z: str) -> "bytes | None":
+    """Fetch raw PDF bytes for a Z-number: S3 first, then INVOICE_FOLDER fallback.
+    Returns None if the PDF can't be found in either location."""
+    if not settings.USE_MOCK_DATA and settings.INVOICE_S3_BUCKET:
+        try:
+            resp = boto3.client("s3", config=_S3_FAST_FAIL).get_object(
+                Bucket=settings.INVOICE_S3_BUCKET, Key=f"{z}.pdf"
+            )
+            return resp["Body"].read()
+        except Exception:
+            pass
+    folder = (
+        settings.INVOICE_FOLDER
+        if not settings.USE_MOCK_DATA
+        else os.path.join(os.path.dirname(__file__), "test_data")
+    )
+    hit = _find_invoice_file(folder, z)  # prefers PDF over CSV by default
+    if hit:
+        path, _ = hit
+        if path.lower().endswith(".pdf"):
+            with open(path, "rb") as fh:
+                return fh.read()
+    return None
+
+
 # How far apart (numerically) a pallet's zip3 and an invoice's billed zip3 can
 # be and still be treated as the same zone. Confirmed against real data
 # (Z558429): Prophecy destination_ids carry SCF *zone* codes (e.g. "SCF350")
@@ -3038,6 +3063,50 @@ def export_logs(
         content=csv_bytes,
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/export/invoice-pdfs", tags=["Export"])
+def export_invoice_pdfs(invoice_numbers: str):
+    """
+    Merge and download all invoice PDFs for the given comma-separated Z-numbers.
+    Fetches from S3 (if configured) with INVOICE_FOLDER as fallback. Skips any
+    Z-number whose PDF can't be located rather than failing the whole batch.
+    Returns 404 if no PDFs were found at all.
+    """
+    from pypdf import PdfWriter, PdfReader
+    import io as _io
+
+    z_list = [z.strip().upper() for z in invoice_numbers.split(",") if z.strip()]
+    writer = PdfWriter()
+    missing: list[str] = []
+
+    for z in z_list:
+        pdf_bytes = _fetch_invoice_pdf_bytes(z)
+        if pdf_bytes is None:
+            missing.append(z)
+            logger.warning("[INVOICE-PDF] PDF not found for %s", z)
+            continue
+        for page in PdfReader(_io.BytesIO(pdf_bytes)).pages:
+            writer.add_page(page)
+
+    if len(writer.pages) == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No invoice PDFs found for: {', '.join(missing or z_list)}",
+        )
+
+    buf = _io.BytesIO()
+    writer.write(buf)
+    buf.seek(0)
+    date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    if missing:
+        logger.info("[INVOICE-PDF] Merged %d page(s); skipped %d Z-numbers with no PDF: %s",
+                    len(writer.pages), len(missing), ", ".join(missing))
+    return StreamingResponse(
+        buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="SG360_Invoices_{date_str}.pdf"'},
     )
 
 

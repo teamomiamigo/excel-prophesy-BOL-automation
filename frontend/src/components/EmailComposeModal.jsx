@@ -13,8 +13,6 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
   const [markedSent, setMarkedSent] = useState(false);
   const [error, setError] = useState(null);
 
-  const total = records.reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
-
   function buildHtmlTable() {
     const rows = records.map(r => `
       <tr>
@@ -33,12 +31,6 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
         </tr>
       </thead>
       <tbody>${rows}</tbody>
-      <tfoot>
-        <tr style="font-weight:700;background:#f9fafb;">
-          <td colspan="3" style="padding:6px 12px;border:1px solid #d1d5db;text-align:right;">TOTAL</td>
-          <td style="padding:6px 12px;border:1px solid #d1d5db;text-align:right;">${fmtMoney(total)}</td>
-        </tr>
-      </tfoot>
     </table>`;
   }
 
@@ -50,8 +42,15 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
     const rows = records.map(r =>
       `${pad(r.bol_number ?? '—', 10)} | ${pad(r.invoice_number || '—', 10)} | ${pad(r.invoice_email_sender || '—', 32)} | ${padL(fmtMoney(r.amount), 9)}`
     ).join('\n');
-    const totalLine = `${pad('', 10)}   ${pad('', 10)}   ${pad('TOTAL', 32)}   ${padL(fmtMoney(total), 9)}`;
-    return [header, sep, rows, sep, totalLine].join('\n');
+    return [header, sep, rows].join('\n');
+  }
+
+  function handleDownloadInvoicePdfs() {
+    const zNumbers = records
+      .flatMap(r => (r.invoice_number || '').split(',').map(z => z.trim()).filter(Boolean))
+      .filter((z, i, arr) => arr.indexOf(z) === i); // dedupe
+    if (zNumbers.length === 0) return;
+    window.open(`/api/export/invoice-pdfs?invoice_numbers=${zNumbers.join(',')}`, '_blank');
   }
 
   async function handleCopyTable() {
@@ -171,12 +170,6 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
                 </tr>
               ))}
             </tbody>
-            <tfoot>
-              <tr style={{ fontWeight: 700, background: '#f9fafb', borderTop: '2px solid #e5e7eb' }}>
-                <td colSpan={3} style={{ padding: '7px 12px', textAlign: 'right' }}>TOTAL</td>
-                <td style={{ padding: '7px 12px', textAlign: 'right' }}>{fmtMoney(total)}</td>
-              </tr>
-            </tfoot>
           </table>
         </div>
 
@@ -233,6 +226,22 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
                 }}
               >
                 Open in Outlook
+              </button>
+              <button
+                onClick={handleDownloadInvoicePdfs}
+                title="Download all invoice PDFs for this batch merged into one file — attach to your email"
+                style={{
+                  background: '#f9fafb',
+                  color: '#374151',
+                  border: '1px solid #d1d5db',
+                  borderRadius: 5,
+                  padding: '7px 14px',
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                }}
+              >
+                Download Invoice PDFs
               </button>
             </div>
             <button

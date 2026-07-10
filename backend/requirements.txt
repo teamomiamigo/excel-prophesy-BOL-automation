@@ -9,5 +9,6 @@ python-dotenv==1.2.1
 python-multipart==0.0.32
 openpyxl==3.1.5               # required by backend/seed_rates.py to read the FSC Excel
 mangum==0.21.0                 # AWS Lambda ASGI adapter — Stage 1
+pypdf==4.3.1                   # PDF merge for invoice bundle download
 pyodbc==5.2.0                   # SQL Server driver — live mode (AWP-SQL-PROD, SG360-TECH-PRD1)
 boto3==1.35.49                   # AWS Secrets Manager client — live mode credential loading
