@@ -1556,9 +1556,14 @@ def _parse_alg_csv_context(reader: "csv.DictReader") -> dict:
         raw_zip = (row.get("Zip") or "").strip()
         try:
             gross_wt = float(row.get("GrossWt") or 0)
-            rate_val = float(row.get("Rate") or 0)
-            if raw_zip and gross_wt > 0 and rate_val > 0:
-                ctx["alg_rate_by_zip3"].setdefault(raw_zip[:3], rate_val)
+            billed = float(row.get("Billed$") or 0)
+            # Derive per-zone rate from Billed$/GrossWt — the "Rate" column in ALG's
+            # CSVs is blank on every freight row (only the FSC footer has a value),
+            # so we back-compute $/cwt from what they actually charged and their weight.
+            # This is the "invoice rate" the user specified: apply it to OUR weight.
+            if raw_zip and gross_wt > 0 and billed > 0:
+                implicit_rate = round(billed / (gross_wt / 100.0), 4)  # $/cwt
+                ctx["alg_rate_by_zip3"].setdefault(raw_zip[:3], implicit_rate)
         except (ValueError, TypeError):
             pass
         try:
