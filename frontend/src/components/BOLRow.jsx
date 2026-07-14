@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState } from 'react';
 
 // ---------------------------------------------------------------------------
 // Cost % variance logic — primary metric (amount / access_prog)
@@ -64,39 +64,17 @@ const PLACEHOLDER = { width: '100%', height: 26 };
 
 export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isIgnoring, isExportingSid, isCheckingBol, isRetryingMatch, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore, onExportSid, onCheckBol, onRetryMatch, onToggleSelect }) {
   const [hovered, setHovered] = useState(false);
-  const [notesValue, setNotesValue] = useState(bol.notes || '');
-  const [saveFlash, setSaveFlash] = useState(false);
-  const debounceRef = useRef(null);
   const isFlagged = bol.status === 'flagged';
 
-  // Sync external prop changes (e.g. after invoice upload refreshes data)
-  useEffect(() => {
-    setNotesValue(bol.notes || '');
-  }, [bol.notes]);
-
-  const isIgnored = bol.is_ignored;
-  const rowBg = isIgnored
-    ? '#f9fafb'
-    : isFlagged
+  const rowBg = isFlagged
     ? '#fffbeb'
     : hovered
     ? '#f9fafb'
     : '#fff';
 
-  function handleNotesChange(e) {
-    const val = e.target.value;
-    setNotesValue(val);
-    clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(async () => {
-      await onNotesUpdate(val);
-      setSaveFlash(true);
-      setTimeout(() => setSaveFlash(false), 1000);
-    }, 500);
-  }
-
   return (
     <tr
-      style={{ background: rowBg, transition: 'background 0.1s', opacity: isIgnored ? 0.45 : 1 }}
+      style={{ background: rowBg, transition: 'background 0.1s' }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
@@ -198,7 +176,6 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
             </span>
           : <span style={{ color: '#d1d5db' }}>—</span>
         }
-        {isIgnored && <span style={{ marginLeft: 6, fontSize: 10, background: '#e5e7eb', color: '#6b7280', borderRadius: 3, padding: '1px 5px', fontWeight: 700, letterSpacing: '0.04em' }}>IGNORED</span>}
       </td>
       <td style={TD_R}
         title={bol.base_tariff != null && bol.fsc_pct != null
@@ -218,38 +195,11 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
         {formatCostPct(bol.cost_pct)}
       </td>
 
-      {/* Editable notes with auto-save */}
+      {/* Notes — editable field removed pending redesign; column kept for future use */}
       <td style={{ ...TD, minWidth: 140 }}>
-        <div style={{ position: 'relative' }}>
-          <input
-            type="text"
-            value={notesValue}
-            onChange={handleNotesChange}
-            placeholder="Add note…"
-            style={{
-              width: '100%',
-              border: saveFlash ? '1px solid #86efac' : '1px solid transparent',
-              background: saveFlash ? '#f0fdf4' : 'transparent',
-              borderRadius: 3,
-              padding: '2px 5px',
-              fontSize: 12,
-              color: '#4b5563',
-              outline: 'none',
-              transition: 'border-color 0.2s, background 0.2s',
-              boxSizing: 'border-box',
-            }}
-            onFocus={e => { e.target.style.border = '1px solid #d1d5db'; e.target.style.background = '#fff'; }}
-            onBlur={e => {
-              if (!saveFlash) {
-                e.target.style.border = '1px solid transparent';
-                e.target.style.background = 'transparent';
-              }
-            }}
-          />
-          {isFlagged && bol.flag_reason && (
-            <div style={{ color: '#b45309', fontSize: 11, marginTop: 2 }}>⚑ {bol.flag_reason}</div>
-          )}
-        </div>
+        {isFlagged && bol.flag_reason && (
+          <div style={{ color: '#b45309', fontSize: 11 }}>⚑ {bol.flag_reason}</div>
+        )}
       </td>
 
       {/* Actions — routine zone (Approve/Flag/SID/BOL) + exception zone (3P/Ignore), fixed-size slots so every row has identical column width */}
@@ -301,9 +251,9 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
                 ⚑
               </button>
             )}
-            {/* Export to Prophecy / Check BOL — only for pending Type A records
-                (no BOL yet, has a manifest, not third-party/ignored) */}
-            {bol.needs_sid_export && bol.manifest && !bol.is_third_party && !bol.is_ignored ? (
+            {/* Export to Prophecy / Check BOL — only for pending Corp records
+                (no BOL yet, has a manifest, not third-party) */}
+            {bol.needs_sid_export && bol.manifest && !bol.is_third_party ? (
               <button
                 onClick={onExportSid}
                 disabled={isExportingSid}
@@ -326,7 +276,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
             ) : (
               <div style={PLACEHOLDER} />
             )}
-            {bol.needs_sid_export && bol.manifest && !bol.is_third_party && !bol.is_ignored ? (
+            {bol.needs_sid_export && bol.manifest && !bol.is_third_party ? (
               <button
                 onClick={onCheckBol}
                 disabled={isCheckingBol}
@@ -378,15 +328,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
                 {isMarkingThirdParty ? '…' : '3P'}
               </button>
             ) : bol.technique_trip == null && bol.invoice_number ? (
-              isIgnored ? (
-                <button
-                  onClick={() => onIgnore && onIgnore(bol.id, false)}
-                  title="Unignore — restore this record"
-                  style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#6b7280', cursor: 'pointer', textDecoration: 'underline', width: '100%' }}
-                >
-                  {isIgnoring ? '…' : 'Unignore'}
-                </button>
-              ) : bol.match_strategy === 'invoice_only' && !bol.bol_number ? (
+              bol.match_strategy === 'invoice_only' && !bol.bol_number ? (
                 <button
                   onClick={onRetryMatch}
                   disabled={isRetryingMatch}

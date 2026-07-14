@@ -1,4 +1,4 @@
-*updated 2026-07-10*
+*updated 2026-07-14*
 
 Running log of development work on this branch — what changed, why, and anything non-obvious for the next person (human dev or Claude Code) touching this code. Pairs with `CLAUDE.md` (architecture/business rules, kept current) and the GitHub issue backlog (what's queued up next).
 
@@ -14,6 +14,12 @@ Stable technical notes that don't belong to one changelog entry — add here whe
 ## Changelog
 
 One entry per closed issue. Newest on top.
+
+### 2026-07-14 — Dashboard cleanup + Ignored-records section
+**What:** Removed the Cloudflare tunnel skill (no longer used), removed the top toolbar's Refresh/Sender controls and their now-orphaned state, renamed "Type A"/"Type B" labels to "Corp"/"Wolf/311" across the summary card and tooltips, and removed the freeform Notes input from the pending table (column kept, empty, for a future redesign; flag-reason callout preserved). Added a new "Ignored" section (mirrors ThirdPartySection.jsx) that pending invoice-only stubs move into when ignored, plus a one-click "Ignore All" bulk shortcut for every remaining eligible stub. Fixed ReassignInvoiceModal.jsx's "Ignore this invoice" link, which was calling the ignore handler with a missing argument and silently un-ignoring instead.
+**Why:** User-requested UI cleanup ahead of further testing, plus a workflow ask to give ignored records a dedicated place instead of dimming them in-place, and a faster way to clear a backlog of unmatched invoice stubs.
+**Files:** frontend/src/App.jsx, frontend/src/components/BOLRow.jsx, BulkActionToolbar.jsx, ReassignInvoiceModal.jsx, SummaryBar.jsx, IgnoredSection.jsx (new); .claude/skills/cloudflare/ (deleted)
+**Gotcha:** `is_ignored` records are now filtered out of `visiblePendingBols` entirely — code that assumed ignored rows still flow through BOLRow (e.g. the old dimming/badge logic) no longer applies; check IgnoredSection.jsx instead.
 
 ### 2026-07-10 — Direct PDF links + Email modal cleanup + merged invoice PDF download
 **What:** Three UX improvements to the invoice/email flow. (1) Invoice number cell in BOLRow now renders each Z-number as a direct `<a>` link to `/api/invoices/{z}/file` (opens PDF in new tab); a small `↔` button beside it still opens the Reassign modal. Previously the entire cell was a button that only opened the Reassign modal. (2) Removed the TOTAL row from `EmailComposeModal`'s preview table and from the plain-text body used by Copy Table / Open in Outlook. (3) New `GET /api/export/invoice-pdfs?invoice_numbers=Z1,Z2,...` endpoint (`_fetch_invoice_pdf_bytes` helper + `pypdf` merge) and a "Download Invoice PDFs" button in `EmailComposeModal` — Katie downloads the merged PDF and attaches it to her Outlook email to Mary.

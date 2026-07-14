@@ -107,7 +107,7 @@ All live-mode dependencies (`pyodbc`, `sqlalchemy[mssql]`, `boto3`, `mangum`) ar
 | POST | `/api/bols/{id}/unignore` | Remove ignored flag |
 | POST | `/api/bols/mark-accounting-sent` | Set `accounting_exported_at = now()` on a list of record IDs; removes them from Approved view |
 | POST | `/api/bols/{id}/reassign-invoice` | Move invoice to a different trip/BOL/manifest; body: `{ target, action: preview\|merge\|replace }` |
-| PATCH | `/api/bols/{id}/notes` | Auto-save notes field (called by frontend with 500ms debounce) |
+| PATCH | `/api/bols/{id}/notes` | Auto-save notes field; not currently called by any UI (input removed from `BOLRow.jsx` 2026-07-14 pending a notes redesign) |
 | POST | `/api/admin/pull` | Pull Technique manifests from AWP-SQL-PROD (disabled in mock mode) |
 | POST | `/api/admin/refetch-bols` | Re-query Technique for specific manifests; updates `bol_number` after Prophecy import (live mode only) |
 | POST | `/api/admin/poll-email` | Poll O365 IMAP for unread ALG invoice emails → extract CSVs → process (live mode only) |
@@ -338,6 +338,7 @@ frontend/src/components/
   BOLRow.jsx                  — Single record row; Approve, Flag, Third-party, Ignore buttons
   ApprovedSection.jsx         — Approved records table + SID export + Send to Accounting flow
   ThirdPartySection.jsx       — Third-party records (customer pays direct); excluded from SID export
+  IgnoredSection.jsx          — Ignored invoice-only stub records; one-click "Ignore All" for remaining eligible stubs
   FlagModal.jsx               — Modal overlay for entering a flag reason
   ReassignInvoiceModal.jsx    — Modal for moving an invoice to a different trip (preview/merge/replace)
   BulkActionToolbar.jsx       — Floating bar shown when rows are multi-selected; bulk approve/flag/third-party/ignore
@@ -351,7 +352,7 @@ No Context, no reducer, no router, no `useMemo`/`useCallback` anywhere in `front
 
 - **Inline styles only** — no CSS modules, Tailwind, or styled-components. Style objects are built ad hoc per component (e.g. `TD`/`TD_R` constants in `BOLRow.jsx` for shared cell styles). Colors are hardcoded hex per-component (`#2D6A4F` green, `#dc2626` red, etc.) — there's no shared theme/constants file, so matching an existing color means grepping for its hex value in the relevant component.
 - **Modals** (`FlagModal.jsx`, `ReassignInvoiceModal.jsx`) are conditionally rendered inline in `App.jsx`'s JSX based on a target-id state variable (e.g. `flagTarget`, `reassignTargetId`) — not a portal, not router-based.
-- **Debounced auto-save**: the notes field in `BOLRow.jsx` uses local `useState` + `useRef` to hand-roll a 500ms `setTimeout` debounce, then calls back up to `App.jsx`'s `onNotesUpdate` (which hits `PATCH /api/bols/{id}/notes`). Reuse this pattern for any other field needing autosave.
+- **Debounced auto-save** (pattern currently unused): `App.jsx`'s `onNotesUpdate` / `PATCH /api/bols/{id}/notes` still exist, but the editable input that drove them was removed from `BOLRow.jsx` on 2026-07-14 pending a notes redesign — reuse the 500ms `setTimeout` debounce approach (local `useState` + `useRef`) if re-adding a notes UI or building similar autosave elsewhere.
 - **Bulk-select**: `selectedIds` is a `Set` in `App.jsx` state, with `toggleSelect`/`toggleSelectAll`/`clearSelection` helpers; `BulkActionToolbar.jsx` reads from it.
 - **Module 2 refactor seam**: `App.jsx` has an in-code comment marking the intended split when Module 2 ships — extract fetch helpers to `src/api/bolsApi.js` and move this state/logic to `src/pages/BolReconciliation.jsx`. Don't do this preemptively; it's noted for when a second module actually needs the shared shell.
 
