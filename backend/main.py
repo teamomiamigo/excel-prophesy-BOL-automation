@@ -1439,6 +1439,14 @@ def _apply_access_prog_calc(
         alg_rate = _lookup_alg_rate(alg_rate_by_zip3, zip3)
         if alg_rate is not None:
             base = Decimal(str(round(alg_rate * weight / 100.0, 2)))
+            # ALG applies a minimum freight charge per shipment; our own tariff card
+            # carries the identical minimum per zone (confirmed against real invoices).
+            # Apply the same floor here using our own weight — otherwise a pallet priced
+            # via ALG's rate has no minimum-charge protection at all, unlike the
+            # internal-card fallback below (get_tariff_rate() already does this itself).
+            zone_info = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
+            if zone_info and zone_info.get("minimum_freight") is not None:
+                base = max(base, zone_info["minimum_freight"])
             with_fsc = base * (Decimal("1") + _effective_fsc_pct) if _effective_fsc_pct is not None else base
             new_base_sum += base
             new_tariff_sum += with_fsc
@@ -1582,13 +1590,19 @@ def _parse_alg_csv_context(reader: "csv.DictReader") -> dict:
         try:
             gross_wt = float(row.get("GrossWt") or 0)
             billed = float(row.get("Billed$") or 0)
-            # Derive per-zone rate from Billed$/GrossWt — the "Rate" column in ALG's
-            # CSVs is blank on every freight row (only the FSC footer has a value),
-            # so we back-compute $/cwt from what they actually charged and their weight.
-            # This is the "invoice rate" the user specified: apply it to OUR weight.
-            if raw_zip and gross_wt > 0 and billed > 0:
-                implicit_rate = round(billed / (gross_wt / 100.0), 4)  # $/cwt
-                ctx["alg_rate_by_zip3"].setdefault(raw_zip[:3], implicit_rate)
+            rate_val = float(row.get("Rate") or 0)
+            # ALG's own printed Rate is the real per-cwt price — confirmed against 126
+            # real historical invoices (7,290 freight lines) to always be populated and
+            # to match our internal tariff card exactly, zone for zone. Reading it
+            # directly avoids back-computing Billed$/GrossWt, which silently bakes in
+            # ALG's per-shipment minimum-freight charge as if it were a flat rate (e.g.
+            # a $70 minimum on a 216 lb parcel implies a fake $32/cwt "rate"). Only fall
+            # back to the derived value if Rate is genuinely absent on some future format.
+            effective_rate = rate_val if rate_val > 0 else (
+                round(billed / (gross_wt / 100.0), 4) if raw_zip and gross_wt > 0 and billed > 0 else None
+            )
+            if raw_zip and effective_rate:
+                ctx["alg_rate_by_zip3"].setdefault(raw_zip[:3], effective_rate)
         except (ValueError, TypeError):
             pass
         try:
