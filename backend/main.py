@@ -824,6 +824,29 @@ def reset_all_invoices(db: Session = Depends(get_db)):
     return {"stubs_deleted": stub_count, "records_cleared": len(technique_rows)}
 
 
+@app.post("/api/admin/wipe-test-data", tags=["Admin"])
+def wipe_test_data(confirm: bool = False, db: Session = Depends(get_db)):
+    """
+    Dev-only: deletes ALL bol_records (pending/approved/flagged/logged) and their
+    cascaded approval_history, for a clean invoice-by-invoice re-test.
+    Does NOT touch tariff_rates, fuel_surcharge_rates, or users.
+    """
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Pass ?confirm=true to wipe all BOL records")
+
+    if settings.USE_MOCK_DATA:
+        count = len(_mock_state)
+        _mock_state.clear()
+        return {"records_deleted": count}
+
+    rows = db.query(BOLRecord).all()
+    count = len(rows)
+    for row in rows:
+        db.delete(row)  # per-row delete (not Query.delete()) so the ORM
+    db.commit()          # cascade="all, delete-orphan" to approval_history fires
+    return {"records_deleted": count}
+
+
 def _apply_bol_status(row: "BOLRecord", technique_row: dict) -> None:
     """
     Set bol_number/needs_sid_export from a Technique/ShipperPlus query row's

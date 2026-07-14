@@ -45,13 +45,15 @@ There are no automated tests and no linter configured for the frontend. Verify c
 
 **Other frontend scripts:**
 ```powershell
-cd frontend && npm run build     # production build (not currently deployed anywhere — no CI/CD)
+cd frontend && npm run build     # production build; deployed via `.\deploy.ps1 -Frontend` or the `/deploy` skill (S3 + CloudFront) — no CI/CD, deploys are manual
 cd frontend && npm run preview   # serve the production build locally
 ```
 
 **Vite dev proxy:** The frontend calls bare `/api/*` paths. Vite proxies them to `http://localhost:8000`. Never hardcode `localhost:8000` in frontend code — the proxy handles it.
 
 **Launching the app for verification:** use the `run` skill (`.claude/skills/run`) — it starts both servers, waits for health checks, and screenshots the dashboard.
+
+**Deploying to AWS:** use the `deploy` skill (`.claude/skills/deploy`) — wraps `deploy.ps1`, adds pre-flight checks and a human-reviewed `terraform apply` gate, and verifies the live deployment afterward. See "AWS Lambda deployment" below for the current infra.
 
 ## Security notes (see `documentation/SECURITY.md` for full detail)
 
@@ -112,6 +114,7 @@ All live-mode dependencies (`pyodbc`, `sqlalchemy[mssql]`, `boto3`, `mangum`) ar
 | POST | `/api/admin/refetch-bols` | Re-query Technique for specific manifests; updates `bol_number` after Prophecy import (live mode only) |
 | POST | `/api/admin/poll-email` | Poll O365 IMAP for unread ALG invoice emails → extract CSVs → process (live mode only) |
 | POST | `/api/admin/reset-invoices` | Dev: clear invoice fields on all records + delete invoice-only stubs |
+| POST | `/api/admin/wipe-test-data` | Dev: deletes ALL `bol_records` (pending/approved/flagged/logged) + cascaded `approval_history`, for a clean invoice-by-invoice re-test. Does NOT touch `tariff_rates`/`fuel_surcharge_rates`/`users`. Requires `?confirm=true` |
 | POST | `/api/admin/recompute-diffs` | Backfill weight_diff/pallet_diff/pcs_diff on existing records via `_compute_diffs()` (live mode only); pure DB recompute, no live Technique/Prophecy query |
 | POST | `/api/admin/recompute-access-prog` | Backfill Calculated Cost on existing matched records — re-locates and re-parses each record's original invoice CSV (`_find_invoice_file(..., require_csv=True)`) since ALG's per-zone rate isn't stored anywhere else, then re-runs `_apply_access_prog_calc()` with a fresh live pallet-data query (live mode only); records whose original file can't be found are reported as `skipped_no_file`, not guessed at |
 | POST | `/api/invoices/upload` | Upload ALG invoice CSV(s) — pass a whole sender folder (`invoice_folder_name`, parsed the same way as `poll-folder`) or fall back to manual `invoice_sender`/`invoice_date`/`invoice_time` fields; response includes `conflict` key if trip already had an invoice |
@@ -329,8 +332,10 @@ documentation/           — Five .md spec files (Design & Workflow, Requirement
                            is the running dev changelog — one entry per closed GitHub issue, appended
                            by the `commit` skill. Read it for recent history that isn't yet folded
                            into this file.
-Dockerfile               — Lambda container image build (see "AWS Lambda deployment" below); not yet deployed
+Dockerfile               — Lambda container image build; live (see "AWS Lambda deployment" below)
 terraform/bootstrap/     — One-time remote-state backend (S3 + DynamoDB), local state; see "AWS Lambda deployment"
+terraform/main/          — The actual deployed infra: Lambda, API Gateway, Aurora, CloudFront, WAF, S3 (frontend + invoices), ECR. Tracked in git; terraform.tfvars holds the live lambda_image_tag. State is still local (not migrated to the bootstrap-provisioned S3 backend yet).
+deploy.ps1               — Builds/pushes the backend image and bumps terraform.tfvars (stops before `terraform apply` by design — human review gate), and fully automates the frontend build/S3 sync/CloudFront invalidation. Wrapped by the `deploy` skill.
 frontend/src/main.jsx    — Vite entry point; mounts <App /> only, no router
 frontend/src/App.jsx     — Owns all state + fetch/mutation handlers; passes data+callbacks down as props
 frontend/src/components/
@@ -370,16 +375,19 @@ No Context, no reducer, no router, no `useMemo`/`useCallback` anywhere in `front
 2. SID export (`GET /api/export/prophecy-sid`) generates synthetic pallet rows from approved records
 3. Email export logs to console instead of sending (SMTP not configured)
 
-## AWS Lambda deployment (Stage 1 — in progress, not yet live)
+## AWS Lambda deployment — live
 
-Container-image Lambda deployment is being built out; nothing here is deployed yet.
+Fully serverless, deployed and actively used for testing (first deployed 2026-07-09, redeployed several times since). **There is no EC2 instance or long-running process** — the backend is a Lambda container image, replaced wholesale on each deploy; AWS handles starting/stopping execution environments automatically.
 
-- `Dockerfile` (repo root): builds `public.ecr.aws/lambda/python:3.13`, installs `backend/requirements.txt`, copies `backend/` (including `test_data/`, needed at runtime for mock mode), entrypoint `backend.main.handler`.
-- `backend/main.py` ends with `handler = Mangum(app)` — wraps the existing FastAPI `app` for Lambda's event format. No route code changes needed for this; it's purely an adapter tacked onto the same app used by uvicorn locally.
-- `backend/requirements.txt` was switched from `>=` floors to pinned `==` versions for reproducible container builds, and gained `mangum==0.21.0`.
-- `terraform/bootstrap/` provisions only the remote-state backend (S3 bucket with versioning + encryption, DynamoDB lock table) using **local** state — deliberately, since it creates the very backend a future `terraform/` (main infra: Lambda, API Gateway, etc.) project would use. That main project doesn't exist yet.
-- `.env.example` is the Stage 1 reference `.env` — everything below its "OUT OF SCOPE for Stage 1" divider is live-mode-only and left blank/default.
-- Target architecture is serverless (Lambda + API Gateway + Aurora + CloudFront); this Dockerfile/bootstrap work is the first slice. Two known blockers for going live-mode in Lambda, not yet resolved: VPN connectivity from Lambda to the on-prem AWP-SQL-PROD/ShipperPlus SQL Servers, and UNC file share access (`INVOICE_FOLDER`) from Lambda.
+- **Backend**: Lambda function `sg360-bol-api` (container image, pulled from ECR by digest) behind an API Gateway HTTP API (`AWS_PROXY` integration, `$default` stage). `Dockerfile` (repo root) builds `public.ecr.aws/lambda/python:3.13`, installs `backend/requirements.txt`, copies `backend/` (including `test_data/`, needed at runtime for mock mode), entrypoint `backend.main.handler`. `backend/main.py` ends with `handler = Mangum(app)` — wraps the same FastAPI `app` used by uvicorn locally, no route code changes needed.
+- **Database**: Aurora Serverless v2 Postgres (`sg360-bol-aurora`), VPC-private — reachable only from the Lambda's own security group, not from a dev machine directly.
+- **Frontend**: S3 static bucket (`sg360-bol-frontend`) + CloudFront, deployed via `deploy.ps1 -Frontend` (build → `aws s3 sync --delete` → CloudFront invalidation).
+- **Invoice PDFs**: separate private S3 bucket (`sg360-bol-invoices`); Lambda role has `PutObject`/`GetObject` only (no delete).
+- **WAF**: CloudFront-scoped WAFv2 web ACL. Currently `default_action = allow{}` (opened 2026-07-14 for testing — testers' egress IPs rotate through a NAT/VPN faster than an IP allowlist can track; the CloudFront URL isn't linked/indexed anywhere so this is obscurity, not real access control). The IP-allowlist rule is left intact in `terraform/main/waf.tf` — flip back to `block{}` before any real production rollout.
+- **Secrets**: Lambda reads `AWS_SECRET_NAME=sg360-bol-live-credentials` from Secrets Manager instead of `.env` (see `backend/config.py`).
+- **DNS workaround**: the link-local DNS resolver is unreachable from this Lambda's VPC/subnet. `backend/config.py` monkey-patches `socket.getaddrinfo` with static IPs for Secrets Manager, Aurora, the two on-prem SQL hosts, and the S3 endpoint — this is how Lambda reaches on-prem AWP-SQL-PROD/ShipperPlus and S3 despite the broken resolver. Stopgap, not a permanent fix; re-resolve and update if AWS's underlying IPs ever shift.
+- **Terraform**: `terraform/main/` defines all of the above (`lambda.tf`, `apigateway.tf`, `aurora.tf`, `frontend.tf`, `invoices_s3.tf`, `waf.tf`, `ecr.tf`, `iam.tf`). State is still local (not migrated to the S3 backend `terraform/bootstrap/` provisioned). `terraform.tfvars` is tracked in git and holds the live `lambda_image_tag`.
+- **Deploying**: use the `/deploy` skill (`.claude/skills/deploy`), which wraps `deploy.ps1` — build/push/plan for the backend (stops for a human-reviewed `terraform apply`), fully automatic build/sync/invalidate for the frontend.
 
 ## Future modules (do not implement yet)
 
