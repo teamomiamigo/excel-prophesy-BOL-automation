@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import SummaryBar from './components/SummaryBar.jsx';
 import BOLTable from './components/BOLTable.jsx';
 import ThirdPartySection from './components/ThirdPartySection.jsx';
+import IgnoredSection from './components/IgnoredSection.jsx';
 import ApprovedSection from './components/ApprovedSection.jsx';
 import FlagModal from './components/FlagModal.jsx';
 import ReassignInvoiceModal from './components/ReassignInvoiceModal.jsx';
@@ -40,10 +41,6 @@ export default function App() {
   const [pollFolderLoading, setPollFolderLoading] = useState(false);
   const [filterText, setFilterText] = useState('');
   const [sort, setSort] = useState({ column: null, direction: 'default' });
-  const [uploadSender, setUploadSender] = useState('');
-  const [uploadDate, setUploadDate] = useState('');
-  const [uploadTime, setUploadTime] = useState('');
-  const [showSenderFields, setShowSenderFields] = useState(false);
   const folderInputRef = useRef(null);
 
   // React's JSX attribute mapping doesn't reliably set the `webkitdirectory`
@@ -60,14 +57,15 @@ export default function App() {
   const [exportingSidId, setExportingSidId] = useState(null);
   const [checkingBolId, setCheckingBolId] = useState(null);
   const [retryingMatchId, setRetryingMatchId] = useState(null);
-  const [refreshLoading, setRefreshLoading] = useState(false);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [bulkActionLoading, setBulkActionLoading] = useState(false);
   const [bulkFlagOpen, setBulkFlagOpen] = useState(false);
   const [bulkResults, setBulkResults] = useState(null); // { action, succeeded, total, skipped }
 
   const thirdPartyBols     = pendingBols.filter(b => b.is_third_party);
-  const visiblePendingBols = pendingBols.filter(b => !b.is_third_party);
+  const visiblePendingBols = pendingBols.filter(b => !b.is_third_party && !b.is_ignored);
+  const ignoredBols        = pendingBols.filter(b => b.is_ignored && !b.is_third_party);
+  const eligibleToIgnore   = visiblePendingBols.filter(b => b.technique_trip == null && b.invoice_number);
 
   const readyToReviewBols = visiblePendingBols.filter(b => b.technique_trip != null && b.amount != null);
 
@@ -292,17 +290,6 @@ export default function App() {
     }
   }
 
-  async function handleRefresh() {
-    setRefreshLoading(true);
-    try {
-      await Promise.all([fetchPending(), fetchApproved()]);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setRefreshLoading(false);
-    }
-  }
-
   // -------------------------------------------------------------------------
   // Bulk actions (issue #32) — fire the same per-record endpoints used by the
   // individual action buttons, once per eligible selected record, then a
@@ -405,6 +392,23 @@ export default function App() {
     }
   }
 
+  async function handleIgnoreAllEligible() {
+    if (!eligibleToIgnore.length) return;
+    setBulkActionLoading(true);
+    try {
+      const results = await Promise.allSettled(
+        eligibleToIgnore.map(b => fetch(`/api/bols/${b.id}/ignore`, { method: 'POST' }))
+      );
+      const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
+      setBulkResults({ action: 'ignored', succeeded, total: eligibleToIgnore.length, skipped: 0 });
+      await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBulkActionLoading(false);
+    }
+  }
+
   async function handleBulkExportSid() {
     const all = selectedRecords();
     const eligible = all.filter(b => b.needs_sid_export && b.manifest && !b.is_third_party && !b.is_ignored);
@@ -446,9 +450,6 @@ export default function App() {
       form.append('file', file);
       if (pdfFile) form.append('pdf_file', pdfFile);
       if (folderName) form.append('invoice_folder_name', folderName);
-      if (uploadSender) form.append('invoice_sender', uploadSender);
-      if (uploadDate) form.append('invoice_date', uploadDate);
-      if (uploadTime) form.append('invoice_time', uploadTime);
       try {
         const res = await fetch('/api/invoices/upload', { method: 'POST', body: form });
         const data = await res.json().catch(() => ({}));
@@ -556,7 +557,7 @@ export default function App() {
     e.target.value = '';
     const files = allFiles.filter(f => f.name.toLowerCase().endsWith('.csv'));
     if (!files.some(f => f.webkitRelativePath)) {
-      setError('The browser did not report folder paths for these files — it may have opened a plain file picker instead of a folder picker. Sender/date will not be auto-detected; use the manual "Sender" fields below, or try again.');
+      setError('The browser did not report folder paths for these files — it may have opened a plain file picker instead of a folder picker. Sender/date will not be auto-detected; try again with the folder picker.');
     }
     // Pair each CSV with its companion PDF in the same folder by leading Z-number
     // (ALG's PDFs carry a name suffix the CSVs don't — "Z558429 -Segerdahl
@@ -902,23 +903,6 @@ export default function App() {
               <span>{pendingBols.length + approvedBols.length} records loaded</span>
               <span style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
                 <button
-                  onClick={handleRefresh}
-                  disabled={refreshLoading}
-                  title="Refresh pending and approved records from this dashboard's own data (no live Technique pull)"
-                  style={{
-                    background: refreshLoading ? '#e5e7eb' : '#f9fafb',
-                    color: refreshLoading ? '#9ca3af' : '#374151',
-                    border: '1px solid #d1d5db',
-                    borderRadius: 5,
-                    padding: '4px 12px',
-                    fontWeight: 600,
-                    fontSize: 12,
-                    cursor: refreshLoading ? 'not-allowed' : 'pointer',
-                  }}
-                >
-                  {refreshLoading ? 'Refreshing…' : '⟳ Refresh'}
-                </button>
-                <button
                   onClick={handlePull}
                   disabled={pullLoading}
                   title="Pull latest manifests from Technique"
@@ -978,49 +962,8 @@ export default function App() {
                   disabled={invoiceUploading}
                   onChange={handleInvoiceUpload}
                 />
-                <button
-                  type="button"
-                  onClick={() => setShowSenderFields(v => !v)}
-                  title="Add sender info for manual uploads"
-                  style={{
-                    background: showSenderFields ? '#fef3c7' : '#fff',
-                    color: '#92400e',
-                    border: '1px solid #fde68a',
-                    borderRadius: 5,
-                    padding: '4px 10px',
-                    fontSize: 12,
-                    cursor: 'pointer',
-                  }}
-                >
-                  {showSenderFields ? '▲ Sender' : '▼ Sender'}
-                </button>
               </span>
             </div>
-            {showSenderFields && (
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '8px 14px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 6, marginBottom: 12, fontSize: 12 }}>
-                <span style={{ fontWeight: 600, color: '#92400e', whiteSpace: 'nowrap' }}>Sender info for manual upload:</span>
-                <input
-                  type="text"
-                  value={uploadSender}
-                  onChange={e => setUploadSender(e.target.value)}
-                  placeholder="Sender name (e.g. Tania)"
-                  style={{ border: '1px solid #d1d5db', borderRadius: 4, padding: '4px 8px', fontSize: 12, width: 160 }}
-                />
-                <input
-                  type="date"
-                  value={uploadDate}
-                  onChange={e => setUploadDate(e.target.value)}
-                  style={{ border: '1px solid #d1d5db', borderRadius: 4, padding: '4px 8px', fontSize: 12 }}
-                />
-                <input
-                  type="time"
-                  value={uploadTime}
-                  onChange={e => setUploadTime(e.target.value)}
-                  style={{ border: '1px solid #d1d5db', borderRadius: 4, padding: '4px 8px', fontSize: 12 }}
-                />
-                <span style={{ color: '#9ca3af' }}>Optional — leave blank if unknown</span>
-              </div>
-            )}
 
             {uploadResults && (uploadResults.matched.length + uploadResults.unmatched.length + uploadResults.errors.length > 0) && (
               <div style={{ marginBottom: 16, border: '1px solid #e5e7eb', borderRadius: 6, overflow: 'hidden', fontSize: 12 }}>
@@ -1167,6 +1110,15 @@ export default function App() {
               unmarkingThirdPartyId={unmarkingThirdPartyId}
               onApprove={handleApprove}
               onUnmark={handleUnmarkThirdParty}
+            />
+
+            <IgnoredSection
+              bols={ignoredBols}
+              eligibleCount={eligibleToIgnore.length}
+              unignoringId={ignoringId}
+              bulkLoading={bulkActionLoading}
+              onUnignore={id => handleIgnore(id, false)}
+              onIgnoreAll={handleIgnoreAllEligible}
             />
 
             <ApprovedSection

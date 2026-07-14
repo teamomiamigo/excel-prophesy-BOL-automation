@@ -6,7 +6,7 @@ export default function SummaryBar({ awaitingInvoice, readyToReview, readyToRevi
       value: readyToReview,
       color: '#E76F1E',
       bg: '#fff7ed',
-      sub: `${readyToReviewTypeA} Type A · ${readyToReviewTypeB} Type B`,
+      sub: `${readyToReviewTypeA} Corp · ${readyToReviewTypeB} Wolf/311`,
     },
     { label: 'Approved Today', value: approvedToday, color: '#2D6A4F', bg: '#f0fdf4' },
   ];

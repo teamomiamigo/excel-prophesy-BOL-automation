@@ -74,7 +74,7 @@ export default function BulkActionToolbar({
       <button
         onClick={onExportSid}
         disabled={loading}
-        title="Export Prophecy SID for eligible selected Type A records (one download each)"
+        title="Export Prophecy SID for eligible selected Corp records (one download each)"
         style={{ ...BTN, background: loading ? '#374151' : '#eff6ff', color: loading ? '#9ca3af' : '#1e40af', opacity: loading ? 0.6 : 1 }}
       >
         SID
