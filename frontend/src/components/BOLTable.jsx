@@ -1,4 +1,8 @@
+import { useEffect, useRef } from 'react';
 import BOLRow from './BOLRow.jsx';
+
+const EDGE_SCROLL_ZONE_PX = 140;
+const EDGE_SCROLL_SPEED_PX = 8;
 
 const TH_STYLE = {
   padding: '8px 10px',
@@ -134,6 +138,58 @@ export default function BOLTable({
   const allSelected = visibleIds.length > 0 && visibleIds.every(id => selectedIds.has(id));
   const someSelected = visibleIds.some(id => selectedIds.has(id));
 
+  const scrollRef = useRef(null);
+  const tableRendered = !loading && totalVisible > 0;
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+
+    let velocity = 0;
+    let rafId = null;
+
+    const step = () => {
+      if (velocity !== 0) {
+        el.scrollLeft += velocity;
+        rafId = requestAnimationFrame(step);
+      } else {
+        rafId = null;
+      }
+    };
+
+    const handleMouseMove = e => {
+      if (el.scrollWidth <= el.clientWidth) {
+        velocity = 0;
+        return;
+      }
+      const rect = el.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      if (x < EDGE_SCROLL_ZONE_PX) {
+        velocity = -EDGE_SCROLL_SPEED_PX;
+      } else if (x > rect.width - EDGE_SCROLL_ZONE_PX) {
+        velocity = EDGE_SCROLL_SPEED_PX;
+      } else {
+        velocity = 0;
+      }
+      if (velocity !== 0 && rafId === null) {
+        rafId = requestAnimationFrame(step);
+      }
+    };
+
+    const handleMouseLeave = () => {
+      velocity = 0;
+    };
+
+    el.addEventListener('mousemove', handleMouseMove);
+    el.addEventListener('mouseleave', handleMouseLeave);
+
+    return () => {
+      el.removeEventListener('mousemove', handleMouseMove);
+      el.removeEventListener('mouseleave', handleMouseLeave);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, [tableRendered]);
+
   function rowProps(bol) {
     return {
       key: bol.id,
@@ -215,7 +271,7 @@ export default function BOLTable({
           {filterText ? `No records match "${filterText}"` : 'No pending records — all caught up!'}
         </div>
       ) : (
-        <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb', marginBottom: 12 }}>
+        <div ref={scrollRef} style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb', marginBottom: 12 }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
             <TableHead
               allSelected={allSelected}
