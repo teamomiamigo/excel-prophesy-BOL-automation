@@ -15,6 +15,12 @@ Stable technical notes that don't belong to one changelog entry — add here whe
 
 One entry per closed issue. Newest on top.
 
+### 2026-07-14 — #55 Edge-hover auto-scroll for pending table
+**What:** Hovering within 140px of the pending table's left or right edge now auto-scrolls it horizontally at a steady slow speed (`requestAnimationFrame`-driven); moving off the edge zone or off the table stops it immediately. No-ops when the table doesn't overflow.
+**Why:** The 21-column pending table already required manual scrollbar dragging to reach the invoice/cost columns; requested as a smoother Notion/Airtable-style interaction.
+**Files:** frontend/src/components/BOLTable.jsx
+**Gotcha:** The listener-attaching effect must depend on `tableRendered` (`!loading && totalVisible > 0`), not an empty array — the scroll wrapper `<div>` doesn't exist in the DOM until the table finishes loading, so an empty-dependency effect captures a `null` ref permanently. This only surfaced as "works under hot-reload, silently fails on a real page load," since HMR remounts the component after data is already loaded.
+
 ### 2026-07-14 — Dashboard cleanup + Ignored-records section
 **What:** Removed the Cloudflare tunnel skill (no longer used), removed the top toolbar's Refresh/Sender controls and their now-orphaned state, renamed "Type A"/"Type B" labels to "Corp"/"Wolf/311" across the summary card and tooltips, and removed the freeform Notes input from the pending table (column kept, empty, for a future redesign; flag-reason callout preserved). Added a new "Ignored" section (mirrors ThirdPartySection.jsx) that pending invoice-only stubs move into when ignored, plus a one-click "Ignore All" bulk shortcut for every remaining eligible stub. Fixed ReassignInvoiceModal.jsx's "Ignore this invoice" link, which was calling the ignore handler with a missing argument and silently un-ignoring instead.
 **Why:** User-requested UI cleanup ahead of further testing, plus a workflow ask to give ignored records a dedicated place instead of dimming them in-place, and a faster way to clear a backlog of unmatched invoice stubs.
