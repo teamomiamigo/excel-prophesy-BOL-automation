@@ -569,7 +569,11 @@ def get_tariff_rate(destination_zip3: str, weight: float,
     pallet row. If omitted, fetched from EIA on each call.
 
     Returns: {"access_prog": Decimal, "base_tariff": Decimal, "fsc_pct": Decimal,
-              "is_exact_zone_match": bool}
+              "is_exact_zone_match": bool, "minimum_freight": Decimal}
+    "minimum_freight" is the zone's own minimum freight charge (same figure ALG
+    itself charges on small shipments) — callers pricing a pallet via ALG's own
+    invoiced rate use this to apply the same floor, since that path has no
+    minimum-charge protection of its own otherwise.
     Returns None if no active tariff row found even with nearest-zone fallback.
     """
     from backend.database import SessionLocal
@@ -630,6 +634,7 @@ def get_tariff_rate(destination_zip3: str, weight: float,
             "base_tariff": Decimal(str(round(base_tariff, 2))),
             "fsc_pct":     fsc_pct,
             "is_exact_zone_match": matched_zone == zip3,
+            "minimum_freight": Decimal(str(rate.minimum_freight)),
         }
     finally:
         db.close()
