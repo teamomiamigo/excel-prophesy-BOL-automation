@@ -45,6 +45,28 @@ class TariffRate(Base):
     effective_date: Mapped[Optional[date]] = mapped_column(Date)
 
 
+class AlgTariffRate(Base):
+    """
+    ALG Worldwide's own per-destination rate table (tariff_id ALG5_2026), sourced directly
+    from Prophecy/ShipperPlus's dbo.tariff_details (SQLAPPS3.ShipperPlus_Segerdahl) via a
+    one-time export (this dev environment has no live route to that server) — see
+    ALG5_2026_tariff_rates.csv. Keyed by the exact destination code (Locations.AccountNumber
+    format, e.g. "SCF606"), confirmed identical to what our own pallet data already carries
+    as Dest_ID/destination_id — an exact match here needs no zip3 slicing or nearest-zone
+    tolerance, unlike the older zip3-keyed TariffRate card (which is kept only as a fallback
+    for any destination code not found here; found 2026-07-15 to be missing ~64% of the zones
+    a real invoice actually bills, vs. 0% missing against this table).
+    Seeded via: python -m backend.seed_rates
+    """
+    __tablename__ = "alg_tariff_rates"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tariff_id: Mapped[str] = mapped_column(String(30), nullable=False, default="ALG5_2026")
+    dest_id: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    rate1: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    mc1: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+
+
 class FuelSurchargeRate(Base):
     """
     ALG Worldwide Fuel Surcharge Matrix (FSC).

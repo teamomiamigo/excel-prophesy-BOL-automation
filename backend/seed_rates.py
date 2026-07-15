@@ -20,7 +20,7 @@ from pathlib import Path
 from sqlalchemy import text
 
 from backend.database import engine, SessionLocal
-from backend.models import Base, TariffRate, FuelSurchargeRate
+from backend.models import Base, TariffRate, FuelSurchargeRate, AlgTariffRate
 
 DEFAULT_TARIFF_CSV = Path(
     r"c:\nikhilm\billing-freight-automation"
@@ -29,6 +29,9 @@ DEFAULT_TARIFF_CSV = Path(
 DEFAULT_FSC_XLSX = Path(
     r"c:\nikhilm\billing-freight-automation"
     r"\SG360_ALG Worldwide Logistics FSC Matrix_06.01.2026.xlsx"
+)
+DEFAULT_ALG_TARIFF_CSV = Path(
+    r"c:\nikhilm\billing-freight-automation\ALG5_2026_tariff_rates.csv"
 )
 
 TARIFF_EFFECTIVE = date(2026, 4, 1)
@@ -153,6 +156,38 @@ def load_fsc_rates(fsc_path: Path, db) -> int:
     return len(records)
 
 
+def load_alg_tariff_rates(alg_tariff_path: Path, db) -> int:
+    """
+    Parse the Access-sourced ALG5_2026 rate export (columns: tariff_id, destination,
+    rate1, mc1 — no header row) and replace all alg_tariff_rates rows.
+
+    destination is the exact Locations.AccountNumber-format code (e.g. "SCF606"),
+    confirmed 2026-07-15 to match our own pallet data's Dest_ID/destination_id exactly —
+    no zip3 derivation needed for this table, unlike tariff_rates.
+    """
+    db.execute(text("DELETE FROM alg_tariff_rates"))
+
+    records = []
+    with open(alg_tariff_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) < 4 or not row[0].strip():
+                continue
+            tariff_id, dest_id, rate1, mc1 = (row[0].strip(), row[1].strip().upper(),
+                                               _to_dec(row[2]), _to_dec(row[3]))
+            if dest_id and rate1 is not None and mc1 is not None:
+                records.append(AlgTariffRate(
+                    tariff_id=tariff_id,
+                    dest_id=dest_id,
+                    rate1=rate1,
+                    mc1=mc1,
+                ))
+
+    db.bulk_save_objects(records)
+    db.commit()
+    return len(records)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -173,12 +208,19 @@ def main():
         metavar="PATH",
         help="Path to the ALG FSC Matrix Excel (default: %(default)s)",
     )
+    parser.add_argument(
+        "--alg-tariff",
+        default=str(DEFAULT_ALG_TARIFF_CSV),
+        metavar="PATH",
+        help="Path to the Access-sourced ALG5_2026 rate export (default: %(default)s)",
+    )
     args = parser.parse_args()
 
     tariff_path = Path(args.tariff)
     fsc_path = Path(args.fsc)
+    alg_tariff_path = Path(args.alg_tariff)
 
-    missing = [p for p in (tariff_path, fsc_path) if not p.exists()]
+    missing = [p for p in (tariff_path, fsc_path, alg_tariff_path) if not p.exists()]
     if missing:
         for p in missing:
             print(f"ERROR: file not found: {p}")
@@ -196,6 +238,10 @@ def main():
         print(f"Loading FSC rates from {fsc_path.name} ...")
         n = load_fsc_rates(fsc_path, db)
         print(f"  {n} rows inserted into fuel_surcharge_rates.")
+
+        print(f"Loading ALG tariff rates from {alg_tariff_path.name} ...")
+        n = load_alg_tariff_rates(alg_tariff_path, db)
+        print(f"  {n} rows inserted into alg_tariff_rates.")
 
         print("Done.")
     except Exception as exc:

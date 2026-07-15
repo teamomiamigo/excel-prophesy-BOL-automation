@@ -549,6 +549,36 @@ def get_fsc_rate(fuel_price_per_gallon: float) -> Optional[Decimal]:
         db.close()
 
 
+def get_alg_tariff_rate(dest_id: str) -> Optional[dict]:
+    """
+    Exact-match lookup against ALG's own per-destination rate table (alg_tariff_rates,
+    seeded from a Prophecy/ShipperPlus dbo.tariff_details export — see AlgTariffRate's
+    docstring). dest_id is the exact Locations.AccountNumber-format code our own pallet
+    data already carries (e.g. "SCF606") — no zip3 derivation, no nearest-zone tolerance,
+    since this table's own destination codes are confirmed identical to that format.
+
+    Preferred over get_tariff_rate() (the older zip3-keyed card) whenever a rate is found
+    here — see CLAUDE.md's access_prog calculation section for the full priority order.
+
+    Returns {"rate1": Decimal, "mc1": Decimal} or None if this exact dest_id isn't in the table.
+    """
+    from backend.database import SessionLocal
+    from backend.models import AlgTariffRate
+
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(AlgTariffRate)
+            .filter(AlgTariffRate.dest_id == dest_id.strip().upper())
+            .first()
+        )
+        if not row:
+            return None
+        return {"rate1": Decimal(str(row.rate1)), "mc1": Decimal(str(row.mc1))}
+    finally:
+        db.close()
+
+
 def get_tariff_rate(destination_zip3: str, weight: float,
                     _diesel_price: Optional[float] = None,
                     _fsc_pct: Optional[Decimal] = None) -> Optional[dict]:
