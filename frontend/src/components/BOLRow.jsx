@@ -1,5 +1,15 @@
 import { useState } from 'react';
 
+// Do Not Pay is only offered for invoice-only stubs with no Technique/Prophecy
+// match at all — a fresh 'invoice_only' stub with no bol_number gets a "Retry"
+// button instead (still worth another Technique lookup). Shared with App.jsx
+// so eligibility can't drift out of sync with this row's own button condition.
+export function isDoNotPayEligible(bol) {
+  return bol.technique_trip == null
+    && !!bol.invoice_number
+    && !(bol.match_strategy === 'invoice_only' && !bol.bol_number);
+}
+
 // ---------------------------------------------------------------------------
 // Cost % variance logic — primary metric (amount / access_prog)
 // Green: within 3% | Orange: 3–6% off | Red: >6% off
@@ -62,7 +72,7 @@ const ICON_BTN = {
 // Actions column: fixed-size empty slot — same footprint as a button, reads as "nothing here"
 const PLACEHOLDER = { width: '100%', height: 26 };
 
-export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isIgnoring, isExportingSid, isCheckingBol, isRetryingMatch, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onIgnore, onExportSid, onCheckBol, onRetryMatch, onToggleSelect }) {
+export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isMarkingDoNotPay, isExportingSid, isCheckingBol, isRetryingMatch, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onDoNotPay, onExportSid, onCheckBol, onRetryMatch, onToggleSelect }) {
   const [hovered, setHovered] = useState(false);
   const isFlagged = bol.status === 'flagged';
 
@@ -350,12 +360,12 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
                 </button>
               ) : (
                 <button
-                  onClick={() => onIgnore && onIgnore(bol.id, true)}
-                  disabled={isIgnoring}
-                  title="Ignore — mark as unresolvable, exclude from exports"
-                  style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#9ca3af', cursor: isIgnoring ? 'not-allowed' : 'pointer', textDecoration: 'underline', width: '100%' }}
+                  onClick={() => onDoNotPay && onDoNotPay(bol.id, true)}
+                  disabled={isMarkingDoNotPay}
+                  title="Do Not Pay — approves this record into its sender's Approved batch, shows DO NOT PAY instead of an amount"
+                  style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#9ca3af', cursor: isMarkingDoNotPay ? 'not-allowed' : 'pointer', textDecoration: 'underline', width: '100%' }}
                 >
-                  {isIgnoring ? '…' : 'Ignore'}
+                  {isMarkingDoNotPay ? '…' : 'Do Not Pay'}
                 </button>
               )
             ) : (

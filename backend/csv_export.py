@@ -92,7 +92,7 @@ def generate_csv_bytes(bol_records: list[dict]) -> bytes:
             "Invoice #":        r.get("invoice_number") or "",
             "Invoice Sender":   r.get("invoice_email_sender") or "",
             "Calculated Cost":  _fmt_decimal(r.get("access_prog")),
-            "Amount":           _fmt_decimal(r.get("amount")),
+            "Amount":           "DNP" if r.get("is_do_not_pay") else _fmt_decimal(r.get("amount")),
             "Cost %":           _fmt_cost_pct(r.get("cost_pct")),
             "Proph Weight":     _fmt_decimal(r.get("prophecy_weight")),
             "Weight Diff":      _fmt_diff(r.get("weight_diff")),

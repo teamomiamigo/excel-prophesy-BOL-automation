@@ -46,7 +46,7 @@ const BTN_BASE = {
   border: 'none',
 };
 
-export default function ReassignInvoiceModal({ bol, submitting, onClose, onReassign, onIgnore }) {
+export default function ReassignInvoiceModal({ bol, submitting, onClose, onReassign, onDoNotPay }) {
   const [target, setTarget] = useState('');
   const [preview, setPreview] = useState(null);   // null | { target_found, target_trip, target_invoice_number, target_amount, has_conflict }
   const [previewing, setPreviewing] = useState(false);
@@ -197,11 +197,11 @@ export default function ReassignInvoiceModal({ bol, submitting, onClose, onReass
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
           <button
             style={{ ...BTN_BASE, background: 'none', border: 'none', color: '#6b7280', fontSize: 12, padding: '6px 0', cursor: 'pointer' }}
-            onClick={() => onIgnore(bol.id, true)}
+            onClick={() => onDoNotPay(bol.id, true)}
             disabled={submitting}
-            title="Mark this invoice record as ignored — stays in log but excluded from exports"
+            title="Do Not Pay this invoice — approves it into its sender's Approved batch"
           >
-            Ignore this invoice
+            Do Not Pay this invoice
           </button>
           <div style={{ display: 'flex', gap: 8 }}>
             <button
