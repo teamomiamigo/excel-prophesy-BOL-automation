@@ -1451,11 +1451,19 @@ def _lookup_alg_rate(alg_rate_by_zip3: dict, zip3: str) -> "float | None":
     return best_rate if best_dist <= _ALG_ZONE_TOLERANCE else None
 
 
-# Below this fraction of our load's weight successfully rated per-zone, the
-# per-zone sum is discarded as unrepresentative (it produced 800%-1300% Cost %
-# numbers when only 1-2 of 60 zones matched) in favor of the invoice's own
-# blended rate, or an honest null when no blended rate is available either.
-_RATE_COVERAGE_THRESHOLD = 0.8
+# Below this fraction of our load's weight successfully rated per-zone, the per-zone
+# sum is discarded as unrepresentative in favor of the invoice's own blended rate, or
+# an honest null when no blended rate is available either.
+#
+# Effectively requires full coverage (2026-07-15): a lower threshold (0.8 originally)
+# let a partially-rated shipment silently report only the rated slice's dollars as if
+# it were the whole shipment's cost — e.g. an 85%-covered load reported ~85% of its
+# true cost, with no scaling and no fallback, because 85% cleared the old 80% bar.
+# That single mechanism explained most of the systematic under-pricing this threshold
+# was chasing. Requiring full coverage means ANY unrated zone now falls back to the
+# invoice's own blended rate for the whole load instead of silently dropping dollars —
+# matches the coverage-gap fallback this branch already trusted for the worse case.
+_RATE_COVERAGE_THRESHOLD = 0.999999
 
 
 def _apply_access_prog_calc(
@@ -1485,11 +1493,13 @@ def _apply_access_prog_calc(
 
     See CLAUDE.md's "access_prog calculation" section for the full rationale/priority order.
     """
+    from backend.data_layer import get_alg_tariff_rate
+
     _effective_fsc_pct = Decimal(str(fsc_rate_val)) if fsc_rate_val is not None else _fsc_pct
     matched_rec.alg_fsc_pct = Decimal(str(fsc_rate_val)) if fsc_rate_val is not None else None
     matched_rec.alg_fsc_cost = Decimal(str(round(fsc_cost_val, 2))) if fsc_cost_val is not None else None
 
-    own_pallets: list[tuple[str, float]] = []  # (zip3, weight)
+    own_pallets: list[tuple[str, float, "str | None"]] = []  # (zip3, weight, exact_dest_id)
     if match_strategy == "prophecy_bol" and effective_prophecy_bol:
         from backend.data_layer import get_prophecy_pallet_data as _get_prophecy_pallet_data
         for prow in _get_prophecy_pallet_data(int(effective_prophecy_bol)):
@@ -1498,18 +1508,20 @@ def _apply_access_prog_calc(
             # Prefer the actual postal zip3 (destination_zip) over the SCF zone code
             # (destination_id "SCF350" → "350"): ALG's invoice bills actual zip3s, so
             # this is what joins against alg_rate_by_zip3 — the SCF code is the reason
-            # exact joins used to miss on every zone (see _ALG_ZONE_TOLERANCE).
+            # exact joins used to miss on every zone (see _ALG_ZONE_TOLERANCE). The exact
+            # dest_id is still carried alongside for the alg_tariff_rates lookup below,
+            # which matches on it directly and needs no zip3 derivation.
             zip3 = (dest_zip[:3] if dest_zip else None) or (dest_id[3:6] if dest_id and len(dest_id) >= 6 else None)
             weight = float(prow.get("weight") or 0)
             if zip3 and weight > 0:
-                own_pallets.append((zip3, weight))
+                own_pallets.append((zip3, weight, dest_id))
     elif matched_rec.manifest:
         from backend.data_layer import get_pallet_data_for_manifests as _get_pallet_data_for_manifests
         for prow in _get_pallet_data_for_manifests([matched_rec.manifest]):
             dest_id = prow.get("Dest_ID") or ""
             weight = float(prow.get("Wgt") or 0)
             if len(dest_id) >= 6 and weight > 0:
-                own_pallets.append((dest_id[3:6], weight))
+                own_pallets.append((dest_id[3:6], weight, dest_id))
 
     matched_rec.weight_source_fallback = not bool(own_pallets)
     if not own_pallets:
@@ -1522,9 +1534,9 @@ def _apply_access_prog_calc(
     new_tariff_sum = Decimal("0")
     new_base_sum = Decimal("0")
     any_approximate = False
-    total_weight = sum(w for _, w in own_pallets)
+    total_weight = sum(w for _, w, _ in own_pallets)
     rated_weight = 0.0
-    for zip3, weight in own_pallets:
+    for zip3, weight, exact_dest_id in own_pallets:
         # Rate/zone structure is ALG's own pricing — use their invoiced rate for this
         # zone first; our internal rate card is only a fallback for a zone this invoice
         # didn't happen to bill.
@@ -1539,6 +1551,20 @@ def _apply_access_prog_calc(
             zone_info = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
             if zone_info and zone_info.get("minimum_freight") is not None:
                 base = max(base, zone_info["minimum_freight"])
+            with_fsc = base * (Decimal("1") + _effective_fsc_pct) if _effective_fsc_pct is not None else base
+            new_base_sum += base
+            new_tariff_sum += with_fsc
+            rated_weight += weight
+            continue
+        # This invoice didn't bill this exact zone — next choice is an exact match
+        # against ALG's own published rate table (alg_tariff_rates, keyed on the same
+        # Dest_ID format our own pallet data already carries), which is far more
+        # complete than the zip3-keyed internal card below (confirmed 2026-07-15: 0%
+        # of a real invoice's zones missing here vs. 64% missing from the old card).
+        alg_tariff = get_alg_tariff_rate(exact_dest_id) if exact_dest_id else None
+        if alg_tariff is not None:
+            base = Decimal(str(round(float(alg_tariff["rate1"]) * weight / 100.0, 2)))
+            base = max(base, alg_tariff["mc1"])
             with_fsc = base * (Decimal("1") + _effective_fsc_pct) if _effective_fsc_pct is not None else base
             new_base_sum += base
             new_tariff_sum += with_fsc
@@ -1701,6 +1727,15 @@ def _parse_alg_csv_context(reader: "csv.DictReader") -> dict:
             ctx["alg_freight_total"] += float(row.get("Billed$") or 0)
         except (ValueError, TypeError):
             pass
+
+    # The CSV's Fuel Surcharge row prints its Rate rounded to 2 decimals (e.g. "0.41"),
+    # but the invoice's own PDF and its two exact dollar figures agree on a more precise
+    # value (e.g. 0.365, matching FSC$/freight$ to 4 decimals across every real invoice
+    # checked 2026-07-15) — unlike the per-zone Rate above, this one IS worth deriving
+    # from the exact dollars rather than trusting the printed label.
+    if ctx["fsc_cost_val"] and ctx["alg_freight_total"]:
+        ctx["fsc_rate_val"] = round(ctx["fsc_cost_val"] / ctx["alg_freight_total"], 6)
+
     return ctx
 
 
