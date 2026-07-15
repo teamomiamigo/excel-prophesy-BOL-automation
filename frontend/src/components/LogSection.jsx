@@ -61,6 +61,26 @@ function StatusBadge({ status }) {
   );
 }
 
+function InvoiceTypeBadge({ record }) {
+  const type = record.is_third_party ? 'Third Party' : (record.needs_sid_export ? 'Corp' : 'Wolf/311');
+  const style = type === 'Third Party'
+    ? { bg: '#fff7ed', color: '#c2410c' }
+    : { bg: '#f3f4f6', color: '#374151' };
+  return (
+    <span style={{
+      background: style.bg,
+      color: style.color,
+      borderRadius: 3,
+      padding: '2px 7px',
+      fontSize: 11,
+      fontWeight: 600,
+      whiteSpace: 'nowrap',
+    }}>
+      {type}
+    </span>
+  );
+}
+
 export default function LogSection() {
   const [records, setRecords] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -209,6 +229,7 @@ export default function LogSection() {
                 <th style={TH}>Trip</th>
                 <th style={TH}>Manifest</th>
                 <th style={TH}>BOL</th>
+                <th style={TH}>Invoice Type</th>
                 <th style={TH}>Invoice Sender</th>
                 <th style={TH}>Invoice #</th>
                 <th style={{ ...TH, textAlign: 'right' }}>Amount</th>
@@ -230,6 +251,7 @@ export default function LogSection() {
                   <td style={{ ...TD, color: '#6b7280' }}>{r.technique_trip || '—'}</td>
                   <td style={TD}>{r.manifest || '—'}</td>
                   <td style={TD}>{r.bol_number ?? <span style={{ color: '#9ca3af' }}>—</span>}</td>
+                  <td style={TD}><InvoiceTypeBadge record={r} /></td>
                   <td style={{ ...TD, color: '#6b7280', fontSize: 12 }}>{r.invoice_email_sender || '—'}</td>
                   <td style={{ ...TD, fontWeight: 600 }}>{r.invoice_number || '—'}</td>
                   <td style={{ ...TD_R, fontWeight: 600, color: r.is_do_not_pay ? '#dc2626' : undefined }}>{r.is_do_not_pay ? 'DNP' : fmtMoney(r.amount)}</td>

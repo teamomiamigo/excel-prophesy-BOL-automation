@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import SummaryBar from './components/SummaryBar.jsx';
 import BOLTable from './components/BOLTable.jsx';
-import { isDoNotPayEligible } from './components/BOLRow.jsx';
+import { isDoNotPayEligible, isThirdPartyEligible } from './components/BOLRow.jsx';
 import ThirdPartySection from './components/ThirdPartySection.jsx';
 import ApprovedSection from './components/ApprovedSection.jsx';
 import FlagModal from './components/FlagModal.jsx';
@@ -33,6 +33,7 @@ export default function App() {
   const [unflaggingId, setUnflaggingId] = useState(null);
   const [markingThirdPartyId, setMarkingThirdPartyId] = useState(null);
   const [unmarkingThirdPartyId, setUnmarkingThirdPartyId] = useState(null);
+  const [movingToLogLoading, setMovingToLogLoading] = useState(false);
   const [reassignTargetId, setReassignTargetId] = useState(null);
   const [reassignSubmitting, setReassignSubmitting] = useState(false);
   const [markingDoNotPayId, setMarkingDoNotPayId] = useState(null);
@@ -351,7 +352,7 @@ export default function App() {
 
   async function handleBulkMarkThirdParty() {
     const all = selectedRecords();
-    const eligible = all.filter(b => !b.amount && !b.bol_number && !b.is_third_party);
+    const eligible = all.filter(isThirdPartyEligible);
     const skipped = all.length - eligible.length;
     if (!all.length) return;
     setBulkActionLoading(true);
@@ -617,6 +618,39 @@ export default function App() {
       setError(err.message);
     } finally {
       setUnmarkingThirdPartyId(null);
+    }
+  }
+
+  async function handleMoveThirdPartyToLog() {
+    const targets = thirdPartyBols;
+    if (!targets.length) return;
+    const confirmed = window.confirm(
+      `Move ${targets.length} third-party record${targets.length !== 1 ? 's' : ''} to the log? This skips the Approved/Send-to-Accounting step.`
+    );
+    if (!confirmed) return;
+    setMovingToLogLoading(true);
+    try {
+      const approveResults = await Promise.allSettled(
+        targets.map(b => fetch(`/api/bols/${b.id}/approve`, { method: 'POST' }))
+      );
+      const succeededIds = targets
+        .filter((b, i) => approveResults[i].status === 'fulfilled' && approveResults[i].value.ok)
+        .map(b => b.id);
+      if (succeededIds.length) {
+        const res = await fetch('/api/bols/mark-accounting-sent', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ record_ids: succeededIds }),
+        });
+        if (!res.ok) throw new Error(`Move to log failed (${res.status})`);
+      }
+      const skipped = targets.length - succeededIds.length;
+      setBulkResults({ action: 'moved to log', succeeded: succeededIds.length, total: targets.length, skipped });
+      await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setMovingToLogLoading(false);
     }
   }
 
@@ -1130,10 +1164,10 @@ export default function App() {
 
             <ThirdPartySection
               bols={thirdPartyBols}
-              approvingId={approvingId}
               unmarkingThirdPartyId={unmarkingThirdPartyId}
-              onApprove={handleApprove}
+              movingToLogLoading={movingToLogLoading}
               onUnmark={handleUnmarkThirdParty}
+              onMoveAllToLog={handleMoveThirdPartyToLog}
             />
 
             <ApprovedSection
