@@ -2320,7 +2320,13 @@ async def upload_alg_invoice(
             sender_str, sent_at = parsed
             logger.info("[UPLOAD] Folder name '%s' → sender='%s'", invoice_folder_name, sender_str)
         else:
-            logger.info("[UPLOAD] Folder name '%s' — not parseable, no sender metadata from it", invoice_folder_name)
+            # Doesn't match the expected "Name M-D-YYYY H-MMAM" shape — use the raw
+            # folder name as-is rather than leaving sender blank (issue #67). Any CSV
+            # uploaded from the same folder shares this identical string, so records
+            # stay grouped/batched together and filterable via the existing sender
+            # substring search even when the folder name doesn't parse.
+            sender_str = invoice_folder_name.strip()[:200]
+            logger.info("[UPLOAD] Folder name '%s' not parseable — using it as-is for sender", invoice_folder_name)
     if sender_str is None and invoice_sender and invoice_date:
         try:
             d = datetime.strptime(invoice_date, "%Y-%m-%d")
@@ -2470,11 +2476,14 @@ def poll_invoice_folder(db: Session = Depends(get_db)):
         entry_path = os.path.join(folder, entry)
         if os.path.isdir(entry_path):
             parsed = _parse_invoice_folder_name(entry)
-            sender_str, sent_at = (parsed[0], parsed[1]) if parsed else (None, None)
             if parsed:
+                sender_str, sent_at = parsed
                 logger.info("[POLL-FOLDER] Subfolder '%s' → sender='%s'", entry, sender_str)
             else:
-                logger.info("[POLL-FOLDER] Subfolder '%s' — name not parseable, no sender metadata", entry)
+                # Use the raw subfolder name as-is rather than leaving sender blank
+                # (issue #67) — see matching comment in upload_alg_invoice().
+                sender_str, sent_at = entry.strip()[:200], None
+                logger.info("[POLL-FOLDER] Subfolder '%s' not parseable — using it as-is for sender", entry)
             for fname in os.listdir(entry_path):
                 if fname.lower().endswith(".csv") and os.path.splitext(fname)[0].upper() not in existing_invoices:
                     file_queue.append((os.path.join(entry_path, fname), fname, sender_str, sent_at))
