@@ -5,6 +5,10 @@ function fmtMoney(val) {
   return `$${parseFloat(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+function amountCell(r) {
+  return r.is_do_not_pay ? 'DO NOT PAY' : fmtMoney(r.amount);
+}
+
 export default function EmailComposeModal({ records, senderLabel, onClose, onMarkSent }) {
   const [toField, setToField] = useState('');
   const [subjectField, setSubjectField] = useState(`SG360 BOL Invoices — ${senderLabel}`);
@@ -19,7 +23,7 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
         <td style="padding:6px 12px;border:1px solid #d1d5db;">${r.bol_number ?? '—'}</td>
         <td style="padding:6px 12px;border:1px solid #d1d5db;">${r.invoice_number || '—'}</td>
         <td style="padding:6px 12px;border:1px solid #d1d5db;">${r.invoice_email_sender || '—'}</td>
-        <td style="padding:6px 12px;border:1px solid #d1d5db;text-align:right;">${fmtMoney(r.amount)}</td>
+        <td style="padding:6px 12px;border:1px solid #d1d5db;text-align:right;">${amountCell(r)}</td>
       </tr>`).join('');
     return `<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;">
       <thead>
@@ -37,10 +41,10 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
   function buildPlainTable() {
     const pad = (s, n) => String(s).padEnd(n);
     const padL = (s, n) => String(s).padStart(n);
-    const header = `${pad('BOL', 10)} | ${pad('Invoice #', 10)} | ${pad('Sender', 32)} | Amount`;
-    const sep    = `${'-'.repeat(10)}-+-${'-'.repeat(10)}-+-${'-'.repeat(32)}-+----------`;
+    const header = `${pad('BOL', 10)} | ${pad('Invoice #', 10)} | ${pad('Sender', 32)} | ${pad('Amount', 11)}`;
+    const sep    = `${'-'.repeat(10)}-+-${'-'.repeat(10)}-+-${'-'.repeat(32)}-+-${'-'.repeat(11)}`;
     const rows = records.map(r =>
-      `${pad(r.bol_number ?? '—', 10)} | ${pad(r.invoice_number || '—', 10)} | ${pad(r.invoice_email_sender || '—', 32)} | ${padL(fmtMoney(r.amount), 9)}`
+      `${pad(r.bol_number ?? '—', 10)} | ${pad(r.invoice_number || '—', 10)} | ${pad(r.invoice_email_sender || '—', 32)} | ${padL(amountCell(r), 11)}`
     ).join('\n');
     return [header, sep, rows].join('\n');
   }
@@ -166,7 +170,7 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
                   </td>
                   <td style={{ padding: '6px 12px' }}>{r.invoice_number || '—'}</td>
                   <td style={{ padding: '6px 12px', color: '#6b7280', fontSize: 12 }}>{r.invoice_email_sender || '—'}</td>
-                  <td style={{ padding: '6px 12px', textAlign: 'right', fontWeight: 600 }}>{fmtMoney(r.amount)}</td>
+                  <td style={{ padding: '6px 12px', textAlign: 'right', fontWeight: 600, color: r.is_do_not_pay ? '#dc2626' : undefined }}>{amountCell(r)}</td>
                 </tr>
               ))}
             </tbody>

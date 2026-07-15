@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import SummaryBar from './components/SummaryBar.jsx';
 import BOLTable from './components/BOLTable.jsx';
+import { isDoNotPayEligible } from './components/BOLRow.jsx';
 import ThirdPartySection from './components/ThirdPartySection.jsx';
-import IgnoredSection from './components/IgnoredSection.jsx';
 import ApprovedSection from './components/ApprovedSection.jsx';
 import FlagModal from './components/FlagModal.jsx';
 import ReassignInvoiceModal from './components/ReassignInvoiceModal.jsx';
@@ -35,7 +35,7 @@ export default function App() {
   const [unmarkingThirdPartyId, setUnmarkingThirdPartyId] = useState(null);
   const [reassignTargetId, setReassignTargetId] = useState(null);
   const [reassignSubmitting, setReassignSubmitting] = useState(false);
-  const [ignoringId, setIgnoringId] = useState(null);
+  const [markingDoNotPayId, setMarkingDoNotPayId] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'log'
   const [pullLoading, setPullLoading] = useState(false);
   const [pollFolderLoading, setPollFolderLoading] = useState(false);
@@ -62,10 +62,9 @@ export default function App() {
   const [bulkFlagOpen, setBulkFlagOpen] = useState(false);
   const [bulkResults, setBulkResults] = useState(null); // { action, succeeded, total, skipped }
 
-  const thirdPartyBols     = pendingBols.filter(b => b.is_third_party);
-  const visiblePendingBols = pendingBols.filter(b => !b.is_third_party && !b.is_ignored);
-  const ignoredBols        = pendingBols.filter(b => b.is_ignored && !b.is_third_party);
-  const eligibleToIgnore   = visiblePendingBols.filter(b => b.technique_trip == null && b.invoice_number);
+  const thirdPartyBols      = pendingBols.filter(b => b.is_third_party);
+  const visiblePendingBols  = pendingBols.filter(b => !b.is_third_party);
+  const eligibleForDoNotPay = visiblePendingBols.filter(isDoNotPayEligible);
 
   const readyToReviewBols = visiblePendingBols.filter(b => b.technique_trip != null && b.amount != null);
 
@@ -371,19 +370,19 @@ export default function App() {
     }
   }
 
-  async function handleBulkIgnore() {
+  async function handleBulkDoNotPay() {
     const all = selectedRecords();
-    const eligible = all.filter(b => b.technique_trip == null && b.invoice_number && !b.is_ignored);
+    const eligible = all.filter(isDoNotPayEligible);
     const skipped = all.length - eligible.length;
     if (!all.length) return;
     setBulkActionLoading(true);
     try {
       const results = await Promise.allSettled(
-        eligible.map(b => fetch(`/api/bols/${b.id}/ignore`, { method: 'POST' }))
+        eligible.map(b => fetch(`/api/bols/${b.id}/mark-do-not-pay`, { method: 'POST' }))
       );
       const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
-      setBulkResults({ action: 'ignored', succeeded, total: all.length, skipped });
-      await fetchPending();
+      setBulkResults({ action: 'marked do-not-pay', succeeded, total: all.length, skipped });
+      await Promise.all([fetchPending(), fetchApproved()]);
       clearSelection();
     } catch (err) {
       setError(err.message);
@@ -392,16 +391,16 @@ export default function App() {
     }
   }
 
-  async function handleIgnoreAllEligible() {
-    if (!eligibleToIgnore.length) return;
+  async function handleDoNotPayAllEligible() {
+    if (!eligibleForDoNotPay.length) return;
     setBulkActionLoading(true);
     try {
       const results = await Promise.allSettled(
-        eligibleToIgnore.map(b => fetch(`/api/bols/${b.id}/ignore`, { method: 'POST' }))
+        eligibleForDoNotPay.map(b => fetch(`/api/bols/${b.id}/mark-do-not-pay`, { method: 'POST' }))
       );
       const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
-      setBulkResults({ action: 'ignored', succeeded, total: eligibleToIgnore.length, skipped: 0 });
-      await fetchPending();
+      setBulkResults({ action: 'marked do-not-pay', succeeded, total: eligibleForDoNotPay.length, skipped: 0 });
+      await Promise.all([fetchPending(), fetchApproved()]);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -411,7 +410,7 @@ export default function App() {
 
   async function handleBulkExportSid() {
     const all = selectedRecords();
-    const eligible = all.filter(b => b.needs_sid_export && b.manifest && !b.is_third_party && !b.is_ignored);
+    const eligible = all.filter(b => b.needs_sid_export && b.manifest && !b.is_third_party && !b.is_do_not_pay);
     const skipped = all.length - eligible.length;
     if (!all.length) return;
     setBulkActionLoading(true);
@@ -732,18 +731,21 @@ export default function App() {
     }
   }
 
-  async function handleIgnore(recordId, shouldIgnore) {
-    setIgnoringId(recordId);
+  async function handleDoNotPay(recordId, shouldMark) {
+    setMarkingDoNotPayId(recordId);
     try {
-      const route = shouldIgnore ? 'ignore' : 'unignore';
+      const route = shouldMark ? 'mark-do-not-pay' : 'unmark-do-not-pay';
       const res = await fetch(`/api/bols/${recordId}/${route}`, { method: 'POST' });
-      if (!res.ok) throw new Error(`${route} failed (${res.status})`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `${route} failed (${res.status})`);
+      }
       setReassignTargetId(null);
-      await fetchPending();
+      await Promise.all([fetchPending(), fetchApproved()]);
     } catch (err) {
       setError(err.message);
     } finally {
-      setIgnoringId(null);
+      setMarkingDoNotPayId(null);
     }
   }
 
@@ -1081,7 +1083,7 @@ export default function App() {
               approvingId={approvingId}
               unflaggingId={unflaggingId}
               markingThirdPartyId={markingThirdPartyId}
-              ignoringId={ignoringId}
+              markingDoNotPayId={markingDoNotPayId}
               exportingSidId={exportingSidId}
               checkingBolId={checkingBolId}
               retryingMatchId={retryingMatchId}
@@ -1098,11 +1100,33 @@ export default function App() {
               onNotesUpdate={handleNotesUpdate}
               onMarkThirdParty={handleMarkThirdParty}
               onReassignOpen={id => setReassignTargetId(id)}
-              onIgnore={handleIgnore}
+              onDoNotPay={handleDoNotPay}
               onExportSid={handleExportRecordToProphecy}
               onCheckBol={handleCheckBol}
               onRetryMatch={handleRetryMatch}
             />
+
+            {eligibleForDoNotPay.length > 0 && (
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 16 }}>
+                <button
+                  onClick={handleDoNotPayAllEligible}
+                  disabled={bulkActionLoading}
+                  title="Mark every remaining eligible invoice-only record as Do Not Pay"
+                  style={{
+                    background: bulkActionLoading ? '#e5e7eb' : '#f3f4f6',
+                    color: bulkActionLoading ? '#9ca3af' : '#374151',
+                    border: '1px solid #d1d5db',
+                    borderRadius: 5,
+                    padding: '5px 12px',
+                    fontWeight: 600,
+                    fontSize: 12,
+                    cursor: bulkActionLoading ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {bulkActionLoading ? 'Marking…' : `Do Not Pay All (${eligibleForDoNotPay.length})`}
+                </button>
+              </div>
+            )}
 
             <ThirdPartySection
               bols={thirdPartyBols}
@@ -1112,22 +1136,15 @@ export default function App() {
               onUnmark={handleUnmarkThirdParty}
             />
 
-            <IgnoredSection
-              bols={ignoredBols}
-              eligibleCount={eligibleToIgnore.length}
-              unignoringId={ignoringId}
-              bulkLoading={bulkActionLoading}
-              onUnignore={id => handleIgnore(id, false)}
-              onIgnoreAll={handleIgnoreAllEligible}
-            />
-
             <ApprovedSection
               approvedBols={approvedBols}
               loading={loadingApproved && approvedBols.length === 0}
               sidLoading={sidLoading}
               sidExportedThisSession={sidExportedThisSession}
               unapprovingId={unapprovingId}
+              undoingDoNotPayId={markingDoNotPayId}
               onUnapprove={handleUnapprove}
+              onUndoDoNotPay={id => handleDoNotPay(id, false)}
               onExportProphecy={handleExportProphecy}
               onRefetchBols={handleRefetchBols}
               onMarkSent={handleMarkSent}
@@ -1162,7 +1179,7 @@ export default function App() {
           submitting={reassignSubmitting}
           onClose={() => setReassignTargetId(null)}
           onReassign={handleReassignInvoice}
-          onIgnore={handleIgnore}
+          onDoNotPay={handleDoNotPay}
         />
       )}
 
@@ -1172,7 +1189,7 @@ export default function App() {
         onApprove={handleBulkApprove}
         onFlag={openBulkFlag}
         onMarkThirdParty={handleBulkMarkThirdParty}
-        onIgnore={handleBulkIgnore}
+        onDoNotPay={handleBulkDoNotPay}
         onExportSid={handleBulkExportSid}
         onClear={clearSelection}
       />

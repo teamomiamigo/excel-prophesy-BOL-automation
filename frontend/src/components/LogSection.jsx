@@ -232,7 +232,7 @@ export default function LogSection() {
                   <td style={TD}>{r.bol_number ?? <span style={{ color: '#9ca3af' }}>—</span>}</td>
                   <td style={{ ...TD, color: '#6b7280', fontSize: 12 }}>{r.invoice_email_sender || '—'}</td>
                   <td style={{ ...TD, fontWeight: 600 }}>{r.invoice_number || '—'}</td>
-                  <td style={{ ...TD_R, fontWeight: 600 }}>{fmtMoney(r.amount)}</td>
+                  <td style={{ ...TD_R, fontWeight: 600, color: r.is_do_not_pay ? '#dc2626' : undefined }}>{r.is_do_not_pay ? 'DNP' : fmtMoney(r.amount)}</td>
                   <td style={TD_R}>{fmtMoney(r.access_prog)}</td>
                   <td style={TD_R}>{fmtCostPct(r.cost_pct)}</td>
                   <td style={TD}><StatusBadge status={r.status} /></td>

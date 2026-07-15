@@ -105,8 +105,8 @@ All live-mode dependencies (`pyodbc`, `sqlalchemy[mssql]`, `boto3`, `mangum`) ar
 | POST | `/api/bols/{id}/unflag` | Remove flag from a record |
 | POST | `/api/bols/{id}/mark-third-party` | Mark as third-party (customer pays direct); excludes from SID export |
 | POST | `/api/bols/{id}/unmark-third-party` | Revert third-party record back to pending queue |
-| POST | `/api/bols/{id}/ignore` | Mark record as ignored — stays in log, excluded from exports, reversible |
-| POST | `/api/bols/{id}/unignore` | Remove ignored flag |
+| POST | `/api/bols/{id}/mark-do-not-pay` | Mark an unmatched invoice-only record as do-not-pay — approves it into its sender's Approved batch, renders "DO NOT PAY" instead of an amount; reversible |
+| POST | `/api/bols/{id}/unmark-do-not-pay` | Undo do-not-pay — reverts to pending review, same as unapprove |
 | POST | `/api/bols/mark-accounting-sent` | Set `accounting_exported_at = now()` on a list of record IDs; removes them from Approved view |
 | POST | `/api/bols/{id}/reassign-invoice` | Move invoice to a different trip/BOL/manifest; body: `{ target, action: preview\|merge\|replace }` |
 | PATCH | `/api/bols/{id}/notes` | Auto-save notes field; not currently called by any UI (input removed from `BOLRow.jsx` 2026-07-14 pending a notes redesign) |
@@ -286,7 +286,8 @@ Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — show
 - `base_tariff` / `fsc_pct` (Numeric): rate breakdown tooltip; `access_prog = base_tariff × (1 + fsc_pct)`
 - `alg_fsc_pct` / `alg_fsc_cost` (Numeric): ALG's own reported FSC rate/cost for the matched invoice, parsed from the CSV's "Fuel Surcharge" row — this is what feeds `fsc_pct` now, not EIA
 - `tariff_zone_approximate` / `weight_source_fallback` (Boolean, default False): flag when `access_prog` had to approximate a rate or fall back to ALG's own weight — see "Key variance metric"
-- `is_third_party` / `is_ignored` (Boolean): both exclude from SID + accounting exports; reversible
+- `is_third_party` (Boolean): excludes from SID + accounting exports; reversible
+- `is_do_not_pay` (Boolean): marks an unmatched invoice-only record do-not-pay — unlike `is_third_party`, does NOT exclude from the accounting export; it's included and rendered as "DO NOT PAY"/"DNP" instead of an amount. Setting it also sets `status=approved`. Reversible
 - `needs_sid_export` (Boolean): True = Type A record (no BOL yet); False = Type B (BOL already in Prophecy)
 - `match_strategy` (String): how the invoice was matched — `"trip"`, `"bol"`, or null for stubs
 - `accounting_exported_at` nullable DateTime — set when "Send to Accounting" runs; exposed in Log tab
@@ -341,13 +342,12 @@ frontend/src/App.jsx     — Owns all state + fetch/mutation handlers; passes da
 frontend/src/components/
   SummaryBar.jsx              — Pending/approved/flagged counts strip
   BOLTable.jsx                — Pending + flagged records table (wraps BOLRow)
-  BOLRow.jsx                  — Single record row; Approve, Flag, Third-party, Ignore buttons
-  ApprovedSection.jsx         — Approved records table + SID export + Send to Accounting flow
+  BOLRow.jsx                  — Single record row; Approve, Flag, Third-party, Do Not Pay buttons; also exports isDoNotPayEligible()
+  ApprovedSection.jsx         — Approved records grouped into per-sender batch cards + SID export + Send to Accounting flow; do-not-pay rows render "DO NOT PAY" and an Undo action
   ThirdPartySection.jsx       — Third-party records (customer pays direct); excluded from SID export
-  IgnoredSection.jsx          — Ignored invoice-only stub records; one-click "Ignore All" for remaining eligible stubs
   FlagModal.jsx               — Modal overlay for entering a flag reason
   ReassignInvoiceModal.jsx    — Modal for moving an invoice to a different trip (preview/merge/replace)
-  BulkActionToolbar.jsx       — Floating bar shown when rows are multi-selected; bulk approve/flag/third-party/ignore
+  BulkActionToolbar.jsx       — Floating bar shown when rows are multi-selected; bulk approve/flag/third-party/do-not-pay
   EmailComposeModal.jsx       — Builds an HTML table for selected records and calls mark-accounting-sent on send
   LogSection.jsx              — Historical log viewer (separate tab)
 ```

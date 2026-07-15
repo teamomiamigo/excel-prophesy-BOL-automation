@@ -9,7 +9,7 @@ const BTN = {
 
 export default function BulkActionToolbar({
   count, loading,
-  onApprove, onFlag, onMarkThirdParty, onIgnore, onExportSid, onClear,
+  onApprove, onFlag, onMarkThirdParty, onDoNotPay, onExportSid, onClear,
 }) {
   if (!count) return null;
 
@@ -63,12 +63,12 @@ export default function BulkActionToolbar({
       </button>
 
       <button
-        onClick={onIgnore}
+        onClick={onDoNotPay}
         disabled={loading}
-        title="Ignore eligible selected records (invoice-only stubs)"
+        title="Do Not Pay eligible selected records (invoice-only stubs) — approves them into their sender's batch"
         style={{ ...BTN, background: loading ? '#374151' : '#f3f4f6', color: loading ? '#9ca3af' : '#374151', opacity: loading ? 0.6 : 1 }}
       >
-        Ignore
+        Do Not Pay
       </button>
 
       <button

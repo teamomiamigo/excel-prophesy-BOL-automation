@@ -59,11 +59,18 @@ async def lifespan(app: FastAPI):
                 raise
             logger.info("DB schema already created by a concurrent cold start; continuing.")
         logger.info("DB tables verified/created.")
+        # Postgres native enums don't pick up new Python enum members automatically —
+        # ADD VALUE must run as its own statement (can't share a transaction with the
+        # ADD COLUMN batch below on older Postgres versions), hence its own connection.
+        with engine.connect() as _enum_conn:
+            _enum_conn.execute(text("ALTER TYPE actiontype ADD VALUE IF NOT EXISTS 'DO_NOT_PAY'"))
+            _enum_conn.commit()
         with engine.connect() as _conn:
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS base_tariff NUMERIC(10,2)"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS fsc_pct NUMERIC(8,6)"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_third_party BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_ignored BOOLEAN NOT NULL DEFAULT FALSE"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_do_not_pay BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS invoice_sent_at TIMESTAMP WITH TIME ZONE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS alg_fsc_pct NUMERIC(8,6)"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS alg_fsc_cost NUMERIC(10,2)"))
@@ -71,8 +78,8 @@ async def lifespan(app: FastAPI):
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS weight_source_fallback BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.commit()
         logger.info(
-            "DB column migration for base_tariff/fsc_pct/is_third_party/is_ignored/invoice_sent_at/"
-            "alg_fsc_pct/alg_fsc_cost/tariff_zone_approximate/weight_source_fallback complete."
+            "DB column migration for base_tariff/fsc_pct/is_third_party/is_ignored(orphaned)/is_do_not_pay/"
+            "invoice_sent_at/alg_fsc_pct/alg_fsc_cost/tariff_zone_approximate/weight_source_fallback complete."
         )
     logger.info(
         "SG360 BOL API started. Mock mode: %s | Version: %s",
@@ -477,37 +484,80 @@ def unmark_third_party(
     return row
 
 
-@app.post("/api/bols/{record_id}/ignore", response_model=BOLSummary, tags=["BOLs"])
-def ignore_bol(record_id: str, db: Session = Depends(get_db)):
-    """Mark a record as ignored — stays in log, excluded from exports, reversible."""
+@app.post("/api/bols/{record_id}/mark-do-not-pay", response_model=BOLSummary, tags=["BOLs"])
+def mark_do_not_pay(record_id: str, db: Session = Depends(get_db)):
+    """
+    Mark an unresolvable invoice-only record as do-not-pay: approves it (so it
+    joins its sender's batch in the Approved section) and flags it to render
+    "DO NOT PAY" instead of a dollar amount everywhere. Reversible via
+    unmark-do-not-pay. Only valid for records with no Technique match at all
+    (invoice-only / Wolf-311 stubs) — same population the old Ignore button targeted.
+    """
     if settings.USE_MOCK_DATA:
         rec = _find_mock(record_id)
-        rec["is_ignored"] = True
+        if rec.get("technique_trip") is not None or not rec.get("invoice_number"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only unmatched invoice-only records (no Technique trip) can be marked Do Not Pay.",
+            )
+        if rec.get("is_do_not_pay"):
+            return _record_to_summary(rec)
+        rec["status"] = "approved"
+        rec["approved_at"] = datetime.now(timezone.utc)
+        rec["approved_by"] = "coordinator"
+        rec["flag_reason"] = None
+        rec["is_do_not_pay"] = True
         rec["updated_at"] = datetime.now(timezone.utc)
         return _record_to_summary(rec)
+
     row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
     if not row:
         raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
-    row.is_ignored = True
-    row.updated_at = datetime.now(timezone.utc)
+    if row.technique_trip is not None or not row.invoice_number:
+        raise HTTPException(
+            status_code=400,
+            detail="Only unmatched invoice-only records (no Technique trip) can be marked Do Not Pay.",
+        )
+    if row.is_do_not_pay:
+        return row
+    row.status = BOLStatus.APPROVED
+    row.approved_at = datetime.now(timezone.utc)
+    row.approved_by = "coordinator"
+    row.flag_reason = None
+    row.is_do_not_pay = True
+    db.add(ApprovalHistory(
+        bol_id=row.id,
+        action=ActionType.DO_NOT_PAY,
+        performed_by="coordinator",
+    ))
     db.commit()
     db.refresh(row)
     return row
 
 
-@app.post("/api/bols/{record_id}/unignore", response_model=BOLSummary, tags=["BOLs"])
-def unignore_bol(record_id: str, db: Session = Depends(get_db)):
-    """Remove ignored flag from a record."""
+@app.post("/api/bols/{record_id}/unmark-do-not-pay", response_model=BOLSummary, tags=["BOLs"])
+def unmark_do_not_pay(record_id: str, db: Session = Depends(get_db)):
+    """Undo a do-not-pay marking — reverts to pending review, same as unapprove."""
     if settings.USE_MOCK_DATA:
         rec = _find_mock(record_id)
-        rec["is_ignored"] = False
+        rec["status"] = "pending"
+        rec["approved_at"] = None
+        rec["approved_by"] = None
+        rec["is_do_not_pay"] = False
         rec["updated_at"] = datetime.now(timezone.utc)
         return _record_to_summary(rec)
     row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
     if not row:
         raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
-    row.is_ignored = False
-    row.updated_at = datetime.now(timezone.utc)
+    row.status = BOLStatus.PENDING
+    row.approved_at = None
+    row.approved_by = None
+    row.is_do_not_pay = False
+    db.add(ApprovalHistory(
+        bol_id=row.id,
+        action=ActionType.REOPENED,
+        performed_by="coordinator",
+    ))
     db.commit()
     db.refresh(row)
     return row
@@ -2773,7 +2823,7 @@ def export_prophecy_sid(db: Session = Depends(get_db)):
             if r["status"] == "approved"
             and r.get("needs_sid_export", True)
             and not r.get("is_third_party", False)
-            and not r.get("is_ignored", False)
+            and not r.get("is_do_not_pay", False)
         ]
         if not approved:
             raise HTTPException(
@@ -2801,7 +2851,7 @@ def export_prophecy_sid(db: Session = Depends(get_db)):
             BOLRecord.status == BOLStatus.APPROVED,
             BOLRecord.needs_sid_export == True,
             BOLRecord.is_third_party == False,
-            BOLRecord.is_ignored == False,
+            BOLRecord.is_do_not_pay == False,
         )
         .all()
     )
@@ -3170,13 +3220,13 @@ def export_approved_bols(
     if settings.USE_MOCK_DATA:
         # In mock mode return all approved records regardless of date —
         # mock data doesn't represent real daily batches.
-        approved = [r for r in _mock_state.values() if r["status"] == "approved" and not r.get("is_ignored", False)]
+        approved = [r for r in _mock_state.values() if r["status"] == "approved" and not r.get("is_do_not_pay", False)]
     else:
         rows = (
             db.query(BOLRecord)
             .filter(
                 BOLRecord.status == BOLStatus.APPROVED,
-                BOLRecord.is_ignored == False,
+                BOLRecord.is_do_not_pay == False,
                 BOLRecord.approved_at >= datetime(
                     target.year, target.month, target.day, tzinfo=timezone.utc
                 ),

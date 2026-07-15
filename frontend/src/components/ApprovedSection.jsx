@@ -69,7 +69,9 @@ export default function ApprovedSection({
   sidLoading,
   sidExportedThisSession,
   unapprovingId,
+  undoingDoNotPayId,
   onUnapprove,
+  onUndoDoNotPay,
   onExportProphecy,
   onRefetchBols,
   onMarkSent,
@@ -158,7 +160,9 @@ export default function ApprovedSection({
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {batches.map((batch, idx) => {
             const isExpanded = !collapsedGroups.has(batch.label);
-            const total = batch.records.reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
+            const total = batch.records
+              .filter(r => !r.is_do_not_pay)
+              .reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
             const missingBolCount = batch.records.filter(r => r.technique_trip && !r.bol_number).length;
             const isRefetching = refetchingKey === batch.label;
 
@@ -259,6 +263,7 @@ export default function ApprovedSection({
                       <tbody>
                         {batch.records.map(bol => {
                           const isUnapproving = unapprovingId === bol.id;
+                          const isUndoingDoNotPay = undoingDoNotPayId === bol.id;
                           return (
                             <tr key={bol.id} style={{ background: '#f0fdf4' }}>
                               <td style={TD}>{bol.technique_trip || '—'}</td>
@@ -271,27 +276,49 @@ export default function ApprovedSection({
                               <td style={TD_R}>{fmtNum(bol.technique_pcs)}</td>
                               <td style={{ ...TD, fontWeight: 600 }}>{bol.invoice_number || '—'}</td>
                               <td style={TD_R}>{fmtMoney(bol.access_prog)}</td>
-                              <td style={{ ...TD_R, fontWeight: 600 }}>{fmtMoney(bol.amount)}</td>
+                              <td style={{ ...TD_R, fontWeight: 600, color: bol.is_do_not_pay ? '#dc2626' : undefined }}>
+                                {bol.is_do_not_pay ? 'DO NOT PAY' : fmtMoney(bol.amount)}
+                              </td>
                               <td style={{ ...TD_R, color: '#16a34a', fontWeight: 600 }}>
-                                {fmtCostPct(bol.cost_pct)}
+                                {bol.is_do_not_pay ? '—' : fmtCostPct(bol.cost_pct)}
                               </td>
                               <td style={{ ...TD, textAlign: 'center' }}>
-                                <button
-                                  onClick={() => onUnapprove(bol.id)}
-                                  disabled={isUnapproving}
-                                  style={{
-                                    background: isUnapproving ? '#f3f4f6' : '#fff',
-                                    color: isUnapproving ? '#9ca3af' : '#6b7280',
-                                    border: '1px solid #d1d5db',
-                                    borderRadius: 4,
-                                    padding: '4px 10px',
-                                    fontSize: 12,
-                                    fontWeight: 600,
-                                    cursor: isUnapproving ? 'not-allowed' : 'pointer',
-                                  }}
-                                >
-                                  {isUnapproving ? '…' : '↩ Revert'}
-                                </button>
+                                {bol.is_do_not_pay ? (
+                                  <button
+                                    onClick={() => onUndoDoNotPay(bol.id)}
+                                    disabled={isUndoingDoNotPay}
+                                    title="Undo Do Not Pay — reverts this record to pending review"
+                                    style={{
+                                      background: isUndoingDoNotPay ? '#f3f4f6' : '#fff',
+                                      color: isUndoingDoNotPay ? '#9ca3af' : '#6b7280',
+                                      border: '1px solid #d1d5db',
+                                      borderRadius: 4,
+                                      padding: '4px 10px',
+                                      fontSize: 12,
+                                      fontWeight: 600,
+                                      cursor: isUndoingDoNotPay ? 'not-allowed' : 'pointer',
+                                    }}
+                                  >
+                                    {isUndoingDoNotPay ? '…' : '↩ Undo Do Not Pay'}
+                                  </button>
+                                ) : (
+                                  <button
+                                    onClick={() => onUnapprove(bol.id)}
+                                    disabled={isUnapproving}
+                                    style={{
+                                      background: isUnapproving ? '#f3f4f6' : '#fff',
+                                      color: isUnapproving ? '#9ca3af' : '#6b7280',
+                                      border: '1px solid #d1d5db',
+                                      borderRadius: 4,
+                                      padding: '4px 10px',
+                                      fontSize: 12,
+                                      fontWeight: 600,
+                                      cursor: isUnapproving ? 'not-allowed' : 'pointer',
+                                    }}
+                                  >
+                                    {isUnapproving ? '…' : '↩ Revert'}
+                                  </button>
+                                )}
                               </td>
                             </tr>
                           );
