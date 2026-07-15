@@ -1,13 +1,29 @@
 import { useState } from 'react';
 
 // Do Not Pay is only offered for invoice-only stubs with no Technique/Prophecy
-// match at all — a fresh 'invoice_only' stub with no bol_number gets a "Retry"
-// button instead (still worth another Technique lookup). Shared with App.jsx
-// so eligibility can't drift out of sync with this row's own button condition.
+// match at all — a fresh 'invoice_only' stub with no bol_number gets Retry/3P
+// buttons instead (still worth another Technique lookup, or writing it off as
+// third-party if it'll never match). Shared with App.jsx so eligibility can't
+// drift out of sync with this row's own button condition.
 export function isDoNotPayEligible(bol) {
   return bol.technique_trip == null
     && !!bol.invoice_number
     && !(bol.match_strategy === 'invoice_only' && !bol.bol_number);
+}
+
+// Third-party covers two distinct populations: (1) pre-invoice Technique records
+// (technique_trip set, no amount/BOL yet — "this shipment will never get an ALG
+// invoice"), and (2) invoice-only stubs that never matched any Technique/Prophecy
+// record at all (no technique_trip, no BOL — the invoice itself may still carry
+// an amount, since ALG billed something we just can't identify). Once a record has
+// BOTH a real technique_trip AND an amount, it's a normal matched/invoiced Corp
+// record and shouldn't be retroactively marked third-party. Once bol_number exists,
+// it's already tied to a real Prophecy load. Shared with App.jsx and the backend
+// guard in mark_third_party so eligibility can't drift.
+export function isThirdPartyEligible(bol) {
+  return !bol.is_third_party
+    && !bol.bol_number
+    && !(bol.technique_trip && bol.amount);
 }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +91,10 @@ const PLACEHOLDER = { width: '100%', height: 26 };
 export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isMarkingDoNotPay, isExportingSid, isCheckingBol, isRetryingMatch, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onDoNotPay, onExportSid, onCheckBol, onRetryMatch, onToggleSelect }) {
   const [hovered, setHovered] = useState(false);
   const isFlagged = bol.status === 'flagged';
+  // Invoice-only stub that never matched any Technique/Prophecy record — Retry
+  // (try again next pull) and 3P (write it off as third-party) are both offered,
+  // since a stub like this can otherwise sit forever with no way to resolve it.
+  const isUnresolvedInvoiceOnly = bol.technique_trip == null && bol.match_strategy === 'invoice_only' && !bol.bol_number;
 
   const rowBg = isFlagged
     ? '#fffbeb'
@@ -113,12 +133,16 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
         }
       </td>
 
-      {/* Technique quantities — substituted with Prophecy (plain text + indigo P marker) for Wolf/311 rows */}
+      {/* Technique quantities — substituted with Prophecy (plain text + indigo P marker) for Wolf/311 rows.
+          A record with neither a technique_trip nor Prophecy data (a genuinely unmatched invoice-only
+          stub) has no independent baseline at all — technique_weight/pallets/pcs are 0 there only
+          because the DB columns are non-nullable, not because we know our own quantity is zero. */}
       {(() => {
         const isP = !bol.technique_trip && (bol.prophecy_weight != null || bol.prophecy_pallets != null);
-        const wgt = isP ? bol.prophecy_weight  : bol.technique_weight;
-        const pal = isP ? bol.prophecy_pallets : bol.technique_pallets;
-        const pcs = isP ? bol.prophecy_pcs     : bol.technique_pcs;
+        const hasNoBaseline = !bol.technique_trip && bol.prophecy_weight == null && bol.prophecy_pallets == null;
+        const wgt = hasNoBaseline ? null : (isP ? bol.prophecy_weight  : bol.technique_weight);
+        const pal = hasNoBaseline ? null : (isP ? bol.prophecy_pallets : bol.technique_pallets);
+        const pcs = hasNoBaseline ? null : (isP ? bol.prophecy_pcs     : bol.technique_pcs);
         const P = isP ? <sup style={{ fontSize: 9, marginLeft: 2, opacity: 0.85, color: '#6366f1', fontWeight: 700 }}>P</sup> : null;
         return (
           <>
@@ -314,60 +338,83 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
           {/* Divider between routine and exception-handling actions */}
           <div style={{ width: 1, alignSelf: 'stretch', background: '#e5e7eb' }} />
 
-          {/* Exception zone: 3P | Ignore | Unignore — mutually exclusive, one fixed slot */}
-          <div style={{ width: 44 }}>
-            {!bol.amount && !bol.bol_number && !bol.is_third_party ? (
-              <button
-                onClick={onMarkThirdParty}
-                disabled={isMarkingThirdParty}
-                title="Mark as third-party — customer pays freight directly"
-                style={{
-                  background: '#fff7ed',
-                  color: '#c2410c',
-                  border: '1px solid #fed7aa',
-                  borderRadius: 4,
-                  padding: '4px 0',
-                  width: '100%',
-                  fontSize: 11,
-                  fontWeight: 700,
-                  cursor: isMarkingThirdParty ? 'not-allowed' : 'pointer',
-                  opacity: isMarkingThirdParty ? 0.6 : 1,
-                  letterSpacing: '0.02em',
-                }}
-              >
-                {isMarkingThirdParty ? '…' : '3P'}
-              </button>
-            ) : bol.technique_trip == null && bol.invoice_number ? (
-              bol.match_strategy === 'invoice_only' && !bol.bol_number ? (
+          {/* Exception zone: 3P | Retry+3P | Do Not Pay — mutually exclusive except
+              the unresolved-invoice-only case, which offers both Retry and 3P */}
+          <div style={{ width: isUnresolvedInvoiceOnly ? 88 : 44 }}>
+            {isThirdPartyEligible(bol) ? (
+              isUnresolvedInvoiceOnly ? (
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <button
+                    onClick={onRetryMatch}
+                    disabled={isRetryingMatch}
+                    title="Check Technique again (21-day window) for a trip matching this invoice's job name"
+                    style={{
+                      background: isRetryingMatch ? '#e5e7eb' : '#f9fafb',
+                      color: '#374151',
+                      border: '1px solid #d1d5db',
+                      borderRadius: 4,
+                      padding: '4px 0',
+                      flex: 1,
+                      fontSize: 11,
+                      fontWeight: 600,
+                      cursor: isRetryingMatch ? 'not-allowed' : 'pointer',
+                      opacity: isRetryingMatch ? 0.7 : 1,
+                    }}
+                  >
+                    {isRetryingMatch ? '…' : '🔍'}
+                  </button>
+                  <button
+                    onClick={onMarkThirdParty}
+                    disabled={isMarkingThirdParty}
+                    title="Mark as third-party — customer pays freight directly"
+                    style={{
+                      background: '#fff7ed',
+                      color: '#c2410c',
+                      border: '1px solid #fed7aa',
+                      borderRadius: 4,
+                      padding: '4px 0',
+                      flex: 1,
+                      fontSize: 11,
+                      fontWeight: 700,
+                      cursor: isMarkingThirdParty ? 'not-allowed' : 'pointer',
+                      opacity: isMarkingThirdParty ? 0.6 : 1,
+                      letterSpacing: '0.02em',
+                    }}
+                  >
+                    {isMarkingThirdParty ? '…' : '3P'}
+                  </button>
+                </div>
+              ) : (
                 <button
-                  onClick={onRetryMatch}
-                  disabled={isRetryingMatch}
-                  title="Check Technique again (21-day window) for a trip matching this invoice's job name"
+                  onClick={onMarkThirdParty}
+                  disabled={isMarkingThirdParty}
+                  title="Mark as third-party — customer pays freight directly"
                   style={{
-                    background: isRetryingMatch ? '#e5e7eb' : '#f9fafb',
-                    color: '#374151',
-                    border: '1px solid #d1d5db',
+                    background: '#fff7ed',
+                    color: '#c2410c',
+                    border: '1px solid #fed7aa',
                     borderRadius: 4,
                     padding: '4px 0',
                     width: '100%',
                     fontSize: 11,
-                    fontWeight: 600,
-                    cursor: isRetryingMatch ? 'not-allowed' : 'pointer',
-                    opacity: isRetryingMatch ? 0.7 : 1,
+                    fontWeight: 700,
+                    cursor: isMarkingThirdParty ? 'not-allowed' : 'pointer',
+                    opacity: isMarkingThirdParty ? 0.6 : 1,
+                    letterSpacing: '0.02em',
                   }}
                 >
-                  {isRetryingMatch ? '…' : '🔍 Retry'}
-                </button>
-              ) : (
-                <button
-                  onClick={() => onDoNotPay && onDoNotPay(bol.id, true)}
-                  disabled={isMarkingDoNotPay}
-                  title="Do Not Pay — approves this record into its sender's Approved batch, shows DO NOT PAY instead of an amount"
-                  style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#9ca3af', cursor: isMarkingDoNotPay ? 'not-allowed' : 'pointer', textDecoration: 'underline', width: '100%' }}
-                >
-                  {isMarkingDoNotPay ? '…' : 'Do Not Pay'}
+                  {isMarkingThirdParty ? '…' : '3P'}
                 </button>
               )
+            ) : bol.technique_trip == null && bol.invoice_number ? (
+              <button
+                onClick={() => onDoNotPay && onDoNotPay(bol.id, true)}
+                disabled={isMarkingDoNotPay}
+                title="Do Not Pay — approves this record into its sender's Approved batch, shows DO NOT PAY instead of an amount"
+                style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#9ca3af', cursor: isMarkingDoNotPay ? 'not-allowed' : 'pointer', textDecoration: 'underline', width: '100%' }}
+              >
+                {isMarkingDoNotPay ? '…' : 'Do Not Pay'}
+              </button>
             ) : (
               <div style={PLACEHOLDER} />
             )}

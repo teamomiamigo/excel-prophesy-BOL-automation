@@ -430,13 +430,18 @@ def mark_third_party(
     db: Session = Depends(get_db),
 ):
     """Mark a record as third-party (customer pays freight directly).
-    Only valid for records with no_invoice=True. Idempotent."""
+    Covers two populations: pre-invoice Technique records (no amount/BOL yet),
+    and invoice-only stubs that never matched any Technique/Prophecy record at
+    all (no technique_trip, no BOL — the invoice may still carry an amount, since
+    ALG billed something we just can't identify). Blocked once a record has BOTH
+    a real technique_trip AND an amount (a normal matched/invoiced Corp record),
+    or once a BOL number exists (already tied to a real Prophecy load). Idempotent."""
     if settings.USE_MOCK_DATA:
         rec = _find_mock(record_id)
-        if rec.get("amount") is not None or rec.get("bol_number") is not None:
+        if rec.get("bol_number") is not None or (rec.get("technique_trip") is not None and rec.get("amount") is not None):
             raise HTTPException(
                 status_code=400,
-                detail="Only records with no matched invoice and no BOL number can be marked as third-party.",
+                detail="Only records with no BOL number, and not both a Technique trip and an invoice amount, can be marked as third-party.",
             )
         rec["is_third_party"] = True
         rec["updated_at"] = datetime.now(timezone.utc)
@@ -445,10 +450,10 @@ def mark_third_party(
     row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
     if not row:
         raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
-    if row.amount is not None or row.bol_number is not None:
+    if row.bol_number is not None or (row.technique_trip is not None and row.amount is not None):
         raise HTTPException(
             status_code=400,
-            detail="Only records with no matched invoice and no BOL number can be marked as third-party.",
+            detail="Only records with no BOL number, and not both a Technique trip and an invoice amount, can be marked as third-party.",
         )
     row.is_third_party = True
     row.updated_at = datetime.now(timezone.utc)
@@ -980,8 +985,22 @@ def _compute_diffs(row: "BOLRecord") -> None:
     prophecy_* populated), Technique quantities otherwise — same "is this Prophecy-
     sourced" check BOLRow.jsx uses on the frontend. Single source of truth: call this
     anywhere a diff needs (re)computing instead of duplicating the formula.
+
+    A record with neither a technique_trip nor Prophecy quantities (a genuinely
+    unmatched invoice-only stub) has no independent baseline at all — technique_weight/
+    pallets/pcs are 0 there only because the DB columns are non-nullable, not because
+    we actually know our own quantity is zero. Diffing against that sentinel would
+    just restate ALG's own number as a fake "difference", so leave diffs null instead.
     """
-    is_prophecy = not row.technique_trip and (row.prophecy_weight is not None or row.prophecy_pallets is not None)
+    has_technique = bool(row.technique_trip)
+    has_prophecy  = row.prophecy_weight is not None or row.prophecy_pallets is not None
+    if not has_technique and not has_prophecy:
+        row.weight_diff  = None
+        row.pallet_diff  = None
+        row.pcs_diff     = None
+        return
+
+    is_prophecy = not has_technique and has_prophecy
     ref_weight  = row.prophecy_weight  if is_prophecy else row.technique_weight
     ref_pallets = row.prophecy_pallets if is_prophecy else row.technique_pallets
     ref_pcs     = row.prophecy_pcs     if is_prophecy else row.technique_pcs
