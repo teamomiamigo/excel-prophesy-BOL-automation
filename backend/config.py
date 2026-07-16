@@ -4,6 +4,7 @@ import socket
 
 import boto3
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 # DNS resolution is broken for this Lambda's VPC/subnet combination — the
 # link-local resolver Lambda normally uses (169.254.x.x) is unreachable here,
@@ -109,5 +110,41 @@ def _load_aws_secrets(secret_name: str) -> dict:
     return json.loads(response["SecretString"])
 
 
+def _build_database_url_from_rds_secret(secret_arn: str, host: str, port: int, database: str) -> str:
+    # The RDS-managed secret (manage_master_user_password = true, aurora.tf) holds
+    # ONLY {"username", "password"} — AWS generates and auto-rotates it, so whatever
+    # AWSCURRENT currently holds is by definition never stale, unlike the old
+    # manually-synced copy in sg360-bol-live-credentials that caused the
+    # 2026-07-16 outage. host/port/database are static and come from Terraform-
+    # managed Lambda env vars (DB_HOST/DB_PORT/DB_NAME), not from this secret.
+    creds = _load_aws_secrets(secret_arn)
+    url = URL.create(
+        drivername="postgresql",
+        username=creds["username"],
+        password=creds["password"],
+        host=host,
+        port=port,
+        database=database,
+    )
+    # url.render_as_string()/str(url) default to hide_password=True (masks the
+    # password as "***") — correct for logging, wrong here, since this string
+    # is consumed directly by create_engine(). Must pass False explicitly.
+    return url.render_as_string(hide_password=False)
+
+
 _aws_secret_name = os.environ.get("AWS_SECRET_NAME")
 settings = Settings(**_load_aws_secrets(_aws_secret_name)) if _aws_secret_name else Settings()
+
+# DB credentials always come from AWS's own auto-rotated RDS-managed secret when
+# set — never from sg360-bol-live-credentials (that secret still supplies
+# SMTP/SQL-Server/EIA creds above, via _aws_secret_name, unchanged). Local/
+# mock-mode dev has no RDS_MASTER_SECRET_ARN env var, so settings.DATABASE_URL
+# is left exactly as Settings()/.env already set it.
+_rds_master_secret_arn = os.environ.get("RDS_MASTER_SECRET_ARN")
+if _rds_master_secret_arn:
+    settings.DATABASE_URL = _build_database_url_from_rds_secret(
+        _rds_master_secret_arn,
+        host=os.environ["DB_HOST"],
+        port=int(os.environ.get("DB_PORT", "5432")),
+        database=os.environ["DB_NAME"],
+    )

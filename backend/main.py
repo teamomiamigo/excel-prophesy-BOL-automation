@@ -65,11 +65,20 @@ async def lifespan(app: FastAPI):
         with engine.connect() as _enum_conn:
             _enum_conn.execute(text("ALTER TYPE actiontype ADD VALUE IF NOT EXISTS 'DO_NOT_PAY'"))
             _enum_conn.commit()
+        # RULE: when a column is removed from an ORM model (backend/models.py),
+        # its ADD COLUMN IF NOT EXISTS line below must be changed to a
+        # DROP COLUMN IF EXISTS line in the SAME commit — never just left in
+        # place. A Python-side SQLAlchemy `default=` is never a real Postgres
+        # DEFAULT; an orphaned NOT NULL column with no DB-level default
+        # rejects every future INSERT that omits it. This bit us on
+        # 2026-07-16 (is_ignored removed from the model in #69/2026-07-15, but
+        # left as ADD COLUMN IF NOT EXISTS here — the column already existed
+        # live, so IF NOT EXISTS silently made this line a permanent no-op).
         with engine.connect() as _conn:
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS base_tariff NUMERIC(10,2)"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS fsc_pct NUMERIC(8,6)"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_third_party BOOLEAN NOT NULL DEFAULT FALSE"))
-            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_ignored BOOLEAN NOT NULL DEFAULT FALSE"))
+            _conn.execute(text("ALTER TABLE bol_records DROP COLUMN IF EXISTS is_ignored"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_do_not_pay BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS invoice_sent_at TIMESTAMP WITH TIME ZONE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS alg_fsc_pct NUMERIC(8,6)"))
@@ -78,8 +87,9 @@ async def lifespan(app: FastAPI):
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS weight_source_fallback BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.commit()
         logger.info(
-            "DB column migration for base_tariff/fsc_pct/is_third_party/is_ignored(orphaned)/is_do_not_pay/"
-            "invoice_sent_at/alg_fsc_pct/alg_fsc_cost/tariff_zone_approximate/weight_source_fallback complete."
+            "DB column migration for base_tariff/fsc_pct/is_third_party/is_do_not_pay/"
+            "invoice_sent_at/alg_fsc_pct/alg_fsc_cost/tariff_zone_approximate/weight_source_fallback complete "
+            "(is_ignored dropped 2026-07-16 — see Developmental Documentation.md)."
         )
     logger.info(
         "SG360 BOL API started. Mock mode: %s | Version: %s",
