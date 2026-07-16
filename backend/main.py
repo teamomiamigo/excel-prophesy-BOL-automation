@@ -1022,7 +1022,28 @@ def _compute_diffs(row: "BOLRecord") -> None:
 def _trip_to_suffix(trip: str) -> str:
     """e.g. 'TEC_T_0110977' -> '110977'. Shared by invoice matching and stub re-matching."""
     parts = (trip or "").split("T_")
-    return str(int(parts[-1])) if len(parts) >= 2 else ""
+    if len(parts) < 2:
+        return ""
+    try:
+        return str(int(parts[-1]))
+    except ValueError:
+        return ""
+
+
+def _manifest_to_suffix(manifest: str) -> str:
+    """e.g. 'TEC_M_0228920' -> '228920'. Fallback matching key (issue #65) for invoices
+    whose Job Name reflects the manifest number rather than the trip number — a trip and
+    its manifest are genuinely different numbers, so this cannot reuse _trip_to_suffix()
+    (its 'T_' split finds nothing in a manifest string, e.g. 'TEC_M_...' has no 'T_').
+    Comingle manifests (e.g. 'CM_052926A') coincidentally contain 'M_' too but end in a
+    letter, not a pure number — caught and treated as no-suffix rather than raising."""
+    parts = (manifest or "").split("M_")
+    if len(parts) < 2:
+        return ""
+    try:
+        return str(int(parts[-1]))
+    except ValueError:
+        return ""
 
 
 def _create_technique_record_from_fallback(db: Session, m: dict, weight_data: dict) -> "BOLRecord":
@@ -1203,7 +1224,7 @@ def pull_technique_data(db: Session = Depends(get_db)):
         logger.info("[PULL] Re-matched %d invoice_only stub(s) to newly loaded manifests", rematched)
 
     # --- Wide fallback: stubs still unmatched may reference a real trip whose despatch
-    # date just falls outside this pull's narrow days_back=1 window. Check a much wider
+    # date just falls outside this pull's days_back=20 window. Check a much wider
     # window once, rather than never re-checking Technique at all for these. ---
     remaining_stubs = db.query(BOLRecord).filter(
         BOLRecord.match_strategy == "invoice_only", BOLRecord.bol_number.is_(None)
@@ -2132,6 +2153,56 @@ def _process_invoice_csv(
                     matched_rec["notes"] = f"{existing_notes} {loose_match_note}" if existing_notes else loose_match_note
                 else:
                     matched_rec.notes = f"{matched_rec.notes} {loose_match_note}" if matched_rec.notes else loose_match_note
+        else:
+            # 2b. No trip-suffix match at all — the invoice's Job Name may instead reflect
+            # the MANIFEST number rather than the trip number (issue #65). A trip and its
+            # manifest are genuinely different numbers (e.g. Trip TEC_T_0109878 vs Manifest
+            # TEC_M_0228920), so an invoice keyed to the manifest would never match Strategy
+            # 2's trip-suffix search above. No trip-sum synthetic candidate here — summing
+            # several *different* manifests that only coincidentally share a matched suffix
+            # doesn't mean the invoice covers all of them, unlike manifests of the same trip.
+            if settings.USE_MOCK_DATA:
+                manifest_candidates = [
+                    rec for rec in _mock_state.values()
+                    if (rec.get("manifest") or "") and _manifest_to_suffix(rec["manifest"]) == job_name
+                ]
+            else:
+                manifest_candidates = [
+                    row_obj for row_obj in db.query(BOLRecord).filter(BOLRecord.manifest.isnot(None)).all()
+                    if _manifest_to_suffix(row_obj.manifest or "") == job_name
+                ]
+            if len(manifest_candidates) == 1:
+                matched_rec = manifest_candidates[0]
+                match_strategy = "job_name"
+                logger.info(
+                    "[INVOICE] %s -> matched via manifest suffix '%s' (no trip suffix match found)",
+                    invoice_no, job_name,
+                )
+            elif len(manifest_candidates) > 1:
+                best, score = _closest_technique_match(manifest_candidates, total_weight, total_pallets, total_pcs)
+                matched_rec = best
+                match_strategy = "job_name"
+                if score > _CLOSE_MATCH_THRESHOLD:
+                    loose_match_note = (
+                        f"Matched via closest-quantity heuristic among {len(manifest_candidates)} "
+                        f"manifests sharing suffix '{job_name}' (discrepancy score {score:.2f}) — verify manually."
+                    )
+                    logger.warning(
+                        "[INVOICE] %s -> closest match among %d manifest-suffix candidates '%s' "
+                        "still has a large discrepancy (score=%.3f) - verify manually",
+                        invoice_no, len(manifest_candidates), job_name, score,
+                    )
+                else:
+                    logger.info(
+                        "[INVOICE] %s -> matched to closest of %d manifest-suffix candidates '%s' (score=%.3f)",
+                        invoice_no, len(manifest_candidates), job_name, score,
+                    )
+                if loose_match_note:
+                    if settings.USE_MOCK_DATA:
+                        existing_notes = matched_rec.get("notes")
+                        matched_rec["notes"] = f"{existing_notes} {loose_match_note}" if existing_notes else loose_match_note
+                    else:
+                        matched_rec.notes = f"{matched_rec.notes} {loose_match_note}" if matched_rec.notes else loose_match_note
 
     # 3. Job Name as a Prophecy BOL (Wolf/311 — no Technique trip for this load). Only
     # reached once steps 1-2 have ruled out this being an ordinary trip suffix.
@@ -3099,11 +3170,42 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     from backend.data_layer import get_technique_data, get_manifest_weights
 
     manifests = _dedupe_technique_rows(get_technique_data(days_back=21))
-    match = next((m for m in manifests if _trip_to_suffix(m.get("technique_trip") or "") == job_name_s), None)
-    if match is None:
+    candidates = [m for m in manifests if _trip_to_suffix(m.get("technique_trip") or "") == job_name_s]
+    if not candidates:
+        # Fall back to manifest-suffix matching (issue #65) — Job Name may reflect the
+        # manifest number rather than the trip number; same fallback the main upload-time
+        # cascade now tries in _process_invoice_csv().
+        candidates = [m for m in manifests if _manifest_to_suffix(m.get("manifest") or "") == job_name_s]
+    if not candidates:
         return {"matched": False, "message": "Still not found in Technique (checked last 21 days)."}
 
-    weight_data = get_manifest_weights([match["manifest"]]).get(match["manifest"], {})
+    loose_match_note: Optional[str] = None
+    if len(candidates) == 1:
+        match = candidates[0]
+        weight_data = get_manifest_weights([match["manifest"]]).get(match["manifest"], {})
+    else:
+        # Multiple candidates share this suffix — score by closeness to the stub's own
+        # ALG-invoiced quantities, same _closest_technique_match() logic the main
+        # upload-time cascade already uses, instead of blindly taking whichever the
+        # Technique query happened to return first.
+        weight_map = get_manifest_weights([c["manifest"] for c in candidates])
+        for c in candidates:
+            c["technique_weight"] = weight_map.get(c["manifest"], {}).get("technique_weight", 0)
+        match, score = _closest_technique_match(
+            candidates, float(stub.alg_weight or 0), stub.alg_pallets or 0, stub.alg_pcs or 0,
+        )
+        weight_data = weight_map.get(match["manifest"], {})
+        if score > _CLOSE_MATCH_THRESHOLD:
+            loose_match_note = (
+                f"Matched via closest-quantity heuristic among {len(candidates)} candidates "
+                f"sharing suffix '{job_name_s}' on retry (discrepancy score {score:.2f}) — verify manually."
+            )
+            logger.warning(
+                "[RETRY-MATCH] %s -> closest match among %d candidates '%s' still has a "
+                "large discrepancy (score=%.3f) - verify manually",
+                stub.invoice_number, len(candidates), job_name_s, score,
+            )
+
     row = _create_technique_record_from_fallback(db, match, weight_data)
     row.invoice_number = stub.invoice_number
     row.inv_job_number  = stub.inv_job_number
@@ -3112,6 +3214,8 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     row.alg_pallets     = stub.alg_pallets
     row.alg_pcs         = stub.alg_pcs
     row.match_strategy  = "job_name"
+    if loose_match_note:
+        row.notes = f"{row.notes} {loose_match_note}" if row.notes else loose_match_note
     _compute_diffs(row)
     db.delete(stub)
     db.commit()
