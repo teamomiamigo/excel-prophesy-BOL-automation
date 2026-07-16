@@ -76,6 +76,10 @@ USE_MOCK_DATA=False
 DATABASE_URL=postgresql://sg360_user:localpass@localhost:5432/sg360_bol
 SQLSERVER_USER=                 # blank = Windows auth to AWP-SQL-PROD
 SQLSERVER_PASSWORD=
+SQLSERVER_ODBC_DRIVER=          # blank = "ODBC Driver 18 for SQL Server" (matches the Lambda container).
+                                 # Set to "ODBC Driver 17 for SQL Server" on a dev machine that only has
+                                 # Driver 17 installed — Driver 18 was silently failing every live SQL
+                                 # query locally (IM002 driver-not-found) until this was made configurable.
 EIA_API_KEY=                    # eia.gov/developer (free) — for weekly diesel FSC lookup
 SMTP_USER=user@sg360.com
 SMTP_PASSWORD=
@@ -115,7 +119,7 @@ All live-mode dependencies (`pyodbc`, `sqlalchemy[mssql]`, `boto3`, `mangum`) ar
 | POST | `/api/admin/pull` | Pull Technique manifests from AWP-SQL-PROD (disabled in mock mode) |
 | POST | `/api/admin/refetch-bols` | Re-query Technique for specific manifests; updates `bol_number` after Prophecy import (live mode only) |
 | POST | `/api/admin/poll-email` | Poll O365 IMAP for unread ALG invoice emails → extract CSVs → process (live mode only) |
-| POST | `/api/admin/reset-invoices` | Dev: clear invoice fields on all records + delete invoice-only stubs |
+| POST | `/api/admin/reset-invoices?confirm=true` | Dev: clear ALL ALG-invoice-derived fields (including on already-approved records — resets status to pending unconditionally) + delete invoice-only stubs. Never touches Technique-side fields, `is_third_party`, `sid_exported_at`, or the static rate-card tables. Requires `confirm=true`. Wrapped by the `/cleanout` skill for repeatable testing |
 | POST | `/api/admin/wipe-test-data` | Dev: deletes ALL `bol_records` (pending/approved/flagged/logged) + cascaded `approval_history`, for a clean invoice-by-invoice re-test. Does NOT touch `tariff_rates`/`fuel_surcharge_rates`/`users`. Requires `?confirm=true` |
 | POST | `/api/admin/recompute-diffs` | Backfill weight_diff/pallet_diff/pcs_diff on existing records via `_compute_diffs()` (live mode only); pure DB recompute, no live Technique/Prophecy query |
 | POST | `/api/admin/recompute-access-prog` | Backfill Calculated Cost on existing matched records — re-locates and re-parses each record's original invoice CSV (`_find_invoice_file(..., require_csv=True)`) since ALG's per-zone rate isn't stored anywhere else, then re-runs `_apply_access_prog_calc()` with a fresh live pallet-data query (live mode only); records whose original file can't be found are reported as `skipped_no_file`, not guessed at |
@@ -126,7 +130,7 @@ All live-mode dependencies (`pyodbc`, `sqlalchemy[mssql]`, `boto3`, `mangum`) ar
 | GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only); also stamps `sid_exported_at` on each included record |
 | POST | `/api/bols/{id}/export-prophecy-sid` | Per-record SID export — pushes one pending Type A record to Prophecy without waiting for a batch approval; same CSV logic as the bulk route, scoped to one manifest |
 | POST | `/api/bols/{id}/refresh-bol` | Refresh one record's manifest-side data: re-pulls weight/pallets/pieces from VisualMail (`get_manifest_weights()`) and checks Prophecy for a BOL (`get_technique_data()` filtered to one manifest), without a full Technique pull — ~10s live (hits AWP-SQL-PROD), near-instant if the record already has a BOL. Does not touch invoice-side fields (access_prog/cost_pct/amount/alg_*) |
-| POST | `/api/bols/{id}/retry-match` | On-demand retry for one unmatched (`match_strategy=invoice_only`) invoice stub — checks a wide 21-day Technique window immediately instead of waiting for the next Pull Manifests click |
+| POST | `/api/bols/{id}/retry-match` | On-demand retry for one unmatched (`match_strategy=invoice_only`) invoice stub — checks a wide 90-day Technique window immediately instead of waiting for the next Pull Manifests click (widened from 21 days 2026-07-16 — a real trip older than 21 days was failing to match with no clear reason why) |
 | POST | `/api/export` | Generate accounting CSV and email to Mary + Katie |
 | GET | `/api/logs` | All records across all dates; optional `?start_date=` / `?end_date=` / `?status=` filters |
 | GET | `/api/logs/export` | Download log as CSV; same date-range params as above |
@@ -209,13 +213,13 @@ All three source files are on disk at `c:\nikhilm\billing-freight-automation\`. 
 | `fuel_surcharge_rates` | `SG360_ALG Worldwide Logistics FSC Matrix_06.01.2026.xlsx` (sheet "Direct FSC", rows 10–144) | 135 diesel price bands; `fsc_amount` = decimal fraction (0.365 = 36.5% surcharge) |
 | `alg_tariff_rates` | `ALG5_2026_tariff_rates.csv` (exported 2026-07-15 from a live query against `SQLAPPS3.ShipperPlus_Segerdahl.dbo.tariff_details WHERE tariff_id='ALG5_2026'` — no live route to that server from this dev environment, hence the one-time export instead of a `get_alg_tariff_rates()` live query function) | 527 rows, keyed by the exact destination code (`Locations.AccountNumber` format, e.g. `SCF606`/`ASF140`) — confirmed identical to what our own pallet data already carries as `Dest_ID`/`destination_id`, so lookups are an **exact match**, no zip3 slicing or nearest-zone tolerance needed. Confirmed 2026-07-15 via `VM_Locations.xlsx` (VisualMail's own `Locations` table) that every one of these 527 codes has a real ZIP, and cross-checking 2 real invoices found 0% of their zones missing here vs. 71.5% of shipped weight missing from `tariff_rates`. This is the **primary** rate source in `_apply_access_prog_calc()`'s fallback chain now; `tariff_rates` is only reached if a destination code isn't found here. |
 
-**Dest ID lookup chain:** live mode: VisualMail `Locations.AccountNumber = "SCF606"` (Corp/Technique path) or ShipperPlus `destination_id`/`destination_zip` (Wolf/311 path) → exact match against `alg_tariff_rates.dest_id` first; only falls to zip3-keyed `tariff_rates` (via `dest_id[3:6]` or `destination_zip[:3]`) if not found there. Mock mode: `access_prog` is hardcoded; no lookup occurs.
+**Dest ID lookup chain:** live mode: VisualMail `Locations.AccountNumber = "SCF606"` (Corp/Technique path) or ShipperPlus `destination_id`/`destination_zip` (Wolf/311 path) → exact match against `alg_tariff_rates.dest_id` first; only falls to zip3-keyed `tariff_rates` if not found there. Zip3 derivation (fixed 2026-07-16) now prefers a real ZIP on both paths — `Locations.ZipCode` (added to `get_pallet_data_for_manifests()`'s query) for Corp/Technique, `destination_zip` for Wolf/311 — falling back to slicing the destination code (`dest_id[3:6]`) only if the real ZIP is unavailable; the code's own digits are ALG's zone label, not always the literal zip3 (e.g. "ASF140" → real ZIP 142xx). Mock mode: `access_prog` is hardcoded; no lookup occurs.
 
 **EIA API** (`EIA_API_KEY` in `.env`): fetches the current weekly diesel price. As of 2026-07-01 this is a **fallback only** — `access_prog` prefers the FSC rate parsed directly off the matched ALG invoice (see below), since the real invoice is always already in hand by the time `access_prog` is computed. EIA is used only when a CSV's Fuel Surcharge footer row can't be parsed.
 
-**`access_prog` calculation (last corrected 2026-07-15 — issue #64, supersedes the 2026-07-14 version, which this section previously described stale):** Computed in `_apply_access_prog_calc()`, shared by `_process_invoice_csv()` (every invoice upload, including Wolf/311 stub creation) and the `POST /api/admin/recompute-access-prog` backfill. Weight/pallets/pieces must always be **ours**, never ALG's — but the tariff/zone rate structure is legitimately **ALG's own pricing**, so using it is correct, not a violation of independence:
+**`access_prog` calculation (last corrected 2026-07-16, supersedes the 2026-07-15/issue #64 version, which this section previously described stale):** Computed in `_apply_access_prog_calc()`, shared by `_process_invoice_csv()` (every invoice upload, including Wolf/311 stub creation) and the `POST /api/admin/recompute-access-prog` backfill. Weight/pallets/pieces must always be **ours**, never ALG's — but the tariff/zone rate structure is legitimately **ALG's own pricing**, so using it is correct, not a violation of independence:
 1. Get our own per-pallet `(zone, weight, exact Dest_ID)`: `get_pallet_data_for_manifests()` for Corp/Technique trips, `get_prophecy_pallet_data()` for Wolf/311 (Prophecy-matched) loads. Both a zip3 (for the ALG-invoice-rate and `tariff_rates` lookups below) and the exact `Dest_ID`/`destination_id` string (for the `alg_tariff_rates` exact-match lookup) are carried per pallet. **If our own data comes back empty (manifest/BOL not found, not yet synced), `access_prog` is left `null`** — no independent data means no independent estimate; there is no fallback to ALG's weight.
-2. Per pallet, resolve the rate in priority order: (a) ALG's own invoiced rate for that exact zone on **this invoice** — read directly from the CSV's `Rate` column (confirmed populated and accurate on 126 real historical invoices; do **not** derive it as `Billed$/GrossWt`, which silently bakes in ALG's per-shipment minimum-freight charge as if it were a flat rate — e.g. a $70 minimum on a 216 lb parcel implies a fake ~$32/cwt "rate"); exact zip3 match first, else nearest invoice zone within `_ALG_ZONE_TOLERANCE` (±5). (b) If this invoice didn't bill that zone, an **exact match** against `alg_tariff_rates` (see above) on the pallet's own `Dest_ID` — no zip3 involved, no ambiguity. (c) If not found there either, the older zip3-keyed `tariff_rates` card as a last resort — sets `tariff_zone_approximate = true` when reached. **Any of the three paths applies the zone's own minimum freight charge** as a floor on the computed cost (`tariff_rates.minimum_freight` for path (a)/(c) via `get_tariff_rate()`'s return key, or `alg_tariff_rates.mc1` directly for path (b)) — matches ALG's actual charged minimum, zone for zone.
+2. Per pallet, resolve the rate in priority order: (a) ALG's own invoiced rate for that exact zone on **this invoice** — read directly from the CSV's `Rate` column (confirmed populated and accurate on 126 real historical invoices; do **not** derive it as `Billed$/GrossWt`, which silently bakes in ALG's per-shipment minimum-freight charge as if it were a flat rate — e.g. a $70 minimum on a 216 lb parcel implies a fake ~$32/cwt "rate"); exact zip3 match first, else nearest invoice zone within `_ALG_ZONE_TOLERANCE` (±5). (b) If this invoice didn't bill that zone, an **exact match** against `alg_tariff_rates` (see above) on the pallet's own `Dest_ID` — no zip3 involved, no ambiguity. (c) If not found there either, the older zip3-keyed `tariff_rates` card as a last resort — sets `tariff_zone_approximate = true` when reached. **Any of the three paths applies the zone's own minimum freight charge** as a floor on the computed cost — sourced from `alg_tariff_rates.mc1` on the exact `Dest_ID` for paths (a) and (b) (fixed 2026-07-16: path (a) previously sourced its minimum from `tariff_rates.minimum_freight` via `get_tariff_rate()`, which is missing ~64% of real zones — so most pallets priced via ALG's own per-zone rate got no minimum-charge protection at all, systematically under-pricing loads with several small/light shipments; confirmed on one real invoice where 18 of 126 line items hit ALG's real minimum, accounting for $556 of a $571 total shortfall), falling back to `tariff_rates.minimum_freight` only if the exact `Dest_ID` isn't in `alg_tariff_rates` either.
 3. **Requires full coverage** (2026-07-15; previously 80%, `_RATE_COVERAGE_THRESHOLD`): if even one pallet's zone resolves via none of the three paths above, discard the per-zone sum entirely and price the whole load at the invoice's own blended $/cwt (`alg_blended_rate` = total freight billed ÷ total billed weight) instead, or leave `access_prog` null if no blended rate is available either. The old 80% threshold let a shipment with, say, 85% zone coverage report only the rated 85% slice's dollars as the whole shipment's cost — silently dropping the other 15% entirely rather than scaling or falling back — which was the single largest driver of the "tiny weight change → huge Cost % swing" symptom in issue #64 (whichever pallet flipped coverage across the 80% line flipped the entire pricing method). A partial per-zone match previously also produced 800–1300% readings in an unrelated earlier incident, which is what originally motivated *some* coverage threshold, just not one this low.
 4. FSC comes from the invoice's own "Fuel Surcharge" footer row, but **derived from the two exact dollar figures** (`fsc_cost_val / alg_freight_total`), not the row's own `Rate` label — confirmed 2026-07-15 that ALG's CSV export rounds this label to 2 decimals (e.g. "0.41") while the true rate (confirmed against the matching PDF, and by this dollar-derived formula matching to 4 decimals on 8/8 invoices checked) is more precise (e.g. 0.4050). This is the opposite of the per-zone freight `Rate` in point 2(a), which — unlike this FSC row — is *not* derived from dollars, precisely because that column's own printed value is already exact for freight (confirmed on 126 invoices) while this one demonstrably isn't.
 `access_prog`/`base_tariff`/`fsc_pct` are recomputed fresh from our own data on every invoice upload for a trip (not accumulated per-invoice like `amount` — our own weight doesn't change just because a second Z-invoice arrived). Historical records whose original invoice CSV can no longer be located (`INVOICE_FOLDER` file since moved/deleted) can't be backfilled with this formula and are left as-is — `POST /api/admin/recompute-access-prog` reports these as `skipped_no_file` rather than guessing.
@@ -236,7 +240,7 @@ All queries connect to AWP-SQL-PROD. TECH, SegGroup, and SQLAPPS3 are linked ser
 
 **Weight split**: `get_technique_data()` does NOT return weight. The morning pull (`POST /api/admin/pull`) always calls both Query A (`get_technique_data`) + Query B (`get_manifest_weights`) and merges by manifest number.
 
-**ALG quantity fields** (`alg_weight`, `alg_pallets`, `alg_pcs` on `BOLRecord`): null until a CSV is uploaded via `POST /api/invoices/upload`. `weight_diff`, `pallet_diff`, `pcs_diff` are computed at upload time and stored; they are not recalculated on re-pull.
+**ALG quantity fields** (`alg_weight`, `alg_pallets`, `alg_pcs` on `BOLRecord`): null until a CSV is uploaded via `POST /api/invoices/upload`. `weight_diff`, `pallet_diff`, `pcs_diff` are computed at upload time and stored, and are also recomputed against the latest `technique_weight`/`pallets`/`pcs` on every `pull_technique_data()` re-pull (`_compute_diffs(row)`), so they stay current as manifest-side numbers change — not just a one-time snapshot from upload.
 
 **Invoice matching — `_process_invoice_csv()` in `main.py` (~line 1950):** shared by manual upload and email polling. Tried in this order — exact matches always before the Prophecy-BOL guess (fixed 2026-07-01, issue #31: a real trip whose numeric suffix coincidentally starts with "14" was being misclassified as a Wolf/311 load before this reorder):
 1. **Z-number**: CSV Z-number → `invoice_number` field on `BOLRecord`
@@ -266,14 +270,14 @@ Invoice sender: "Tanya 6/10/2026 4:21PM"
 Weight:        8,000–416,000 lbs          (use Numeric(12,2) — NOT Numeric(10,2))
 Pieces:        100,000–700,000
 Amount:        $249–$27,019
-Cost %:        stored as ratio 0.9881 = 98.81% (amount / access_prog)
+Cost %:        stored as ratio 1.0121 = 101.21% (access_prog / amount) — changed 2026-07-16, was amount / access_prog
 ```
 
 ## Key variance metric
 
-**Cost %** = `amount / access_prog` (actual ALG invoice ÷ expected Access program rate).
+**Cost %** = `access_prog / amount` (our calculated Access program rate ÷ ALG's actual invoice) — flipped 2026-07-16 (was `amount / access_prog`) so that when our calculated cost is *higher* than what ALG actually billed, the percentage reads *above* 100%, not below. `>100%` = ALG billed less than we calculated (or our calc overshot); `<100%` = ALG billed more than we calculated. Existing historical records keep their pre-flip value until reprocessed (invoice re-upload or `POST /api/admin/recompute-access-prog`) — there is no separate migration, since that same endpoint already recomputes both `access_prog` and `cost_pct` together.
 
-Color thresholds:
+Color thresholds (symmetric around 100% either way, unaffected by the flip):
 - Green: within 3% of 100% (0.97–1.03)
 - Orange: 3–6% off (0.94–0.97 or 1.03–1.06)
 - Red: >6% off (<0.94 or >1.06)
@@ -294,7 +298,7 @@ Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — show
 - `tariff_zone_approximate` / `weight_source_fallback` (Boolean, default False): flag when `access_prog` had to approximate a rate or fall back to ALG's own weight — see "Key variance metric"
 - `is_third_party` (Boolean): excludes from SID + accounting exports; reversible
 - `is_do_not_pay` (Boolean): marks an unmatched invoice-only record do-not-pay — unlike `is_third_party`, does NOT exclude from the accounting export; it's included and rendered as "DO NOT PAY"/"DNP" instead of an amount. Setting it also sets `status=approved`. Reversible
-- `needs_sid_export` (Boolean): True = Type A record (no BOL yet); False = Type B (BOL already in Prophecy)
+- `needs_sid_export` (Boolean): True = Type A record (no BOL yet); False = Type B (BOL already in Prophecy). `_apply_bol_status()` (shared by the bulk pull and `POST /api/bols/{id}/refresh-bol`) only flips a record back to Type A when it never had a `bol_number` — once a record is Type B, a later Technique/ShipperPlus query returning no `load_id` is treated as a transient query/join hiccup, not proof the BOL vanished from Prophecy, so `bol_number`/`needs_sid_export` are left alone rather than flip-flopped
 - `match_strategy` (String): how the invoice was matched — `"invoice_number"` (Z-number re-upload), `"job_name"` (trip or manifest suffix, or a re-scored retry-match), `"prophecy_bol"` (Wolf/311, Job Name is a Prophecy BOL), `"pallets_pieces"` (last-resort exact quantity match), or `"invoice_only"` for an unmatched stub — never null once an invoice has been processed
 - `accounting_exported_at` nullable DateTime — set when "Send to Accounting" runs; exposed in Log tab
 - `sid_exported_at` nullable DateTime — set when a record's SID CSV is downloaded (bulk `GET /api/export/prophecy-sid` or per-record `POST /api/bols/{id}/export-prophecy-sid`); previously existed but was never written until 2026-07-02
@@ -333,12 +337,24 @@ backend/test_data/       — Sample ALG invoice CSVs for testing the upload flow
 test_invoices_0622/      — 26 real Z-number CSVs from Tanya's June 22 email (e.g. Z557707.CSV).
                            Use for live-mode invoice upload testing. NOT committed — real production
                            data; add to .gitignore if not already excluded.
-documentation/           — Five .md spec files (Design & Workflow, Requirements & SQL Mapping,
-                           SECURITY.md, SG360_BOL_Project_Context.md, etc.). Reference for business
-                           rules and SQL source queries; not runtime code. Developmental Documentation.md
-                           is the running dev changelog — one entry per closed GitHub issue, appended
-                           by the `commit` skill. Read it for recent history that isn't yet folded
-                           into this file.
+documentation/           — Six .md spec files (Design & Workflow, Requirements & SQL Mapping,
+                           SECURITY.md, SG360_BOL_Project_Context.md, Agentic Automation Architecture.md,
+                           etc.). Reference for business rules and SQL source queries; not runtime code.
+                           Developmental Documentation.md is the running dev changelog — one entry per
+                           closed GitHub issue, appended by the `/commit` command
+                           (`.claude/commands/commit.md`). Read it for recent history that isn't yet
+                           folded into this file.
+backend/agents/          — Design-only. `Agentic Automation Architecture.md` specs an LLM-agent layer
+                           (Task Registry, Proposals, human-in-the-loop review) that would live here,
+                           but no implementation is committed — the directory currently holds only a
+                           stale `__pycache__` from a deleted prototype (`runner.py`/`classify.py`/`llm.py`
+                           .pyc files with no matching .py source). Don't assume any of it is wired up;
+                           check for actual .py files before referencing this layer as if it exists.
+README.md / ONBOARDING.md — README.md: local setup only (defers to this file for everything else).
+                           ONBOARDING.md: non-technical project overview for anyone picking this up cold
+                           (people, data sources, core features) — written 2026-07-01 and now stale on
+                           deployment status (still says "no live deployment yet"; see "AWS Lambda
+                           deployment" below for current state).
 Dockerfile               — Lambda container image build; live (see "AWS Lambda deployment" below)
 terraform/bootstrap/     — One-time remote-state backend (S3 + DynamoDB), local state; see "AWS Lambda deployment"
 terraform/main/          — The actual deployed infra: Lambda, API Gateway, Aurora, CloudFront, WAF, S3 (frontend + invoices), ECR. Tracked in git; terraform.tfvars holds the live lambda_image_tag. State is still local (not migrated to the bootstrap-provisioned S3 backend yet).
@@ -360,7 +376,7 @@ frontend/src/components/
 
 ## Frontend patterns
 
-No Context, no reducer, no router, no `useMemo`/`useCallback` anywhere in `frontend/src` — just `useState`/`useEffect`/`useRef`, all lifted to `App.jsx` (~1160 lines) and passed down as props. Conventions to match when extending it:
+No Context, no reducer, no router, no `useMemo`/`useCallback` anywhere in `frontend/src` — just `useState`/`useEffect`/`useRef`, all lifted to `App.jsx` (~1230 lines) and passed down as props. Conventions to match when extending it:
 
 - **Inline styles only** — no CSS modules, Tailwind, or styled-components. Style objects are built ad hoc per component (e.g. `TD`/`TD_R` constants in `BOLRow.jsx` for shared cell styles). Colors are hardcoded hex per-component (`#2D6A4F` green, `#dc2626` red, etc.) — there's no shared theme/constants file, so matching an existing color means grepping for its hex value in the relevant component.
 - **Modals** (`FlagModal.jsx`, `ReassignInvoiceModal.jsx`) are conditionally rendered inline in `App.jsx`'s JSX based on a target-id state variable (e.g. `flagTarget`, `reassignTargetId`) — not a portal, not router-based.

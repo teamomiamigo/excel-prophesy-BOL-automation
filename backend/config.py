@@ -73,6 +73,12 @@ class Settings(BaseSettings):
     SQLSERVER_USER: str = ""
     SQLSERVER_PASSWORD: str = ""
 
+    # ODBC driver name pyodbc connects with. Default matches what the Lambda container
+    # installs (Dockerfile: msodbcsql18). Dev machines commonly only have Driver 17
+    # installed — override with SQLSERVER_ODBC_DRIVER=ODBC Driver 17 for SQL Server in
+    # .env rather than changing this default, which would silently break Lambda.
+    SQLSERVER_ODBC_DRIVER: str = "ODBC Driver 18 for SQL Server"
+
     # Direct connection to SG360-TECH-PRD1 (ShipperPlus host).
     # When set, get_prophecy_data() uses this instead of the SQLAPPS3 linked server.
     TECH_PRD1_SERVER: str = "SG360-TECH-PRD1"

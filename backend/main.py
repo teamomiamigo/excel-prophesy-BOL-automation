@@ -691,7 +691,7 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
 
         if target_rec.get("amount") and target_rec.get("access_prog"):
             target_rec["cost_pct"] = round(
-                float(target_rec["amount"]) / float(target_rec["access_prog"]), 6
+                float(target_rec["access_prog"]) / float(target_rec["amount"]), 6
             )
         target_rec["updated_at"] = datetime.now(timezone.utc)
 
@@ -784,7 +784,7 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
 
     if target_row.amount and target_row.access_prog:
         target_row.cost_pct = Decimal(str(round(
-            float(target_row.amount) / float(target_row.access_prog), 6
+            float(target_row.access_prog) / float(target_row.amount), 6
         )))
     target_row.updated_at = datetime.now(timezone.utc)
 
@@ -832,61 +832,73 @@ def update_notes(
     return row
 
 
+_INVOICE_FIELDS_TO_NULL = [
+    "invoice_number", "invoice_email_sender", "invoice_sent_at", "inv_job_number", "carrier",
+    "alg_weight", "alg_pallets", "alg_pcs",
+    "access_prog", "amount", "cost_pct", "base_tariff", "fsc_pct", "alg_fsc_pct", "alg_fsc_cost",
+    "match_strategy", "weight_diff", "pallet_diff", "pcs_diff", "notes", "flag_reason",
+]
+_INVOICE_FIELDS_TO_FALSE = ["tariff_zone_approximate", "weight_source_fallback"]
+
+
 @app.post("/api/admin/reset-invoices", tags=["Admin"])
-def reset_all_invoices(db: Session = Depends(get_db)):
+def reset_all_invoices(confirm: bool = False, db: Session = Depends(get_db)):
     """
-    Dev-only: delete stub records and clear invoice fields on all Technique records.
-    Lets you do a clean invoice upload from scratch without re-running the pull.
+    Dev-only: delete invoice-only stub records and clear every ALG-invoice-
+    derived field on all Technique records -- including already-approved ones
+    -- for a clean invoice upload from scratch without re-running the pull.
+
+    Deliberately unconditional on status: a record whose invoice/cost data was
+    just wiped can't sensibly stay "approved" with nothing left to show for it,
+    so status resets to pending and flag_reason clears regardless of the
+    record's current status. This means it WILL destroy real historical
+    billing data on any already-approved/exported record if run against a live
+    database with real data in it -- that's an explicit, deliberate choice, not
+    an oversight; hence the confirm gate below.
+
+    Never touches: Technique-side fields (technique_trip, manifest,
+    technique_weight/pallets/pcs, bol_number, needs_sid_export), is_third_party
+    (a manual categorization independent of any invoice), sid_exported_at (the
+    Prophecy SID/BOL export lifecycle is independent of ALG invoice data), or
+    the static tariff_rates/fuel_surcharge_rates/alg_tariff_rates rate-card
+    tables -- only ALG-invoice-derived data is ever cleared.
     """
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Pass ?confirm=true to reset all invoice data")
+
     if settings.USE_MOCK_DATA:
         stub_ids = [k for k, v in _mock_state.items() if v.get("match_strategy") == "invoice_only"]
         for sid in stub_ids:
             del _mock_state[sid]
         for rec in _mock_state.values():
-            rec["invoice_number"] = None
-            rec["amount"]         = None
-            rec["alg_weight"]     = None
-            rec["alg_pallets"]    = None
-            rec["alg_pcs"]        = None
-            rec["access_prog"]    = None
-            rec["cost_pct"]       = None
-            rec["match_strategy"] = None
-            rec["inv_job_number"] = None
-            rec["weight_diff"]    = None
-            rec["pallet_diff"]    = None
-            rec["pcs_diff"]       = None
-            rec["notes"]          = None
-            if rec["status"] != "approved":
-                rec["status"]     = "pending"
-                rec["flag_reason"] = None
+            for f in _INVOICE_FIELDS_TO_NULL:
+                rec[f] = None
+            for f in _INVOICE_FIELDS_TO_FALSE:
+                rec[f] = False
+            rec["status"] = "pending"
         return {"stubs_deleted": len(stub_ids), "records_cleared": len(_mock_state)}
 
-    stubs = db.query(BOLRecord).filter(BOLRecord.match_strategy == "invoice_only").all()
-    stub_count = len(stubs)
+    # Partition in Python, not SQL: a `technique_trip IS NOT NULL` WHERE clause
+    # misses Wolf/311 records (match_strategy="prophecy_bol"), which legitimately
+    # have technique_trip=None too -- they match on Prophecy BOL number, not a
+    # Technique trip. Every row that isn't an invoice_only stub needs clearing,
+    # regardless of which side it matched through.
+    all_rows = db.query(BOLRecord).all()
+    stubs = [r for r in all_rows if r.match_strategy == "invoice_only"]
+    remaining = [r for r in all_rows if r.match_strategy != "invoice_only"]
+
     for s in stubs:
         db.delete(s)
 
-    technique_rows = db.query(BOLRecord).filter(BOLRecord.technique_trip.isnot(None)).all()
-    for row in technique_rows:
-        row.invoice_number = None
-        row.amount         = None
-        row.alg_weight     = None
-        row.alg_pallets    = None
-        row.alg_pcs        = None
-        row.access_prog    = None
-        row.cost_pct       = None
-        row.match_strategy = None
-        row.inv_job_number = None
-        row.weight_diff    = None
-        row.pallet_diff    = None
-        row.pcs_diff       = None
-        row.notes          = None
-        if row.status != BOLStatus.APPROVED:
-            row.status      = BOLStatus.PENDING
-            row.flag_reason = None
+    for row in remaining:
+        for f in _INVOICE_FIELDS_TO_NULL:
+            setattr(row, f, None)
+        for f in _INVOICE_FIELDS_TO_FALSE:
+            setattr(row, f, False)
+        row.status = BOLStatus.PENDING
 
     db.commit()
-    return {"stubs_deleted": stub_count, "records_cleared": len(technique_rows)}
+    return {"stubs_deleted": len(stubs), "records_cleared": len(remaining)}
 
 
 @app.post("/api/admin/wipe-test-data", tags=["Admin"])
@@ -928,8 +940,12 @@ def _apply_bol_status(row: "BOLRecord", technique_row: dict) -> None:
             row.bol_number = load_id
         elif pooled_id > 0 and not row.bol_number:
             row.bol_number = pooled_id
-    else:
+    elif not row.bol_number:
         row.needs_sid_export = True
+    # else: row already has a bol_number from a prior match (Type B). A later
+    # query returning no load_id doesn't mean the BOL vanished from Prophecy —
+    # it's far more likely a transient query/join hiccup. Leave needs_sid_export
+    # (and bol_number) as-is instead of flip-flopping the record back to Type A.
 
 
 def _select_canonical_technique_row(rows: list[dict]) -> dict:
@@ -1029,6 +1045,20 @@ def _compute_diffs(row: "BOLRecord") -> None:
     )
 
 
+def _append_note_to(row: "BOLRecord", text: str) -> None:
+    """Idempotent notes-append for the pull/refresh paths — a manifest stuck without
+    Query B weight data gets re-pulled/re-refreshed repeatedly, so this must not pile
+    up duplicate copies of the same diagnostic note each time."""
+    if text not in (row.notes or ""):
+        row.notes = f"{row.notes} {text}".strip() if row.notes else text
+
+
+_NO_ACTIVE_PALLET_DATA_NOTE = (
+    "No active-pallet weight data in VisualMail for this manifest "
+    "(Query B / Active=1 returned nothing) — weight/pallets/pcs left at 0."
+)
+
+
 def _trip_to_suffix(trip: str) -> str:
     """e.g. 'TEC_T_0110977' -> '110977'. Shared by invoice matching and stub re-matching."""
     parts = (trip or "").split("T_")
@@ -1071,6 +1101,8 @@ def _create_technique_record_from_fallback(db: Session, m: dict, weight_data: di
     row.technique_weight  = weight_data.get("technique_weight", 0)
     row.technique_pallets = weight_data.get("technique_pallets", 0)
     row.technique_pcs     = weight_data.get("technique_pcs", 0)
+    if not weight_data:
+        _append_note_to(row, _NO_ACTIVE_PALLET_DATA_NOTE)
     _apply_bol_status(row, m)
     proph_pcs = m.get("prophecy_pcs") or 0
     if proph_pcs:
@@ -1142,11 +1174,18 @@ def pull_technique_data(db: Session = Depends(get_db)):
         row.technique_weight   = weight_data.get("technique_weight", 0)
         row.technique_pallets  = weight_data.get("technique_pallets", 0)
         row.technique_pcs      = weight_data.get("technique_pcs", 0)
+        if not weight_data:
+            _append_note_to(row, _NO_ACTIVE_PALLET_DATA_NOTE)
         # access_prog is computed at invoice upload time (per-pallet ZIP from ALG CSV) — not at pull time
 
         # Type A = no load yet (needs SID export to Prophecy to create BOL)
         # Type B = load_id > 0 (BOL already exists in Prophecy/ShipperPlus; store it)
         _apply_bol_status(row, m)
+
+        # Re-pull refreshes technique_weight/pallets/pcs above — recompute the
+        # diffs against ALG's invoiced quantities so they don't go stale
+        # relative to the just-refreshed technique-side numbers.
+        _compute_diffs(row)
 
         # Prophecy pieces from Query A (ShipperPlus join) — save if non-zero
         proph_pcs = m.get("prophecy_pcs") or 0
@@ -1183,12 +1222,36 @@ def pull_technique_data(db: Session = Depends(get_db)):
         match_rec = None
         match_strat = None
 
-        # Strategy 1: trip suffix → job name
-        for c in technique_recs:
-            if c.technique_trip and _trip_to_suffix(c.technique_trip) == job_name_s:
-                match_rec = c
-                match_strat = "job_name"
-                break
+        # Strategy 1: trip suffix → job name — score candidates by closeness to the
+        # stub's own ALG-billed quantities instead of taking whichever the query
+        # happened to return first (was previously non-deterministic when a suffix
+        # had multiple committed candidates). These are already-committed records
+        # from this same pull, so their technique_weight/pallets/pcs are already
+        # Query B-sourced — no extra query needed.
+        suffix_candidates = [
+            c for c in technique_recs
+            if c.technique_trip and _trip_to_suffix(c.technique_trip) == job_name_s
+        ]
+        if len(suffix_candidates) == 1:
+            match_rec = suffix_candidates[0]
+            match_strat = "job_name"
+        elif len(suffix_candidates) > 1:
+            match_rec, score = _closest_technique_match(
+                suffix_candidates, float(stub.alg_weight or 0), stub.alg_pallets or 0, stub.alg_pcs or 0,
+            )
+            match_strat = "job_name"
+            if score > _CLOSE_MATCH_THRESHOLD:
+                _append_note_to(
+                    match_rec,
+                    f"Matched via closest-quantity heuristic among {len(suffix_candidates)} "
+                    f"candidates sharing trip suffix '{job_name_s}' during stub re-match "
+                    f"(discrepancy score {score:.2f}) — verify manually.",
+                )
+                logger.warning(
+                    "[PULL RE-MATCH] %s -> closest match among %d candidates on trip suffix '%s' "
+                    "still has a large discrepancy (score=%.3f) - verify manually",
+                    stub.invoice_number, len(suffix_candidates), job_name_s, score,
+                )
 
         # Strategy 2: BOL number → job name (non-comingle only)
         if match_rec is None and "Comingle" not in (stub.notes or ""):
@@ -1242,12 +1305,41 @@ def pull_technique_data(db: Session = Depends(get_db)):
     wide_resolved = 0
     if remaining_stubs:
         wide_manifests = _dedupe_technique_rows(get_technique_data(days_back=21))
-        wide_by_suffix = {_trip_to_suffix(m["technique_trip"]): m for m in wide_manifests if m.get("technique_trip")}
-        to_resolve = [
-            (s, wide_by_suffix[s.inv_job_number])
-            for s in remaining_stubs
-            if s.inv_job_number and s.inv_job_number in wide_by_suffix
-        ]
+        # Group (not collapse) by trip suffix — a dict comprehension here previously kept
+        # only the last manifest seen per suffix, non-deterministically (no ORDER BY on
+        # the underlying query), whenever one trip legitimately had multiple manifests.
+        wide_by_suffix: dict[str, list[dict]] = {}
+        for m in wide_manifests:
+            if m.get("technique_trip"):
+                wide_by_suffix.setdefault(_trip_to_suffix(m["technique_trip"]), []).append(m)
+
+        to_resolve = []  # (stub, chosen manifest dict)
+        for s in remaining_stubs:
+            candidates = wide_by_suffix.get(s.inv_job_number or "", [])
+            if not candidates:
+                continue
+            if len(candidates) == 1:
+                to_resolve.append((s, candidates[0]))
+            else:
+                # Multiple manifests share this suffix in the wide window — score by
+                # closeness to the stub's own ALG-billed quantities instead of taking
+                # an arbitrary one.
+                score_weights = get_manifest_weights([c["manifest"] for c in candidates])
+                for c in candidates:
+                    wd = score_weights.get(c["manifest"], {})
+                    c["technique_weight"]  = wd.get("technique_weight", 0)
+                    c["technique_pallets"] = wd.get("technique_pallets", 0)
+                    c["technique_pcs"]     = wd.get("technique_pcs", 0)
+                best, score = _closest_technique_match(
+                    candidates, float(s.alg_weight or 0), s.alg_pallets or 0, s.alg_pcs or 0,
+                )
+                to_resolve.append((s, best))
+                if score > _CLOSE_MATCH_THRESHOLD:
+                    logger.warning(
+                        "[PULL WIDE FALLBACK] %s -> closest match among %d candidates on trip "
+                        "suffix '%s' still has a large discrepancy (score=%.3f) - verify manually",
+                        s.invoice_number, len(candidates), s.inv_job_number, score,
+                    )
         if to_resolve:
             weights_by_manifest = get_manifest_weights([m["manifest"] for _, m in to_resolve])
             for stub, m in to_resolve:
@@ -1548,11 +1640,30 @@ def _apply_access_prog_calc(
                 own_pallets.append((zip3, weight, dest_id))
     elif matched_rec.manifest:
         from backend.data_layer import get_pallet_data_for_manifests as _get_pallet_data_for_manifests
-        for prow in _get_pallet_data_for_manifests([matched_rec.manifest]):
+        # get_pallet_data_for_manifests() intentionally re-raises on query failure (correct
+        # for its other caller, the SID export routes, where fail-fast is right) — but this
+        # access_prog path already has a documented graceful-null story for empty own_pallets
+        # below, so a live query failure here should degrade the same way, not 500 the whole
+        # invoice upload/recompute request.
+        try:
+            manifest_pallet_rows = _get_pallet_data_for_manifests([matched_rec.manifest])
+        except Exception as exc:
+            logger.error(
+                "[ACCESS_PROG] get_pallet_data_for_manifests failed for manifest %s: %s",
+                matched_rec.manifest, exc,
+            )
+            manifest_pallet_rows = []
+        for prow in manifest_pallet_rows:
             dest_id = prow.get("Dest_ID") or ""
+            dest_zip = prow.get("Dest_Zip")
             weight = float(prow.get("Wgt") or 0)
-            if len(dest_id) >= 6 and weight > 0:
-                own_pallets.append((dest_id[3:6], weight, dest_id))
+            # Prefer the real ZIP (Locations.ZipCode, live from VisualMail) over slicing
+            # the destination code — confirmed 2026-07-16 that code's own digits are ALG's
+            # zone label, not always the real zip3 (e.g. "ASF140" labels a facility whose
+            # real ZIP is 142xx). Same pattern as the Wolf/311 branch above.
+            zip3 = (str(dest_zip)[:3] if dest_zip else None) or (dest_id[3:6] if dest_id and len(dest_id) >= 6 else None)
+            if zip3 and weight > 0:
+                own_pallets.append((zip3, weight, dest_id))
 
     matched_rec.weight_source_fallback = not bool(own_pallets)
     if not own_pallets:
@@ -1574,14 +1685,23 @@ def _apply_access_prog_calc(
         alg_rate = _lookup_alg_rate(alg_rate_by_zip3, zip3)
         if alg_rate is not None:
             base = Decimal(str(round(alg_rate * weight / 100.0, 2)))
-            # ALG applies a minimum freight charge per shipment; our own tariff card
-            # carries the identical minimum per zone (confirmed against real invoices).
-            # Apply the same floor here using our own weight — otherwise a pallet priced
-            # via ALG's rate has no minimum-charge protection at all, unlike the
-            # internal-card fallback below (get_tariff_rate() already does this itself).
-            zone_info = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
-            if zone_info and zone_info.get("minimum_freight") is not None:
-                base = max(base, zone_info["minimum_freight"])
+            # ALG applies a minimum freight charge per shipment; apply the same floor
+            # here using our own weight — otherwise a pallet priced via ALG's rate has
+            # no minimum-charge protection at all. Source the minimum from
+            # alg_tariff_rates.mc1 (ALG's own complete rate export, ~0% zone coverage
+            # gap, keyed by this pallet's exact dest_id) rather than the older zip3-keyed
+            # tariff_rates card (confirmed 2026-07-16 to be missing ~64% of real zones,
+            # which was silently skipping the minimum-charge floor on most pallets and
+            # systematically under-pricing loads with several small/light shipments —
+            # e.g. $556 of a $571 gap on one real invoice traced directly to this).
+            # Only fall back to the old card if this exact dest_id isn't in alg_tariff_rates.
+            alg_min = get_alg_tariff_rate(exact_dest_id) if exact_dest_id else None
+            if alg_min is not None:
+                base = max(base, alg_min["mc1"])
+            else:
+                zone_info = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
+                if zone_info and zone_info.get("minimum_freight") is not None:
+                    base = max(base, zone_info["minimum_freight"])
             with_fsc = base * (Decimal("1") + _effective_fsc_pct) if _effective_fsc_pct is not None else base
             new_base_sum += base
             new_tariff_sum += with_fsc
@@ -1888,7 +2008,7 @@ def _apply_invoice_match(
             matched_rec["invoice_sent_at"] = invoice_sent_at
         if matched_rec.get("amount") and matched_rec.get("access_prog"):
             matched_rec["cost_pct"] = round(
-                float(matched_rec["amount"]) / float(matched_rec["access_prog"]), 6
+                float(matched_rec["access_prog"]) / float(matched_rec["amount"]), 6
             )
         # Diffs: ALG vs Prophecy for Wolf/311, ALG vs Technique for Corp.
         alg_w   = matched_rec.get("alg_weight")
@@ -1951,7 +2071,7 @@ def _apply_invoice_match(
             )
         if matched_rec.amount and matched_rec.access_prog:
             matched_rec.cost_pct = Decimal(
-                str(round(float(matched_rec.amount) / float(matched_rec.access_prog), 6))
+                str(round(float(matched_rec.access_prog) / float(matched_rec.amount), 6))
             )
         # Wolf/311: refresh Prophecy weight/pallets/pcs from ShipperPlus when this invoice
         # matched via a Prophecy BOL number this time around.
@@ -2359,7 +2479,7 @@ def _process_invoice_csv(
                         alg_blended_rate=alg_blended_rate,
                     )
                     if stub.amount and stub.access_prog:
-                        stub.cost_pct = Decimal(str(round(float(stub.amount) / float(stub.access_prog), 6)))
+                        stub.cost_pct = Decimal(str(round(float(stub.access_prog) / float(stub.amount), 6)))
                 db.commit()
         logger.info(
             "[INVOICE] %s → no match, stub created (bol=%s, note=%s)",
@@ -2862,7 +2982,7 @@ def recompute_access_prog(db: Session = Depends(get_db)):
             skipped_no_own_data += 1
             continue
         if rec.amount and rec.access_prog:
-            rec.cost_pct = Decimal(str(round(float(rec.amount) / float(rec.access_prog), 6)))
+            rec.cost_pct = Decimal(str(round(float(rec.access_prog) / float(rec.amount), 6)))
         fixed += 1
 
     db.commit()
@@ -3099,6 +3219,11 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
     than new hand-written single-manifest SQL — heavier than strictly
     necessary, but zero risk of a subtly wrong new query. Revisit if this
     proves too slow in practice.
+
+    Weight/pallets/pieces (step 1) always refresh regardless of BOL status —
+    a record can still need a weight correction after its BOL already exists.
+    Only step 2 (the Prophecy BOL check) is skipped once needs_sid_export is
+    already False, since there's nothing left to check for.
     """
     if settings.USE_MOCK_DATA:
         raise HTTPException(
@@ -3111,15 +3236,13 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Record not found.")
     if not rec.manifest:
         raise HTTPException(status_code=422, detail="This record has no manifest number to check.")
-    if not rec.needs_sid_export:
-        return {"updated": False, "bol_number": rec.bol_number, "message": "This record already has a BOL."}
 
     from backend.data_layer import get_technique_data, get_manifest_weights
 
     messages = []
     updated = False
 
-    # (1) Refresh weight/pallets/pieces from VisualMail (Query B)
+    # (1) Refresh weight/pallets/pieces from VisualMail (Query B) — always runs.
     weight_data = get_manifest_weights([rec.manifest]).get(rec.manifest)
     if weight_data:
         new_weight  = weight_data["technique_weight"]
@@ -3132,26 +3255,32 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
             _compute_diffs(rec)
             updated = True
             messages.append("Weight/pallets/pieces updated.")
-
-    # (2) Check BOL status from Technique/ShipperPlus (Query A)
-    manifests = _dedupe_technique_rows(get_technique_data(days_back=21))
-    match = next((m for m in manifests if m.get("manifest") == rec.manifest), None)
-    if match is None:
-        messages.append("Manifest not found in Technique for BOL check — try again later.")
+        else:
+            messages.append("Weight/pallets/pieces unchanged.")
     else:
-        before = rec.bol_number
-        _apply_bol_status(rec, match)
-        if rec.bol_number and rec.bol_number != before:
-            updated = True
-            messages.append(f"BOL {rec.bol_number} found.")
+        messages.append(_NO_ACTIVE_PALLET_DATA_NOTE)
+
+    # (2) Check BOL status from Technique/ShipperPlus (Query A) — only meaningful
+    # for a record that doesn't have a BOL yet.
+    if rec.needs_sid_export:
+        manifests = _dedupe_technique_rows(get_technique_data(days_back=21))
+        match = next((m for m in manifests if m.get("manifest") == rec.manifest), None)
+        if match is None:
+            messages.append("Manifest not found in Technique for BOL check — try again later.")
+        else:
+            before = rec.bol_number
+            _apply_bol_status(rec, match)
+            if rec.bol_number and rec.bol_number != before:
+                updated = True
+                messages.append(f"BOL {rec.bol_number} found.")
+    else:
+        messages.append("BOL already exists — skipped Prophecy BOL check.")
 
     db.commit()
 
     if updated:
         logger.info("[REFRESH-BOL] %s → bol=%s weight=%s pallets=%s pcs=%s",
                     rec.manifest, rec.bol_number, rec.technique_weight, rec.technique_pallets, rec.technique_pcs)
-    else:
-        messages.append("No changes.")
 
     return {"updated": updated, "bol_number": rec.bol_number, "message": " ".join(messages)}
 
@@ -3159,10 +3288,12 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
 @app.post("/api/bols/{record_id}/retry-match", tags=["Admin"])
 def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     """
-    On-demand retry for one stuck invoice_only stub: check a wide (21-day) Technique
+    On-demand retry for one stuck invoice_only stub: check a wide (90-day) Technique
     window immediately instead of waiting for the next "Pull Manifests" click. Reuses
     _create_technique_record_from_fallback()/_compute_diffs() so this stays in sync
-    with the automatic wide fallback in pull_technique_data().
+    with the automatic wide fallback in pull_technique_data() (which keeps its own
+    much narrower 21-day window — this button is the deliberately wider, manually-
+    triggered search, not the automatic daily one).
     """
     if settings.USE_MOCK_DATA:
         raise HTTPException(status_code=400, detail="Retry-match is disabled in mock mode.")
@@ -3179,7 +3310,7 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
 
     from backend.data_layer import get_technique_data, get_manifest_weights
 
-    manifests = _dedupe_technique_rows(get_technique_data(days_back=21))
+    manifests = _dedupe_technique_rows(get_technique_data(days_back=90))
     candidates = [m for m in manifests if _trip_to_suffix(m.get("technique_trip") or "") == job_name_s]
     if not candidates:
         # Fall back to manifest-suffix matching (issue #65) — Job Name may reflect the
@@ -3187,7 +3318,7 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
         # cascade now tries in _process_invoice_csv().
         candidates = [m for m in manifests if _manifest_to_suffix(m.get("manifest") or "") == job_name_s]
     if not candidates:
-        return {"matched": False, "message": "Still not found in Technique (checked last 21 days)."}
+        return {"matched": False, "message": "Still not found in Technique (checked last 90 days)."}
 
     loose_match_note: Optional[str] = None
     if len(candidates) == 1:
@@ -3200,7 +3331,10 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
         # Technique query happened to return first.
         weight_map = get_manifest_weights([c["manifest"] for c in candidates])
         for c in candidates:
-            c["technique_weight"] = weight_map.get(c["manifest"], {}).get("technique_weight", 0)
+            wd = weight_map.get(c["manifest"], {})
+            c["technique_weight"]  = wd.get("technique_weight", 0)
+            c["technique_pallets"] = wd.get("technique_pallets", 0)
+            c["technique_pcs"]     = wd.get("technique_pcs", 0)
         match, score = _closest_technique_match(
             candidates, float(stub.alg_weight or 0), stub.alg_pallets or 0, stub.alg_pcs or 0,
         )

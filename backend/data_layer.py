@@ -30,7 +30,7 @@ def _get_tech_prd1_connection():
     import pyodbc
     from backend.config import settings
     conn_str = (
-        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+        f"DRIVER={{{settings.SQLSERVER_ODBC_DRIVER}}};"
         f"SERVER={settings.TECH_PRD1_SERVER};"
         f"DATABASE=ShipperPlus_Segerdahl;"
         f"UID={settings.TECH_PRD1_USER};"
@@ -56,7 +56,7 @@ def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail")
     from backend.config import settings
     if settings.SQLSERVER_USER and settings.SQLSERVER_PASSWORD:
         conn_str = (
-            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+            f"DRIVER={{{settings.SQLSERVER_ODBC_DRIVER}}};"
             f"SERVER={server};"
             f"DATABASE={database};"
             f"UID={settings.SQLSERVER_USER};"
@@ -65,7 +65,7 @@ def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail")
         )
     else:
         conn_str = (
-            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+            f"DRIVER={{{settings.SQLSERVER_ODBC_DRIVER}}};"
             f"SERVER={server};"
             f"DATABASE={database};"
             f"Trusted_Connection=yes;"
@@ -688,6 +688,7 @@ SELECT
         ELSE Pallet.UniqueContainerID
     END AS Order_ID,
     VisualMail.dbo.Locations.AccountNumber AS Dest_ID,
+    VisualMail.dbo.Locations.ZipCode AS Dest_Zip,
     ROUND(VisualMail.dbo.Pallet.Weight, 0) AS Wgt,
     1 AS Pallets,
     VisualMail.dbo.Pallet.NumberOfCopies AS PCS,
@@ -730,14 +731,19 @@ def get_pallet_data_for_manifests(manifest_numbers: list[str]) -> list[dict]:
     Fetch pallet-level rows from VisualMail for each manifest in the list.
     Used to generate the Prophecy SID import file.
 
-    Returns a list of dicts with keys matching SID_CSV_COLUMNS in csv_export.py:
+    Returns a list of dicts with keys matching SID_CSV_COLUMNS in csv_export.py
+    (extra keys below are ignored by generate_sid_csv()'s extrasaction="ignore"):
         ManifestNumber, OrderNumber, UniqueContainerID, Order_ID, MotherPalletID,
         Dest ID, Wgt, Pallets, PCS, Delv Appt From, Delv Appt to, JobNumber,
         Earliest Ship Date, Order Comments, Comments 2, Description, JobID,
         Version, VerifiedDate, Location
 
-    Dest ID = Locations.AccountNumber, e.g. 'SCF606' (parse first 3 digits after
-    prefix to get the ep_zip3 for tariff lookup: 'SCF606' → '606').
+    Dest ID = Locations.AccountNumber, e.g. 'SCF606' — do NOT derive its zip3 by
+    slicing this string (confirmed 2026-07-16: the code's own digits are ALG's zone
+    label, not always the real zip3 — e.g. 'ASF140' labels a facility whose real
+    ZIP is 142xx). Dest_Zip = Locations.ZipCode is the real 5-digit ZIP for this
+    destination and should be preferred for zip3 derivation; Dest_ID remains the
+    key for the exact-match alg_tariff_rates lookup, which needs no zip3 at all.
     """
     if not manifest_numbers:
         return []
