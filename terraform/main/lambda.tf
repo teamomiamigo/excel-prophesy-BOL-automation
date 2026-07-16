@@ -23,6 +23,15 @@ resource "aws_lambda_function" "app" {
     security_group_ids = [aws_security_group.lambda_sql_access[0].id]
   }
 
+  # NOTE (2026-07-16): backend/config.py supports reading DB credentials
+  # directly from Aurora's own AWS-managed, auto-rotated master secret
+  # (RDS_MASTER_SECRET_ARN/DB_HOST/DB_PORT/DB_NAME) instead of the manually-
+  # synced copy below — that's the real fix for today's credential-drift
+  # outage. It is NOT wired up here yet: doing so requires an IAM policy
+  # update (iam.tf) that needs iam:PutRolePolicy, which the deploying user
+  # doesn't currently have. Once that permission is available, add those 4
+  # env vars back (see git history around this comment) and restore the
+  # matching iam.tf statement to complete the fix.
   environment {
     variables = {
       AWS_SECRET_NAME = "sg360-bol-live-credentials"

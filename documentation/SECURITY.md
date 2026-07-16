@@ -76,6 +76,22 @@ When you get SQL access from Raj/IT:
 
 ---
 
+## Database credentials in AWS
+
+*(Added 2026-07-16, after a production outage caused by exactly this gap not being written down anywhere.)*
+
+The app's own PostgreSQL database (Aurora Serverless v2, `sg360-bol-aurora`) currently gets its password from **`sg360-bol-live-credentials`**, an out-of-band secret (created manually, not tracked by Terraform — Terraform only knows its ARN/name as a literal string in `iam.tf`/`lambda.tf`) that also holds SMTP, on-prem SQL Server, and EIA API credentials.
+
+**The actual root cause of the 2026-07-16 outage:** Aurora's real master password is separately AWS-managed and auto-rotated (`manage_master_user_password = true` in `terraform/main/aurora.tf`, name pattern `rds!cluster-...`), and nothing keeps `sg360-bol-live-credentials`'s copy in sync with it — so every auto-rotation (roughly weekly) silently breaks the DB connection until someone manually resyncs it (as was done that day; next rotation is due ~2026-07-23).
+
+**The intended fix, built but not yet deployed:** `backend/config.py` supports reading the DB password directly from Aurora's own auto-managed secret at every cold start (no copy to go stale), via `RDS_MASTER_SECRET_ARN`/`DB_HOST`/`DB_PORT`/`DB_NAME`. Enabling it requires granting the deploying AWS user `iam:PutRolePolicy` on the `sg360-bol-lambda-exec` role — not currently available. Until that permission is granted and this is wired up in `terraform/main/lambda.tf`/`iam.tf`, **expect this outage to recur on the next auto-rotation** unless someone manually resyncs the secret first.
+
+**Known gap:** `sg360-bol-live-credentials` being untracked by Terraform is a separate, non-urgent weakness — its contents can't be diffed/reviewed like the rest of the infrastructure. Bringing it under Terraform management (or splitting it into per-purpose secrets) is a reasonable future improvement, not yet done.
+
+*Last reviewed: 2026-07-16.*
+
+---
+
 ## The Repository
 
 ### What to commit
@@ -139,4 +155,4 @@ If asked, here's the one-paragraph answer:
 
 ---
 
-*Last reviewed: June 19, 2026*
+*Last reviewed: 2026-07-16 (added "Database credentials in AWS" section)*
