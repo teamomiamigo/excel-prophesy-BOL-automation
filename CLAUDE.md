@@ -236,12 +236,15 @@ All queries connect to AWP-SQL-PROD. TECH, SegGroup, and SQLAPPS3 are linked ser
 
 **ALG quantity fields** (`alg_weight`, `alg_pallets`, `alg_pcs` on `BOLRecord`): null until a CSV is uploaded via `POST /api/invoices/upload`. `weight_diff`, `pallet_diff`, `pcs_diff` are computed at upload time and stored; they are not recalculated on re-pull.
 
-**Invoice matching — `_process_invoice_csv()` in `main.py` (~line 1005):** shared by manual upload and email polling. Tried in this order — exact matches always before the Prophecy-BOL guess (fixed 2026-07-01, issue #31: a real trip whose numeric suffix coincidentally starts with "14" was being misclassified as a Wolf/311 load before this reorder):
+**Invoice matching — `_process_invoice_csv()` in `main.py` (~line 1950):** shared by manual upload and email polling. Tried in this order — exact matches always before the Prophecy-BOL guess (fixed 2026-07-01, issue #31: a real trip whose numeric suffix coincidentally starts with "14" was being misclassified as a Wolf/311 load before this reorder):
 1. **Z-number**: CSV Z-number → `invoice_number` field on `BOLRecord`
-2. **Job Name as trip suffix**: CSV "Job Name" field → trip DespatchID suffix (`str(int(trip.split('T_')[-1]))`, e.g. `TEC_T_0397246` → `"397246"`)
-3. **Job Name as Prophecy BOL** (Wolf/311 — no Technique trip for this load): only checked once steps 1-2 rule out a real trip match. `BOL No` is a Post Office permit number, never used for matching.
+2. **Job Name as trip suffix**: CSV "Job Name" field → trip DespatchID suffix (`_trip_to_suffix()`, e.g. `TEC_T_0397246` → `"397246"`). One trip can have several manifests — `_closest_technique_match()` scores every individual manifest plus one synthetic "whole trip" candidate (summed quantities across all of them) against the invoice's own billed weight/pallets/pcs; if the trip-sum candidate wins, the invoice attaches to one primary manifest (prefers one with a BOL already, else the heaviest) and every other manifest on the trip gets an explanatory note but is otherwise left alone.
+   - **2b. Manifest suffix fallback (added 2026-07-15, issue #65)**: if no trip shares this suffix at all, try the same idea against the **manifest**'s own suffix instead (`_manifest_to_suffix()`, e.g. `TEC_M_0228920` → `"228920"`) — a trip and its manifest are genuinely different numbers, so some invoices' Job Name reflects the manifest rather than the trip. No trip-sum candidate here (summing unrelated manifests that only coincidentally share a suffix wouldn't mean the invoice covers all of them).
+3. **Job Name as Prophecy BOL** (Wolf/311 — no Technique trip for this load): only checked once steps 1-2 rule out a real trip/manifest match. `BOL No` is a Post Office permit number, never used for matching.
 4. **Pallets + pieces** (last resort, non-comingle only, exact count match against a single unmatched record — logs a warning to verify manually)
 5. **No match**: create stub record (invoice-only, `technique_trip` is null)
+
+`POST /api/bols/{id}/retry-match` reuses the same trip-suffix → manifest-suffix fallback order and `_closest_technique_match()` scoring (fixed 2026-07-15, issue #65 — previously took whichever Technique candidate the query happened to return first, with no scoring, when multiple manifests shared a suffix).
 
 **Comingle invoices** (CSV "Cust Job No" starts with `"CM"`): always create a stub with `access_prog=null` and `cost_pct=null`. These are comingle loads that have no Technique record to match against — label them "Comingle — no Technique match". Non-comingle unmatched stubs also get `access_prog=null` / `cost_pct=null`.
 
@@ -290,7 +293,7 @@ Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — show
 - `is_third_party` (Boolean): excludes from SID + accounting exports; reversible
 - `is_do_not_pay` (Boolean): marks an unmatched invoice-only record do-not-pay — unlike `is_third_party`, does NOT exclude from the accounting export; it's included and rendered as "DO NOT PAY"/"DNP" instead of an amount. Setting it also sets `status=approved`. Reversible
 - `needs_sid_export` (Boolean): True = Type A record (no BOL yet); False = Type B (BOL already in Prophecy)
-- `match_strategy` (String): how the invoice was matched — `"trip"`, `"bol"`, or null for stubs
+- `match_strategy` (String): how the invoice was matched — `"invoice_number"` (Z-number re-upload), `"job_name"` (trip or manifest suffix, or a re-scored retry-match), `"prophecy_bol"` (Wolf/311, Job Name is a Prophecy BOL), `"pallets_pieces"` (last-resort exact quantity match), or `"invoice_only"` for an unmatched stub — never null once an invoice has been processed
 - `accounting_exported_at` nullable DateTime — set when "Send to Accounting" runs; exposed in Log tab
 - `sid_exported_at` nullable DateTime — set when a record's SID CSV is downloaded (bulk `GET /api/export/prophecy-sid` or per-record `POST /api/bols/{id}/export-prophecy-sid`); previously existed but was never written until 2026-07-02
 - `approval_history` table for full audit trail
