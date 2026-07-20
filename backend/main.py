@@ -1105,6 +1105,7 @@ def _create_technique_record_from_fallback(db: Session, m: dict, weight_data: di
     row.technique_pcs     = weight_data.get("technique_pcs", 0)
     if not weight_data:
         _append_note_to(row, _NO_ACTIVE_PALLET_DATA_NOTE)
+    row.is_ambiguous_trip = (m.get("_trip_manifest_count") or 0) > 1
     _apply_bol_status(row, m)
     proph_pcs = m.get("prophecy_pcs") or 0
     if proph_pcs:
@@ -2174,6 +2175,40 @@ def _partition_candidates_by_resolution(candidates: list):
     return usable, resolved
 
 
+def _flag_if_resolved_match_looks_wrong(
+    matched_rec, total_weight, total_pallets, total_pcs, invoice_no: str, job_name: str, suffix_kind: str,
+) -> None:
+    """
+    Diagnostic-only sanity check for the "exactly one resolved candidate" shortcut
+    above: a bol_number means Katie already resolved this ambiguity, so it must
+    keep winning the match regardless of how well its quantities fit — never
+    override matched_rec here. But nothing else was ever checking whether that
+    resolved candidate's own quantities are even a plausible fit for this invoice,
+    so a stale/wrong bol_number on the wrong manifest could silently absorb an
+    unrelated invoice with no signal anywhere. Log + note when the fit is bad,
+    so it's visible (dashboard ~UNVERIFIED badge, Log tab, CSV exports) without
+    ever second-guessing Katie's own resolution.
+    """
+    _, score = _closest_technique_match([matched_rec], total_weight, total_pallets, total_pcs)
+    if score > _CLOSE_MATCH_THRESHOLD:
+        note = (
+            f"Invoice {invoice_no} attached to already-resolved manifest "
+            f"{_cget(matched_rec, 'manifest')} (BOL {_cget(matched_rec, 'bol_number')}) via "
+            f"{suffix_kind}-suffix '{job_name}', but its own Technique quantities differ "
+            f"sharply from this invoice (discrepancy score {score:.2f}) — verify manually."
+        )
+        logger.warning(
+            "[INVOICE] %s -> resolved match on %s suffix '%s' has large discrepancy "
+            "(score=%.3f) despite skipping quantity scoring - flagging for review",
+            invoice_no, suffix_kind, job_name, score,
+        )
+        if settings.USE_MOCK_DATA:
+            existing = matched_rec.get("notes")
+            matched_rec["notes"] = f"{existing} {note}" if existing else note
+        else:
+            matched_rec.notes = f"{matched_rec.notes} {note}" if matched_rec.notes else note
+
+
 def _wide_fallback_technique_search(
     job_name: str, alg_weight: "float | None", alg_pallets: "int | None", alg_pcs: "int | None",
     days_back: int = 90,
@@ -2201,6 +2236,15 @@ def _wide_fallback_technique_search(
 
     wide_manifests = _dedupe_technique_rows(get_technique_data(days_back=days_back))
 
+    # Same "how many manifests does this trip have" count pull_technique_data() computes
+    # for is_ambiguous_trip -- records created via this wide fallback previously never set
+    # it at all (always defaulted False), so a genuinely ambiguous trip found only here
+    # could never show the ~UNVERIFIED badge.
+    trip_manifest_counts: dict[str, int] = {}
+    for m in wide_manifests:
+        if m.get("technique_trip"):
+            trip_manifest_counts[m["technique_trip"]] = trip_manifest_counts.get(m["technique_trip"], 0) + 1
+
     by_trip_suffix: dict[str, list[dict]] = {}
     by_manifest_suffix: dict[str, list[dict]] = {}
     for m in wide_manifests:
@@ -2213,6 +2257,7 @@ def _wide_fallback_technique_search(
     if not candidates:
         return None
     if len(candidates) == 1:
+        candidates[0]["_trip_manifest_count"] = trip_manifest_counts.get(candidates[0].get("technique_trip"), 0)
         return candidates[0]
 
     # Multiple manifests share this suffix in the wide window — score by closeness
@@ -2230,6 +2275,7 @@ def _wide_fallback_technique_search(
             "still has a large discrepancy (score=%.3f) - verify manually",
             len(candidates), job_name, score,
         )
+    best["_trip_manifest_count"] = trip_manifest_counts.get(best.get("technique_trip"), 0)
     return best
 
 
@@ -2307,7 +2353,15 @@ def _apply_invoice_match(
                 matched_rec["alg_weight"] = alg_weight_dec
                 matched_rec["alg_pallets"] = total_pallets or None
                 matched_rec["alg_pcs"] = total_pcs or None
-        matched_rec["match_strategy"] = match_strategy
+            # Only classify the record on a genuinely new match -- a duplicate
+            # re-upload of an already-recorded invoice (already_done) tells us
+            # nothing new about what kind of record this is, and blindly
+            # resetting match_strategy here would erase a real prior
+            # classification like "prophecy_bol" in favor of "invoice_number"
+            # (which just describes how THIS re-upload was looked up, not what
+            # the record actually is) -- breaking anything that branches on it,
+            # e.g. POST /api/admin/recompute-access-prog's Prophecy detection.
+            matched_rec["match_strategy"] = match_strategy
         matched_rec["inv_job_number"] = job_name
         if invoice_email_sender:
             matched_rec["invoice_email_sender"] = invoice_email_sender
@@ -2363,7 +2417,15 @@ def _apply_invoice_match(
                 matched_rec.alg_weight = alg_weight_dec
                 matched_rec.alg_pallets = total_pallets or None
                 matched_rec.alg_pcs = total_pcs or None
-        matched_rec.match_strategy = match_strategy
+            # Only classify the record on a genuinely new match -- a duplicate
+            # re-upload of an already-recorded invoice (already_done) tells us
+            # nothing new about what kind of record this is, and blindly
+            # resetting match_strategy here would erase a real prior
+            # classification like "prophecy_bol" in favor of "invoice_number"
+            # (which just describes how THIS re-upload was looked up, not what
+            # the record actually is) -- breaking anything that branches on it,
+            # e.g. POST /api/admin/recompute-access-prog's Prophecy detection.
+            matched_rec.match_strategy = match_strategy
         matched_rec.inv_job_number = job_name
         if invoice_email_sender:
             matched_rec.invoice_email_sender = invoice_email_sender
@@ -2545,6 +2607,9 @@ def _process_invoice_csv(
                     invoice_no, _cget(matched_rec, "manifest"), len(usable) - 1, job_name,
                     _cget(matched_rec, "bol_number"),
                 )
+                _flag_if_resolved_match_looks_wrong(
+                    matched_rec, total_weight, total_pallets, total_pcs, invoice_no, job_name, "trip",
+                )
             else:
                 # Some ALG invoices bill the whole trip, not one manifest (confirmed
                 # live: Z558228 billed 19,076 lbs against manifests of 18,138 + 1,048).
@@ -2644,6 +2709,9 @@ def _process_invoice_csv(
                         "quantity-closeness scoring",
                         invoice_no, _cget(matched_rec, "manifest"), len(usable) - 1, job_name,
                         _cget(matched_rec, "bol_number"),
+                    )
+                    _flag_if_resolved_match_looks_wrong(
+                        matched_rec, total_weight, total_pallets, total_pcs, invoice_no, job_name, "manifest",
                     )
                 else:
                     scoring_pool = resolved if resolved else usable
@@ -2749,6 +2817,7 @@ def _process_invoice_csv(
     if matched_rec is None:
         is_wolf_stub = bool(effective_prophecy_bol)
         stub_bol_number = int(effective_prophecy_bol) if is_wolf_stub else None
+        stub_match_strategy = "prophecy_bol" if is_wolf_stub else "invoice_only"
         if is_wolf_stub:
             auto_note = f"Wolf/311 load — Prophecy BOL {effective_prophecy_bol}. No matching morning record found."
         elif (cust_job_no or "").upper().startswith("CM"):
@@ -2790,7 +2859,7 @@ def _process_invoice_csv(
                 "notes": auto_note,
                 "status": "pending",
                 "flag_reason": None,
-                "match_strategy": "prophecy_bol" if is_wolf_stub else "invoice_only",
+                "match_strategy": stub_match_strategy,
                 "needs_sid_export": False,
                 "no_invoice": False,
                 "is_third_party": False,
@@ -2817,7 +2886,7 @@ def _process_invoice_csv(
                 cost_pct              = cost_pct_s,
                 notes                 = auto_note,
                 status                = BOLStatus.PENDING,
-                match_strategy        = "prophecy_bol" if is_wolf_stub else "invoice_only",
+                match_strategy        = stub_match_strategy,
                 needs_sid_export      = False,
             )
             db.add(stub)
@@ -2849,20 +2918,24 @@ def _process_invoice_csv(
             invoice_no, stub_bol_number, auto_note,
         )
         return {
-            "matched": False,
+            "matched": is_wolf_stub,
             "invoice_number": invoice_no,
             "job_name": job_name,
             "alg_bol_no": alg_bol_no,
             "matched_trip": None,
             "manifest": None,
-            "match_strategy": "invoice_only",
+            "match_strategy": stub_match_strategy,
             "alg_pcs": total_pcs,
             "alg_weight": round(total_weight, 2),
             "alg_pallets": total_pallets,
             "amount": total_billed,
             "fsc_pct": fsc_rate_val,
             "fsc_cost": fsc_cost_val,
-            "message": f"Invoice {invoice_no} has no match — stub record created. {auto_note}",
+            "message": (
+                f"Invoice {invoice_no} matched Prophecy BOL {effective_prophecy_bol} (Wolf/311 load)."
+                if is_wolf_stub
+                else f"Invoice {invoice_no} has no match — stub record created. {auto_note}"
+            ),
         }
 
     result = _apply_invoice_match(
@@ -3743,6 +3816,15 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     from backend.data_layer import get_technique_data, get_manifest_weights
 
     manifests = _dedupe_technique_rows(get_technique_data(days_back=90))
+
+    # Same is_ambiguous_trip count pull_technique_data() computes -- retry-match creates
+    # records via _create_technique_record_from_fallback() too, which previously never
+    # set this at all (see the wide-fallback fix above).
+    trip_manifest_counts: dict[str, int] = {}
+    for m in manifests:
+        if m.get("technique_trip"):
+            trip_manifest_counts[m["technique_trip"]] = trip_manifest_counts.get(m["technique_trip"], 0) + 1
+
     candidates = [m for m in manifests if _trip_to_suffix(m.get("technique_trip") or "") == job_name_s]
     if not candidates:
         # Fall back to manifest-suffix matching (issue #65) — Job Name may reflect the
@@ -3782,6 +3864,7 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
                 stub.invoice_number, len(candidates), job_name_s, score,
             )
 
+    match["_trip_manifest_count"] = trip_manifest_counts.get(match.get("technique_trip"), 0)
     row = _create_technique_record_from_fallback(db, match, weight_data)
     row.invoice_number = stub.invoice_number
     row.inv_job_number  = stub.inv_job_number

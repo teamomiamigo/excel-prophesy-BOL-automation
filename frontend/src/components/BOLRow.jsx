@@ -32,8 +32,30 @@ export function isThirdPartyEligible(bol) {
 // confirmed as belonging to the right manifest for this trip. Resolution comes only
 // from actions Katie already takes herself (SID export -> Prophecy import -> bol_number,
 // or mark-third-party) -- never inferred from Technique's own TranType/Notes fields.
+//
+// Second, independent trigger: a record CAN already have a bol_number and still be
+// wrongly matched -- the backend's "resolved candidate" shortcut (main.py) picks
+// whichever manifest already has a bol_number without checking whether its own
+// quantities are even close to what the invoice billed. weight_diff/pallet_diff/
+// pcs_diff are already computed for every record regardless of ambiguity, so a
+// severe mismatch is visible here with no backend change.
+const QUANTITY_MISMATCH_THRESHOLD = 0.15; // mirrors backend's _CLOSE_MATCH_THRESHOLD (main.py)
+
+function _relDiff(diffVal, algVal) {
+  if (diffVal == null || !algVal) return 0;
+  return Math.abs(diffVal) / Math.abs(algVal);
+}
+
+function hasSevereQuantityMismatch(bol) {
+  const score = _relDiff(bol.weight_diff, bol.alg_weight)
+              + _relDiff(bol.pallet_diff, bol.alg_pallets)
+              + _relDiff(bol.pcs_diff, bol.alg_pcs);
+  return score > QUANTITY_MISMATCH_THRESHOLD;
+}
+
 export function isUnverifiedQuantity(bol) {
-  return !!bol.is_ambiguous_trip && !bol.bol_number && !bol.is_third_party;
+  if (bol.is_third_party) return false;
+  return (!!bol.is_ambiguous_trip && !bol.bol_number) || hasSevereQuantityMismatch(bol);
 }
 
 // ---------------------------------------------------------------------------
