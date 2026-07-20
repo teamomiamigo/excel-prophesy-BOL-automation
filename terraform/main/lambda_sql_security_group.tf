@@ -17,6 +17,22 @@ variable "chg_approved_sql_access" {
 # ShipperPlus_Segerdahl never lived on that host). AWP-SQL-PROD egress remains,
 # unchanged and still within what was approved.
 #
+# NOTE (2026-07-20, same day): `description` below is deliberately left
+# UNCHANGED (still mentions SG360-TECH-PRD1) even though the rule for it is
+# gone. AWS treats a security group's `description` as immutable, so editing
+# it forces Terraform to destroy and recreate the entire group -- which this
+# repo actually attempted once, and it failed: Lambda provisioned concurrency
+# (lambda.tf) keeps a warm execution environment permanently attached to this
+# group's network interface, so AWS could never detach it to allow deletion,
+# and the apply died on a 45-minute ENI-detach timeout mid-replacement. That
+# window also took the live site down (this group had zero egress rules while
+# the replacement was destroying-then-recreating them). Recovered by manually
+# restoring the 9 needed rules directly via the AWS API and reconciling
+# Terraform's state via `terraform import` -- see git history around this
+# comment / Developmental Documentation.md for the full incident. Do not
+# change `description` again without first removing provisioned concurrency
+# from lambda.tf, applying the group replacement, then re-adding it.
+#
 # All rules for this security group are managed as separate
 # aws_security_group_rule resources below, NOT as inline egress blocks here.
 # Mixing the two causes Terraform to treat externally-added rules (like the
@@ -26,7 +42,7 @@ variable "chg_approved_sql_access" {
 resource "aws_security_group" "lambda_sql_access" {
   count       = var.chg_approved_sql_access ? 1 : 0
   name        = "${var.project_name}-lambda-sql-access"
-  description = "Outbound SQL Server access only, to AWP-SQL-PROD"
+  description = "Outbound SQL Server access only, to AWP-SQL-PROD and SG360-TECH-PRD1"
   vpc_id      = "vpc-013b795209b52a39a"
 }
 
