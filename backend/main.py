@@ -13,7 +13,7 @@ import boto3
 from botocore.config import Config as BotoConfig
 from fastapi import FastAPI, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -1504,8 +1504,11 @@ def _find_invoice_file(folder: str, z: str, require_csv: bool = False) -> "tuple
 
 
 def _fetch_invoice_pdf_bytes(z: str) -> "bytes | None":
-    """Fetch raw PDF bytes for a Z-number: S3 first, then INVOICE_FOLDER fallback.
-    Returns None if the PDF can't be found in either location."""
+    """Fetch raw PDF bytes for a Z-number: S3 first, then the local disk cache
+    (whatever _store_invoice_pdf_bytes() wrote there), then INVOICE_FOLDER as a
+    last resort for PDFs that never passed through this app at all (e.g. one
+    poll_invoice_folder found sitting on the shared drive next to its CSV).
+    Returns None if the PDF can't be found anywhere."""
     if not settings.USE_MOCK_DATA and settings.INVOICE_S3_BUCKET:
         try:
             resp = boto3.client("s3", config=_S3_FAST_FAIL).get_object(
@@ -1514,6 +1517,10 @@ def _fetch_invoice_pdf_bytes(z: str) -> "bytes | None":
             return resp["Body"].read()
         except Exception:
             pass
+    cache_path = os.path.join(_INVOICE_PDF_CACHE_DIR, f"{z}.pdf")
+    if os.path.isfile(cache_path):
+        with open(cache_path, "rb") as fh:
+            return fh.read()
     folder = (
         settings.INVOICE_FOLDER
         if not settings.USE_MOCK_DATA
@@ -1526,6 +1533,169 @@ def _fetch_invoice_pdf_bytes(z: str) -> "bytes | None":
             with open(path, "rb") as fh:
                 return fh.read()
     return None
+
+
+# S3 (INVOICE_S3_BUCKET) is the only persistent store reachable from Lambda,
+# but a local dev machine usually has no bucket configured at all — without
+# this, a PDF uploaded through the frontend's multipart pdf_file field would
+# be read into memory and then simply discarded, with nowhere to retrieve it
+# from afterward. Individual PDFs are cached flat (mirrors the S3 key layout,
+# "{z}.pdf"); merged batch PDFs live under a batches/ subfolder.
+_INVOICE_PDF_CACHE_DIR = os.path.join(os.path.dirname(__file__), "invoice_pdf_cache")
+
+
+def _store_invoice_pdf_bytes(z: str, data: bytes) -> None:
+    """Persist one invoice's PDF bytes: S3 if INVOICE_S3_BUCKET is set, else the
+    local disk cache. Best-effort — logs and swallows failures, matching the
+    error handling already used at this function's one call site."""
+    if settings.INVOICE_S3_BUCKET:
+        try:
+            boto3.client("s3", config=_S3_FAST_FAIL).put_object(
+                Bucket=settings.INVOICE_S3_BUCKET,
+                Key=f"{z}.pdf",
+                Body=data,
+                ContentType="application/pdf",
+            )
+        except Exception as exc:
+            logger.error("[INVOICE-PDF] Failed to store PDF for %s in S3: %s", z, exc)
+        return
+    os.makedirs(_INVOICE_PDF_CACHE_DIR, exist_ok=True)
+    with open(os.path.join(_INVOICE_PDF_CACHE_DIR, f"{z}.pdf"), "wb") as fh:
+        fh.write(data)
+
+
+def _store_batch_pdf_bytes(slug: str, data: bytes) -> None:
+    """Persist a merged batch PDF under the same S3-or-local-cache split as
+    _store_invoice_pdf_bytes(), keyed under a batches/ prefix/subfolder."""
+    if settings.INVOICE_S3_BUCKET:
+        try:
+            boto3.client("s3", config=_S3_FAST_FAIL).put_object(
+                Bucket=settings.INVOICE_S3_BUCKET,
+                Key=f"batches/{slug}.pdf",
+                Body=data,
+                ContentType="application/pdf",
+            )
+        except Exception as exc:
+            logger.error("[INVOICE-PDF] Failed to store batch PDF '%s' in S3: %s", slug, exc)
+        return
+    batch_dir = os.path.join(_INVOICE_PDF_CACHE_DIR, "batches")
+    os.makedirs(batch_dir, exist_ok=True)
+    with open(os.path.join(batch_dir, f"{slug}.pdf"), "wb") as fh:
+        fh.write(data)
+
+
+def _fetch_batch_pdf_bytes(slug: str) -> "bytes | None":
+    """Fetch a previously-merged batch PDF: S3 if configured, else local cache.
+    Returns None if no precomputed batch PDF exists yet for this slug."""
+    if not settings.USE_MOCK_DATA and settings.INVOICE_S3_BUCKET:
+        try:
+            resp = boto3.client("s3", config=_S3_FAST_FAIL).get_object(
+                Bucket=settings.INVOICE_S3_BUCKET, Key=f"batches/{slug}.pdf"
+            )
+            return resp["Body"].read()
+        except Exception:
+            return None
+    path = os.path.join(_INVOICE_PDF_CACHE_DIR, "batches", f"{slug}.pdf")
+    if os.path.isfile(path):
+        with open(path, "rb") as fh:
+            return fh.read()
+    return None
+
+
+def _slugify_sender(label: str) -> str:
+    """Turn an invoice_email_sender label (e.g. 'Tania 6/25/2026 4:16PM') into
+    a filesystem/S3-key-safe slug for batch PDF storage — used as the storage
+    key only. For a user-facing download filename, use _readable_batch_name()
+    instead; this one is deliberately unreadable (every non-alphanumeric char
+    becomes '_') so it can't collide across senders whose labels differ only
+    in punctuation."""
+    import re
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", label.strip()).strip("_")
+    return slug or "unassigned"
+
+
+def _readable_batch_name(label: str) -> str:
+    """Human-readable version of a batch label (e.g. 'Tania 6/25/2026 4:16PM'
+    -> 'Tania 6-25-2026 4-16PM') for use in a download filename. Unlike
+    _slugify_sender() (the storage key), this only swaps the handful of
+    characters Windows/macOS actually forbid in a filename, leaving the
+    sender name/date/time readable as-is — the downloaded file is named
+    after the batch itself, not an opaque slug."""
+    import re
+    name = re.sub(r'[\\/:*?"<>|]+', '-', label.strip())
+    return name or "batch"
+
+
+def _collect_batch_invoice_numbers(sender: str, db: Session) -> "list[str]":
+    """All distinct Z-numbers on records sharing this invoice_email_sender —
+    splits comma-joined invoice_number values (one record can carry more than
+    one Z-number, see _merge_invoice_numbers) and preserves first-seen order."""
+    if settings.USE_MOCK_DATA:
+        raw = [
+            v.get("invoice_number") for v in _mock_state.values()
+            if v.get("invoice_email_sender") == sender and v.get("invoice_number")
+        ]
+    else:
+        raw = [
+            row[0] for row in db.query(BOLRecord.invoice_number)
+                .filter(BOLRecord.invoice_email_sender == sender,
+                        BOLRecord.invoice_number.isnot(None))
+                .all()
+        ]
+    seen: list[str] = []
+    for val in raw:
+        for z in [p.strip() for p in val.split(",")]:
+            if z and z not in seen:
+                seen.append(z)
+    return seen
+
+
+def _merge_and_store_batch_pdf(sender: str, db: Session) -> dict:
+    """Merge every currently-locatable PDF for one invoice_email_sender batch
+    into a single PDF and persist it under that sender's slug, so the
+    "Download Invoices" button can serve a batch instantly instead of
+    re-merging on every click. Called once after a folder upload finishes
+    (POST /api/invoices/merge-batch-pdfs) and again, best-effort, at the end
+    of poll_invoice_folder(). Safe to call repeatedly — always re-merges from
+    current state, so a later-arriving PDF (e.g. a resolved stub) is picked up
+    next time it's called. A Z-number with no locatable PDF is skipped, not
+    fatal to the merge.
+    """
+    from pypdf import PdfWriter, PdfReader
+    import io as _io
+
+    z_list = _collect_batch_invoice_numbers(sender, db)
+    writer = PdfWriter()
+    missing: list[str] = []
+    for z in z_list:
+        pdf_bytes = _fetch_invoice_pdf_bytes(z)
+        if pdf_bytes is None:
+            missing.append(z)
+            continue
+        for page in PdfReader(_io.BytesIO(pdf_bytes)).pages:
+            writer.add_page(page)
+
+    if len(writer.pages) == 0:
+        logger.warning(
+            "[BATCH-PDF] No PDFs locatable for sender '%s' (%d invoice(s), all missing)",
+            sender, len(z_list),
+        )
+        return {"merged": False, "pdf_count": 0, "invoice_count": len(z_list), "missing": missing}
+
+    buf = _io.BytesIO()
+    writer.write(buf)
+    slug = _slugify_sender(sender)
+    _store_batch_pdf_bytes(slug, buf.getvalue())
+    logger.info(
+        "[BATCH-PDF] Merged %d/%d PDF(s) for sender '%s' -> batches/%s.pdf",
+        len(z_list) - len(missing), len(z_list), sender, slug,
+    )
+    return {
+        "merged": True,
+        "pdf_count": len(z_list) - len(missing),
+        "invoice_count": len(z_list),
+        "missing": missing,
+    }
 
 
 # How far apart (numerically) a pallet's zip3 and an invoice's billed zip3 can
@@ -2848,20 +3018,59 @@ async def upload_alg_invoice(
                                    invoice_sent_at=sent_at)
     result["invoice_email_sender"] = sender_str
 
-    if pdf_file is not None and settings.INVOICE_S3_BUCKET and result.get("invoice_number"):
+    if pdf_file is not None and result.get("invoice_number"):
         pdf_bytes = await pdf_file.read()
-        try:
-            boto3.client("s3", config=_S3_FAST_FAIL).put_object(
-                Bucket=settings.INVOICE_S3_BUCKET,
-                Key=f"{result['invoice_number']}.pdf",
-                Body=pdf_bytes,
-                ContentType="application/pdf",
-            )
-            logger.info("[UPLOAD] Stored PDF for %s in s3://%s", result["invoice_number"], settings.INVOICE_S3_BUCKET)
-        except Exception as exc:
-            logger.error("[UPLOAD] Failed to store PDF for %s in S3: %s", result["invoice_number"], exc)
+        _store_invoice_pdf_bytes(result["invoice_number"], pdf_bytes)
 
     return result
+
+
+@app.post("/api/invoices/merge-batch-pdfs", tags=["Invoices"])
+def merge_batch_pdfs(body: dict, db: Session = Depends(get_db)):
+    """
+    Merge and store the combined invoice PDF for one upload batch — every
+    record sharing the given invoice_email_sender. Called by the frontend once
+    after a whole folder's worth of per-file /api/invoices/upload calls
+    finishes, so the merge happens a single time per batch rather than being
+    redone on every "Download Invoices" click. Safe to call again later (e.g.
+    after a stub resolves and gains its own PDF) — always re-merges from
+    whatever's currently locatable.
+    """
+    sender = (body.get("sender") or "").strip()
+    if not sender:
+        raise HTTPException(status_code=400, detail="sender is required")
+    return _merge_and_store_batch_pdf(sender, db)
+
+
+@app.get("/api/invoices/batch-pdf", tags=["Invoices"])
+def get_batch_pdf(sender: str, db: Session = Depends(get_db)):
+    """
+    Serve the merged invoice PDF for one upload batch (every record sharing
+    this invoice_email_sender). Serves the precomputed merge stored by
+    POST /api/invoices/merge-batch-pdfs when one exists (fast path — no
+    re-merging on every click); otherwise merges on the fly from whatever PDFs
+    can currently be located and caches the result for next time — covers
+    batches uploaded before this endpoint existed, or where the merge-on-
+    upload step failed or was skipped (e.g. poll_invoice_folder-ingested
+    invoices with no S3-stored companion PDF, only INVOICE_FOLDER's copy).
+    """
+    sender = sender.strip()
+    if not sender:
+        raise HTTPException(status_code=400, detail="sender is required")
+    slug = _slugify_sender(sender)
+
+    cached = _fetch_batch_pdf_bytes(slug)
+    if cached is None:
+        result = _merge_and_store_batch_pdf(sender, db)
+        if not result["merged"]:
+            raise HTTPException(status_code=404, detail=f"No invoice PDFs found for sender '{sender}'")
+        cached = _fetch_batch_pdf_bytes(slug)
+
+    return StreamingResponse(
+        io.BytesIO(cached),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="SG360 Invoices - {_readable_batch_name(sender)}.pdf"'},
+    )
 
 
 @app.get("/api/invoices/{invoice_number}/file", tags=["Invoices"])
@@ -3015,6 +3224,20 @@ def poll_invoice_folder(db: Session = Depends(get_db)):
     msg = f"Processed {len(file_queue)} file(s): {matched} matched, {stubbed} stubbed."
     if errors:
         msg += f" {errors} error(s)."
+
+    # Best-effort: refresh each affected sender's merged batch PDF so
+    # "Download Invoices" doesn't need an on-the-fly merge next time. These
+    # PDFs were never uploaded through this app (poll_invoice_folder only ever
+    # reads the CSV, not a companion pdf_file), so this relies entirely on
+    # _fetch_invoice_pdf_bytes()'s INVOICE_FOLDER fallback finding them still
+    # sitting on the shared drive next to their CSV.
+    senders_touched = {sender_str for _, _, sender_str, _ in file_queue if sender_str}
+    for sender in senders_touched:
+        try:
+            _merge_and_store_batch_pdf(sender, db)
+        except Exception as exc:
+            logger.error("[POLL-FOLDER] Batch PDF merge failed for sender '%s': %s", sender, exc)
+
     return {"found": len(file_queue), "processed": results, "message": msg}
 
 
