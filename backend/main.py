@@ -85,10 +85,12 @@ async def lifespan(app: FastAPI):
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS alg_fsc_cost NUMERIC(10,2)"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS tariff_zone_approximate BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS weight_source_fallback BOOLEAN NOT NULL DEFAULT FALSE"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_ambiguous_trip BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.commit()
         logger.info(
             "DB column migration for base_tariff/fsc_pct/is_third_party/is_do_not_pay/"
-            "invoice_sent_at/alg_fsc_pct/alg_fsc_cost/tariff_zone_approximate/weight_source_fallback complete "
+            "invoice_sent_at/alg_fsc_pct/alg_fsc_cost/tariff_zone_approximate/weight_source_fallback/"
+            "is_ambiguous_trip complete "
             "(is_ignored dropped 2026-07-16 — see Developmental Documentation.md)."
         )
     logger.info(
@@ -1143,6 +1145,14 @@ def pull_technique_data(db: Session = Depends(get_db)):
     manifest_numbers = [m["manifest"] for m in manifests if m.get("manifest")]
     weights_by_manifest = get_manifest_weights(manifest_numbers) if manifest_numbers else {}
 
+    # A trip with more than one manifest in this pull is ambiguous — Technique doesn't
+    # reliably tell us which manifest is the real billable one (see is_ambiguous_trip
+    # on BOLRecord). Recomputed fresh on every pull, same lifecycle as technique_weight.
+    trip_manifest_counts: dict[str, int] = {}
+    for m in manifests:
+        if m.get("technique_trip"):
+            trip_manifest_counts[m["technique_trip"]] = trip_manifest_counts.get(m["technique_trip"], 0) + 1
+
     loaded = 0
     for m in manifests:
         manifest_num = m.get("manifest")
@@ -1178,6 +1188,8 @@ def pull_technique_data(db: Session = Depends(get_db)):
             _append_note_to(row, _NO_ACTIVE_PALLET_DATA_NOTE)
         # access_prog is computed at invoice upload time (per-pallet ZIP from ALG CSV) — not at pull time
 
+        row.is_ambiguous_trip = trip_manifest_counts.get(m["technique_trip"], 0) > 1
+
         # Type A = no load yet (needs SID export to Prophecy to create BOL)
         # Type B = load_id > 0 (BOL already exists in Prophecy/ShipperPlus; store it)
         _apply_bol_status(row, m)
@@ -1199,6 +1211,13 @@ def pull_technique_data(db: Session = Depends(get_db)):
 
     db.commit()
     logger.info("[PULL] Loaded %d records (days_back=%d)", loaded, days_back)
+
+    # Shared by both stub-resolution passes below (_finish_resolving_stub calls) — cheap
+    # to compute once per pull rather than once per resolved stub.
+    from backend.data_layer import get_tariff_rate as _get_tariff_rate
+    from backend.data_layer import get_current_diesel_price, get_fsc_rate as _get_fsc_rate
+    _diesel_price = get_current_diesel_price()
+    _fsc_pct = _get_fsc_rate(_diesel_price) if _diesel_price is not None else None
 
     # NOTE: stub re-matching and the wide fallback below intentionally run even when
     # `loaded == 0` (no new manifests today) — a day with nothing new despatched is
@@ -1288,6 +1307,10 @@ def pull_technique_data(db: Session = Depends(get_db)):
         match_rec.alg_pallets     = stub.alg_pallets
         match_rec.alg_pcs         = stub.alg_pcs
         match_rec.match_strategy  = match_strat
+        _finish_resolving_stub(
+            match_rec, stub.invoice_email_sender, stub.invoice_sent_at, settings.INVOICE_FOLDER,
+            _get_tariff_rate, _diesel_price, _fsc_pct,
+        )
         _compute_diffs(match_rec)
         db.delete(stub)
         rematched += 1
@@ -1298,13 +1321,17 @@ def pull_technique_data(db: Session = Depends(get_db)):
 
     # --- Wide fallback: stubs still unmatched may reference a real trip whose despatch
     # date just falls outside this pull's days_back=20 window. Check a much wider
-    # window once, rather than never re-checking Technique at all for these. ---
+    # 90-day window once (widened from 21 days 2026-07-17 -- an ALG invoice batch can
+    # lag well over 3 weeks behind despatch, e.g. a 6-25 batch processed 7-17; matches
+    # the window already proven correct on the per-record Retry button), rather than
+    # never re-checking Technique at all for these. Only runs when there's actually a
+    # stub to resolve, so this doesn't add cost to a normal day's pull. ---
     remaining_stubs = db.query(BOLRecord).filter(
         BOLRecord.match_strategy == "invoice_only", BOLRecord.bol_number.is_(None)
     ).all()
     wide_resolved = 0
     if remaining_stubs:
-        wide_manifests = _dedupe_technique_rows(get_technique_data(days_back=21))
+        wide_manifests = _dedupe_technique_rows(get_technique_data(days_back=90))
         # Group (not collapse) by trip suffix — a dict comprehension here previously kept
         # only the last manifest seen per suffix, non-deterministically (no ORDER BY on
         # the underlying query), whenever one trip legitimately had multiple manifests.
@@ -1351,11 +1378,15 @@ def pull_technique_data(db: Session = Depends(get_db)):
                 row.alg_pallets    = stub.alg_pallets
                 row.alg_pcs        = stub.alg_pcs
                 row.match_strategy = "job_name"
+                _finish_resolving_stub(
+                    row, stub.invoice_email_sender, stub.invoice_sent_at, settings.INVOICE_FOLDER,
+                    _get_tariff_rate, _diesel_price, _fsc_pct,
+                )
                 _compute_diffs(row)
                 db.delete(stub)
                 wide_resolved += 1
             db.commit()
-            logger.info("[PULL] Wide fallback (21-day) resolved %d previously-stuck stub(s)", wide_resolved)
+            logger.info("[PULL] Wide fallback (90-day) resolved %d previously-stuck stub(s)", wide_resolved)
 
     msg = f"Loaded {loaded} manifest(s)."
     if rematched:
@@ -1890,10 +1921,81 @@ def _parse_alg_csv_context(reader: "csv.DictReader") -> dict:
     return ctx
 
 
+def _finish_resolving_stub(
+    rec: "BOLRecord",
+    stub_sender: "str | None",
+    stub_sent_at,
+    folder: "str | None",
+    _get_tariff_rate,
+    _diesel_price,
+    _fsc_pct,
+) -> None:
+    """
+    Common cleanup after a code path attaches a resolved invoice_only stub's data onto
+    a real Technique record OUTSIDE the main upload flow (_apply_invoice_match() already
+    does both of these inline, as part of parsing the invoice CSV for the first time).
+    Used by pull_technique_data()'s DB-side stub re-match and wide-window fallback, and
+    by POST /api/bols/{id}/retry-match -- all three previously left invoice_email_sender/
+    invoice_sent_at blank and never computed access_prog/cost_pct, since they only ever
+    copied invoice_number/amount/alg_* onto the resolved record.
+
+    1. Copies invoice_email_sender/invoice_sent_at from the stub being consumed (rec
+       itself never had them -- it's either a brand-new fallback record or an existing
+       Technique record that was never an invoice).
+    2. Re-locates rec's own invoice CSV (_find_invoice_file, require_csv=True) and
+       re-parses it to compute access_prog/base_tariff/fsc_pct/cost_pct, the same way
+       POST /api/admin/recompute-access-prog does for a single record.
+
+    No-ops silently, leaving rec's cost fields null, if `folder` isn't configured/found,
+    the file can't be located, or our own pallet data isn't available -- same resilience
+    contract as recompute_access_prog(), since none of these are truly exceptional here.
+    """
+    if stub_sender:
+        rec.invoice_email_sender = stub_sender
+    if stub_sent_at:
+        rec.invoice_sent_at = stub_sent_at
+
+    if not folder or not os.path.isdir(folder) or not rec.invoice_number:
+        return
+    hit = _find_invoice_file(folder, rec.invoice_number, require_csv=True)
+    if hit is None:
+        return
+    path, _media_type = hit
+    try:
+        with open(path, "rb") as f:
+            content = f.read()
+    except OSError:
+        return
+
+    reader = csv.DictReader(io.StringIO(content.decode("utf-8", errors="replace")))
+    ctx = _parse_alg_csv_context(reader)
+    effective_prophecy_bol = (
+        str(rec.bol_number) if rec.match_strategy == "prophecy_bol" and rec.bol_number else None
+    )
+    _blended = (
+        round(ctx["alg_freight_total"] / (ctx["total_weight"] / 100.0), 4)
+        if ctx.get("alg_freight_total") and ctx.get("total_weight") else None
+    )
+    _apply_access_prog_calc(
+        rec, rec.match_strategy, effective_prophecy_bol,
+        ctx["alg_rate_by_zip3"], ctx["fsc_rate_val"], ctx["fsc_cost_val"],
+        _get_tariff_rate, _diesel_price, _fsc_pct,
+        alg_blended_rate=_blended,
+    )
+    if rec.access_prog is not None and rec.amount:
+        rec.cost_pct = Decimal(str(round(float(rec.access_prog) / float(rec.amount), 6)))
+
+
 _CLOSE_MATCH_THRESHOLD = 0.15  # combined relative difference across weight/pallets/pcs;
                                 # above this, log a warning and note the record for manual
                                 # verification, but still commit to the closest candidate —
                                 # tune against real invoices once this is live.
+
+
+def _cget(c, field):
+    """Read a field off a candidate that may be a BOLRecord (live mode) or a dict
+    (mock mode) -- shared by the trip-suffix/manifest-suffix matching strategies."""
+    return c.get(field) if isinstance(c, dict) else getattr(c, field, None)
 
 
 def _closest_technique_match(candidates: list, total_weight, total_pallets, total_pcs):
@@ -1924,6 +2026,28 @@ def _closest_technique_match(candidates: list, total_weight, total_pallets, tota
 
     scored = sorted(((c, _score(c)) for c in candidates), key=lambda pair: pair[1])
     return scored[0]
+
+
+def _partition_candidates_by_resolution(candidates: list):
+    """
+    Given several BOLRecords/dicts sharing one trip or manifest suffix, filter out
+    any candidate Katie has already marked is_third_party (she's told us it's not
+    the billable-through-SG360 leg — never auto-attach a new invoice there), unless
+    doing so would empty the pool entirely. Returns (usable, resolved):
+      usable   - candidates still eligible for matching (3P ones excluded, unless
+                 that would leave nothing)
+      resolved - the subset of `usable` that already has a bol_number, i.e. Katie
+                 has already created a real Prophecy BOL for it via her SID-export
+                 flow. An empty `resolved` means nothing's been resolved yet.
+
+    Resolution (bol_number / is_third_party) is a stronger, human-provided signal
+    than quantity-closeness scoring — it comes from actions Katie already takes
+    herself, not from guessing at Technique's own unreliable TranType/Notes fields.
+    """
+    non_tp = [c for c in candidates if not _cget(c, "is_third_party")]
+    usable = non_tp if non_tp else candidates
+    resolved = [c for c in usable if _cget(c, "bol_number")]
+    return usable, resolved
 
 
 def _apply_invoice_match(
@@ -2223,66 +2347,83 @@ def _process_invoice_csv(
             matched_rec = candidates[0]
             match_strategy = "job_name"
         elif len(candidates) > 1:
-            def _cget(c, field):
-                return c.get(field) if isinstance(c, dict) else getattr(c, field, None)
+            usable, resolved = _partition_candidates_by_resolution(candidates)
 
-            # Some ALG invoices bill the whole trip, not one manifest (confirmed
-            # live: Z558228 billed 19,076 lbs against manifests of 18,138 + 1,048).
-            # Score the combined totals of every manifest on the trip as one more
-            # candidate alongside each individual manifest — whichever fits the
-            # invoice's quantities best wins.
-            combined = {
-                "technique_weight": sum(float(_cget(c, "technique_weight") or 0) for c in candidates),
-                "technique_pallets": sum(int(_cget(c, "technique_pallets") or 0) for c in candidates),
-                "technique_pcs": sum(int(_cget(c, "technique_pcs") or 0) for c in candidates),
-                "_is_trip_sum": True,
-            }
-            best, score = _closest_technique_match(candidates + [combined], total_weight, total_pallets, total_pcs)
-            match_strategy = "job_name"
-            if isinstance(best, dict) and best.get("_is_trip_sum"):
-                # Trip-level invoice: attach to the primary manifest (prefer one
-                # that already has a BOL, else the heaviest), remember the trip
-                # totals so diffs get computed against them after the match applies.
-                primary = next((c for c in candidates if _cget(c, "bol_number")), None)
-                if primary is None:
-                    primary = max(candidates, key=lambda c: float(_cget(c, "technique_weight") or 0))
-                matched_rec = primary
-                manifest_names = ", ".join(str(_cget(c, "manifest")) for c in candidates)
-                trip_sum_ctx = {
-                    "weight": combined["technique_weight"],
-                    "pallets": combined["technique_pallets"],
-                    "pcs": combined["technique_pcs"],
-                    "siblings": [c for c in candidates if c is not primary],
-                    "manifest_names": manifest_names,
+            if len(resolved) == 1:
+                # Katie has already resolved this ambiguity herself (created the real
+                # Prophecy BOL for exactly one manifest on this trip via her SID-export
+                # flow) — trust that over any quantity-closeness guess.
+                matched_rec = resolved[0]
+                match_strategy = "job_name"
+                logger.info(
+                    "[INVOICE] %s -> preferred already-resolved manifest %s over %d other "
+                    "trip-suffix candidates on suffix '%s' (BOL %s already exists) — "
+                    "skipped quantity-closeness scoring",
+                    invoice_no, _cget(matched_rec, "manifest"), len(usable) - 1, job_name,
+                    _cget(matched_rec, "bol_number"),
+                )
+            else:
+                # Some ALG invoices bill the whole trip, not one manifest (confirmed
+                # live: Z558228 billed 19,076 lbs against manifests of 18,138 + 1,048).
+                # Score the combined totals of every manifest on the trip as one more
+                # candidate alongside each individual manifest — whichever fits the
+                # invoice's quantities best wins. If more than one candidate is already
+                # resolved (Katie's created real BOLs for two separate manifests on this
+                # trip), score only among those — an unresolved manifest never outscores
+                # one Katie has already confirmed.
+                scoring_pool = resolved if resolved else usable
+                combined = {
+                    "technique_weight": sum(float(_cget(c, "technique_weight") or 0) for c in usable),
+                    "technique_pallets": sum(int(_cget(c, "technique_pallets") or 0) for c in usable),
+                    "technique_pcs": sum(int(_cget(c, "technique_pcs") or 0) for c in usable),
+                    "_is_trip_sum": True,
                 }
-                logger.info(
-                    "[INVOICE] %s -> trip-level match on suffix '%s': invoice totals fit the "
-                    "combined %d manifests (%s) better than any single one (score=%.3f)",
-                    invoice_no, job_name, len(candidates), manifest_names, score,
-                )
-            else:
-                matched_rec = best
-            if score > _CLOSE_MATCH_THRESHOLD:
-                loose_match_note = (
-                    f"Matched via closest-quantity heuristic among {len(candidates)} "
-                    f"manifests on this trip (discrepancy score {score:.2f}) — verify manually."
-                )
-                logger.warning(
-                    "[INVOICE] %s -> closest match among %d candidates on trip suffix '%s' "
-                    "still has a large discrepancy (score=%.3f) - verify manually",
-                    invoice_no, len(candidates), job_name, score,
-                )
-            else:
-                logger.info(
-                    "[INVOICE] %s -> matched to closest of %d candidates on trip suffix '%s' (score=%.3f)",
-                    invoice_no, len(candidates), job_name, score,
-                )
-            if loose_match_note:
-                if settings.USE_MOCK_DATA:
-                    existing_notes = matched_rec.get("notes")
-                    matched_rec["notes"] = f"{existing_notes} {loose_match_note}" if existing_notes else loose_match_note
+                best, score = _closest_technique_match(scoring_pool + [combined], total_weight, total_pallets, total_pcs)
+                match_strategy = "job_name"
+                if isinstance(best, dict) and best.get("_is_trip_sum"):
+                    # Trip-level invoice: attach to the primary manifest (prefer one
+                    # that already has a BOL, else the heaviest), remember the trip
+                    # totals so diffs get computed against them after the match applies.
+                    primary = next((c for c in usable if _cget(c, "bol_number")), None)
+                    if primary is None:
+                        primary = max(usable, key=lambda c: float(_cget(c, "technique_weight") or 0))
+                    matched_rec = primary
+                    manifest_names = ", ".join(str(_cget(c, "manifest")) for c in usable)
+                    trip_sum_ctx = {
+                        "weight": combined["technique_weight"],
+                        "pallets": combined["technique_pallets"],
+                        "pcs": combined["technique_pcs"],
+                        "siblings": [c for c in usable if c is not primary],
+                        "manifest_names": manifest_names,
+                    }
+                    logger.info(
+                        "[INVOICE] %s -> trip-level match on suffix '%s': invoice totals fit the "
+                        "combined %d manifests (%s) better than any single one (score=%.3f)",
+                        invoice_no, job_name, len(usable), manifest_names, score,
+                    )
                 else:
-                    matched_rec.notes = f"{matched_rec.notes} {loose_match_note}" if matched_rec.notes else loose_match_note
+                    matched_rec = best
+                if score > _CLOSE_MATCH_THRESHOLD:
+                    loose_match_note = (
+                        f"Matched via closest-quantity heuristic among {len(scoring_pool)} "
+                        f"manifests on this trip (discrepancy score {score:.2f}) — verify manually."
+                    )
+                    logger.warning(
+                        "[INVOICE] %s -> closest match among %d candidates on trip suffix '%s' "
+                        "still has a large discrepancy (score=%.3f) - verify manually",
+                        invoice_no, len(scoring_pool), job_name, score,
+                    )
+                else:
+                    logger.info(
+                        "[INVOICE] %s -> matched to closest of %d candidates on trip suffix '%s' (score=%.3f)",
+                        invoice_no, len(scoring_pool), job_name, score,
+                    )
+                if loose_match_note:
+                    if settings.USE_MOCK_DATA:
+                        existing_notes = matched_rec.get("notes")
+                        matched_rec["notes"] = f"{existing_notes} {loose_match_note}" if existing_notes else loose_match_note
+                    else:
+                        matched_rec.notes = f"{matched_rec.notes} {loose_match_note}" if matched_rec.notes else loose_match_note
         else:
             # 2b. No trip-suffix match at all — the invoice's Job Name may instead reflect
             # the MANIFEST number rather than the trip number (issue #65). A trip and its
@@ -2309,24 +2450,38 @@ def _process_invoice_csv(
                     invoice_no, job_name,
                 )
             elif len(manifest_candidates) > 1:
-                best, score = _closest_technique_match(manifest_candidates, total_weight, total_pallets, total_pcs)
-                matched_rec = best
-                match_strategy = "job_name"
-                if score > _CLOSE_MATCH_THRESHOLD:
-                    loose_match_note = (
-                        f"Matched via closest-quantity heuristic among {len(manifest_candidates)} "
-                        f"manifests sharing suffix '{job_name}' (discrepancy score {score:.2f}) — verify manually."
-                    )
-                    logger.warning(
-                        "[INVOICE] %s -> closest match among %d manifest-suffix candidates '%s' "
-                        "still has a large discrepancy (score=%.3f) - verify manually",
-                        invoice_no, len(manifest_candidates), job_name, score,
+                usable, resolved = _partition_candidates_by_resolution(manifest_candidates)
+
+                if len(resolved) == 1:
+                    matched_rec = resolved[0]
+                    match_strategy = "job_name"
+                    logger.info(
+                        "[INVOICE] %s -> preferred already-resolved manifest %s over %d other "
+                        "manifest-suffix candidates '%s' (BOL %s already exists) — skipped "
+                        "quantity-closeness scoring",
+                        invoice_no, _cget(matched_rec, "manifest"), len(usable) - 1, job_name,
+                        _cget(matched_rec, "bol_number"),
                     )
                 else:
-                    logger.info(
-                        "[INVOICE] %s -> matched to closest of %d manifest-suffix candidates '%s' (score=%.3f)",
-                        invoice_no, len(manifest_candidates), job_name, score,
-                    )
+                    scoring_pool = resolved if resolved else usable
+                    best, score = _closest_technique_match(scoring_pool, total_weight, total_pallets, total_pcs)
+                    matched_rec = best
+                    match_strategy = "job_name"
+                    if score > _CLOSE_MATCH_THRESHOLD:
+                        loose_match_note = (
+                            f"Matched via closest-quantity heuristic among {len(scoring_pool)} "
+                            f"manifests sharing suffix '{job_name}' (discrepancy score {score:.2f}) — verify manually."
+                        )
+                        logger.warning(
+                            "[INVOICE] %s -> closest match among %d manifest-suffix candidates '%s' "
+                            "still has a large discrepancy (score=%.3f) - verify manually",
+                            invoice_no, len(scoring_pool), job_name, score,
+                        )
+                    else:
+                        logger.info(
+                            "[INVOICE] %s -> matched to closest of %d manifest-suffix candidates '%s' (score=%.3f)",
+                            invoice_no, len(scoring_pool), job_name, score,
+                        )
                 if loose_match_note:
                     if settings.USE_MOCK_DATA:
                         existing_notes = matched_rec.get("notes")
@@ -3224,6 +3379,13 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
     a record can still need a weight correction after its BOL already exists.
     Only step 2 (the Prophecy BOL check) is skipped once needs_sid_export is
     already False, since there's nothing left to check for.
+
+    Once a record has a bol_number, step 1 switches its weight source from
+    get_manifest_weights() to get_manifest_weights_from_sid() — the same
+    manifest-keyed pallet query behind the Prophecy SID export Katie's own
+    process already relies on, so a post-BOL refresh matches her own numbers
+    exactly. Before a BOL exists, get_manifest_weights() stays the source
+    (unambiguous, cheaper); see CLAUDE.md for why this isn't a blanket swap.
     """
     if settings.USE_MOCK_DATA:
         raise HTTPException(
@@ -3237,13 +3399,18 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
     if not rec.manifest:
         raise HTTPException(status_code=422, detail="This record has no manifest number to check.")
 
-    from backend.data_layer import get_technique_data, get_manifest_weights
+    from backend.data_layer import get_technique_data, get_manifest_weights, get_manifest_weights_from_sid
 
     messages = []
     updated = False
 
-    # (1) Refresh weight/pallets/pieces from VisualMail (Query B) — always runs.
-    weight_data = get_manifest_weights([rec.manifest]).get(rec.manifest)
+    # (1) Refresh weight/pallets/pieces — always runs. Once a BOL exists, prefer
+    # the SID-export query for exact consistency with what Katie's own Prophecy
+    # import already used.
+    if rec.bol_number:
+        weight_data = get_manifest_weights_from_sid([rec.manifest]).get(rec.manifest)
+    else:
+        weight_data = get_manifest_weights([rec.manifest]).get(rec.manifest)
     if weight_data:
         new_weight  = weight_data["technique_weight"]
         new_pallets = weight_data["technique_pallets"]
@@ -3290,10 +3457,10 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     """
     On-demand retry for one stuck invoice_only stub: check a wide (90-day) Technique
     window immediately instead of waiting for the next "Pull Manifests" click. Reuses
-    _create_technique_record_from_fallback()/_compute_diffs() so this stays in sync
-    with the automatic wide fallback in pull_technique_data() (which keeps its own
-    much narrower 21-day window — this button is the deliberately wider, manually-
-    triggered search, not the automatic daily one).
+    _create_technique_record_from_fallback()/_compute_diffs()/_finish_resolving_stub()
+    so this stays in sync with the automatic wide fallback in pull_technique_data()
+    (which uses the same 90-day window as of 2026-07-17 — this button is just the
+    manually-triggered, single-record version of the same search).
     """
     if settings.USE_MOCK_DATA:
         raise HTTPException(status_code=400, detail="Retry-match is disabled in mock mode.")
@@ -3361,6 +3528,16 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     if loose_match_note:
         row.notes = f"{row.notes} {loose_match_note}" if row.notes else loose_match_note
     _compute_diffs(row)
+
+    from backend.data_layer import get_tariff_rate as _get_tariff_rate
+    from backend.data_layer import get_current_diesel_price, get_fsc_rate as _get_fsc_rate
+    _diesel_price = get_current_diesel_price()
+    _fsc_pct = _get_fsc_rate(_diesel_price) if _diesel_price is not None else None
+    _finish_resolving_stub(
+        row, stub.invoice_email_sender, stub.invoice_sent_at, settings.INVOICE_FOLDER,
+        _get_tariff_rate, _diesel_price, _fsc_pct,
+    )
+
     db.delete(stub)
     db.commit()
     logger.info("[RETRY-MATCH] Resolved stub %s → %s", stub.invoice_number, row.technique_trip)

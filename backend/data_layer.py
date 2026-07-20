@@ -767,6 +767,35 @@ def get_pallet_data_for_manifests(manifest_numbers: list[str]) -> list[dict]:
         raise
 
 
+def get_manifest_weights_from_sid(manifest_numbers: list[str]) -> dict[str, dict]:
+    """
+    Same return shape as get_manifest_weights() (technique_weight/pallets/pcs per
+    manifest), but aggregated from get_pallet_data_for_manifests() — the exact
+    query Katie's own SID export already trusts — instead of
+    _MANIFEST_WEIGHT_QUERY. Used only for records that already have a bol_number
+    (Katie has resolved which manifest is real and generated its SID export),
+    where matching her own tool's numbers exactly is worth the extra Locations/
+    PalletStatusCodes JOIN cost. NOT a replacement for get_manifest_weights() at
+    pull time — see CLAUDE.md's "why not" note on this design.
+    """
+    rows = get_pallet_data_for_manifests(manifest_numbers)
+    result: dict[str, dict] = {}
+    for r in rows:
+        key = r.get("ManifestNumber")
+        if not key:
+            continue
+        agg = result.setdefault(key, {
+            "technique_weight": Decimal("0"),
+            "technique_pcs": 0,
+            "technique_pallets": 0,
+        })
+        agg["technique_weight"] += Decimal(str(r.get("Wgt") or 0))
+        agg["technique_pcs"] += int(r.get("PCS") or 0)
+        agg["technique_pallets"] += 1  # one row per pallet in _SID_QUERY
+    logger.info("[SID] Aggregated weights for %d/%d manifests", len(result), len(manifest_numbers))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # ALG invoice CSV (from Tanya via email or direct upload)
 # ---------------------------------------------------------------------------

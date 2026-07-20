@@ -166,6 +166,10 @@ class BOLRecord(Base):
     # True when our own pallet-level weight data (Technique/VisualMail or Prophecy) was
     # unavailable and access_prog fell back to ALG's self-reported invoice weight.
     weight_source_fallback: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # True when this manifest's technique_trip had more than one manifest in the most
+    # recent Technique pull. Recomputed fresh on every pull (same lifecycle as
+    # technique_weight itself) — un-flags automatically if the trip resolves to one manifest.
+    is_ambiguous_trip: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Quantity comparisons — Technique vs ALG invoice (populated on upload)
     prophecy_weight: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
@@ -273,6 +277,7 @@ class BOLSummary(BaseModel):
     alg_fsc_cost: Optional[Decimal] = None
     tariff_zone_approximate: bool = False
     weight_source_fallback: bool = False
+    is_ambiguous_trip: bool = False
     prophecy_weight: Optional[Decimal] = None
     weight_diff: Optional[Decimal] = None
     prophecy_pallets: Optional[int] = None

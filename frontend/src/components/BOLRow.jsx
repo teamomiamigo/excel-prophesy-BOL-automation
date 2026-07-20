@@ -26,6 +26,16 @@ export function isThirdPartyEligible(bol) {
     && !(bol.technique_trip && bol.amount);
 }
 
+// An ambiguous-trip manifest (Technique split one trip into several manifests, see
+// is_ambiguous_trip) that Katie hasn't resolved yet — no BOL created, not marked
+// third-party. technique_weight/pallets/pcs are real Query B numbers, just not yet
+// confirmed as belonging to the right manifest for this trip. Resolution comes only
+// from actions Katie already takes herself (SID export -> Prophecy import -> bol_number,
+// or mark-third-party) -- never inferred from Technique's own TranType/Notes fields.
+export function isUnverifiedQuantity(bol) {
+  return !!bol.is_ambiguous_trip && !bol.bol_number && !bol.is_third_party;
+}
+
 // ---------------------------------------------------------------------------
 // Cost % variance logic — primary metric (amount / access_prog)
 // Green: within 3% | Orange: 3–6% off | Red: >6% off
@@ -144,10 +154,19 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
         const pal = hasNoBaseline ? null : (isP ? bol.prophecy_pallets : bol.technique_pallets);
         const pcs = hasNoBaseline ? null : (isP ? bol.prophecy_pcs     : bol.technique_pcs);
         const P = isP ? <sup style={{ fontSize: 9, marginLeft: 2, opacity: 0.85, color: '#6366f1', fontWeight: 700 }}>P</sup> : null;
+        const unverified = !isP && isUnverifiedQuantity(bol);
         return (
           <>
-            <td style={{ ...TD_R, borderLeft: '2px solid #f3f4f6' }}>
+            <td
+              style={{ ...TD_R, borderLeft: '2px solid #f3f4f6' }}
+              title={unverified
+                ? 'This trip has multiple manifests in Technique — quantities are provisional until Katie confirms which manifest is billable (BOL created or marked third-party).'
+                : undefined}
+            >
               {fmtNum(wgt)}{wgt != null ? P : null}
+              {unverified && (
+                <span style={{ marginLeft: 4, fontSize: 10, background: '#fef3c7', color: '#92400e', borderRadius: 3, padding: '1px 5px', fontWeight: 700, letterSpacing: '0.02em' }}>~UNVERIFIED</span>
+              )}
             </td>
             <td style={TD_R}>
               {fmtNum(pal)}{pal != null ? P : null}
