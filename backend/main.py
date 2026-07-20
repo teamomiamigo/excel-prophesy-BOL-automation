@@ -1212,12 +1212,26 @@ def pull_technique_data(db: Session = Depends(get_db)):
     db.commit()
     logger.info("[PULL] Loaded %d records (days_back=%d)", loaded, days_back)
 
-    # Shared by both stub-resolution passes below (_finish_resolving_stub calls) — cheap
-    # to compute once per pull rather than once per resolved stub.
+    # Shared by the stub-resolution pass below (_finish_resolving_stub call) — lazy,
+    # not computed until a stub actually resolves (2026-07-20: this was previously
+    # fetched unconditionally on every pull, even when zero stubs existed or none of
+    # them matched anything. get_current_diesel_price() is an external EIA API call
+    # from inside this VPC and measured ~10s+ in live testing — the exact same cost
+    # _process_invoice_csv() already deliberately avoids when an invoice's own CSV has
+    # a usable FSC rate, see its "don't burn time on the EIA fallback lookup" comment.
+    # _finish_resolving_stub() only uses this as a fallback if the record's own invoice
+    # CSV doesn't have one, so most calls never need it at all.)
     from backend.data_layer import get_tariff_rate as _get_tariff_rate
     from backend.data_layer import get_current_diesel_price, get_fsc_rate as _get_fsc_rate
-    _diesel_price = get_current_diesel_price()
-    _fsc_pct = _get_fsc_rate(_diesel_price) if _diesel_price is not None else None
+    _diesel_cache: dict = {}
+
+    def _get_diesel_and_fsc():
+        if "diesel_price" not in _diesel_cache:
+            _diesel_cache["diesel_price"] = get_current_diesel_price()
+            _diesel_cache["fsc_pct"] = (
+                _get_fsc_rate(_diesel_cache["diesel_price"]) if _diesel_cache["diesel_price"] is not None else None
+            )
+        return _diesel_cache["diesel_price"], _diesel_cache["fsc_pct"]
 
     # NOTE: stub re-matching and the wide fallback below intentionally run even when
     # `loaded == 0` (no new manifests today) — a day with nothing new despatched is
@@ -1307,6 +1321,7 @@ def pull_technique_data(db: Session = Depends(get_db)):
         match_rec.alg_pallets     = stub.alg_pallets
         match_rec.alg_pcs         = stub.alg_pcs
         match_rec.match_strategy  = match_strat
+        _diesel_price, _fsc_pct = _get_diesel_and_fsc()
         _finish_resolving_stub(
             match_rec, stub.invoice_email_sender, stub.invoice_sent_at, settings.INVOICE_FOLDER,
             _get_tariff_rate, _diesel_price, _fsc_pct,
