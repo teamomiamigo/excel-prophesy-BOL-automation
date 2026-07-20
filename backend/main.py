@@ -2819,7 +2819,7 @@ def _process_invoice_csv(
         stub_bol_number = int(effective_prophecy_bol) if is_wolf_stub else None
         stub_match_strategy = "prophecy_bol" if is_wolf_stub else "invoice_only"
         if is_wolf_stub:
-            auto_note = f"Wolf/311 load — Prophecy BOL {effective_prophecy_bol}. No matching morning record found."
+            auto_note = f"Wolf/311 load — Prophecy BOL {effective_prophecy_bol}. New record created from this invoice."
         elif (cust_job_no or "").upper().startswith("CM"):
             auto_note = f"Comingle — no Technique match. Cust Job No: {cust_job_no}"
         else:
