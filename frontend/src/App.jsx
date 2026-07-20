@@ -469,6 +469,23 @@ export default function App() {
     setUploadProgress(null);
     setUploadResults({ matched, unmatched, errors, conflicts });
     await Promise.all([fetchPending(), fetchApproved()]);
+
+    // Best-effort: merge this batch's invoice PDFs into one file now, so
+    // "Download Invoices" in the Send to Accounting modal is ready instantly
+    // instead of merging on first click. One call per distinct sender, since
+    // a single folder pick can span several dated sender subfolders. Safe to
+    // skip/fail silently — GET /api/invoices/batch-pdf falls back to merging
+    // on the fly if no precomputed batch PDF is found.
+    const sendersInBatch = [...new Set([...matched, ...unmatched].map(r => r.sender).filter(Boolean))];
+    await Promise.allSettled(
+      sendersInBatch.map(sender =>
+        fetch('/api/invoices/merge-batch-pdfs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sender }),
+        })
+      )
+    );
   }
 
   // Primary picker — File System Access API. Each directory handle carries its
