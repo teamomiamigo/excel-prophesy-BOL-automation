@@ -4,9 +4,12 @@ resource "aws_apigatewayv2_api" "app" {
 }
 
 resource "aws_apigatewayv2_integration" "lambda" {
-  api_id                 = aws_apigatewayv2_api.app.id
-  integration_type       = "AWS_PROXY"
-  integration_uri        = aws_lambda_function.app.invoke_arn
+  api_id           = aws_apigatewayv2_api.app.id
+  integration_type = "AWS_PROXY"
+  # Points at the "live" alias (see lambda.tf provisioned-concurrency block,
+  # 2026-07-20), not $LATEST directly — provisioned concurrency only applies to
+  # a published version/alias, never to $LATEST.
+  integration_uri        = aws_lambda_alias.live.invoke_arn
   payload_format_version = "2.0"
 }
 
@@ -34,6 +37,7 @@ resource "aws_lambda_permission" "apigateway" {
   statement_id  = "AllowAPIGatewayInvoke"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.app.function_name
+  qualifier     = aws_lambda_alias.live.name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.app.execution_arn}/*/*"
 }

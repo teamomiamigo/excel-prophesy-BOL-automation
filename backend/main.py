@@ -1319,89 +1319,23 @@ def pull_technique_data(db: Session = Depends(get_db)):
         db.commit()
         logger.info("[PULL] Re-matched %d invoice_only stub(s) to newly loaded manifests", rematched)
 
-    # --- Wide fallback: stubs still unmatched may reference a real trip whose despatch
-    # date just falls outside this pull's days_back=20 window. Check a much wider
-    # window once (originally widened from 21 to 90 days on 2026-07-17 -- an ALG invoice
-    # batch can lag well over 3 weeks behind despatch, e.g. a 6-25 batch processed 7-17 --
-    # then narrowed to 40 days on 2026-07-20: stacked onto the main 20-day pull in the
-    # same request, the 90-day version reliably pushed this endpoint past API Gateway's
-    # hard 30s integration timeout whenever any invoice_only stub existed (measured: main
-    # pull ~15s + 90-day fallback ~13s = ~28s, right at the ceiling). 40 days keeps most of
-    # the lag coverage while leaving headroom. The per-record Retry button (a single,
-    # unstacked request) still safely uses the full 90-day window -- see its own comment.
-    # Only runs when there's actually a stub to resolve, so this doesn't add cost to a
-    # normal day's pull. ---
-    remaining_stubs = db.query(BOLRecord).filter(
-        BOLRecord.match_strategy == "invoice_only", BOLRecord.bol_number.is_(None)
-    ).all()
-    wide_resolved = 0
-    if remaining_stubs:
-        wide_manifests = _dedupe_technique_rows(get_technique_data(days_back=40))
-        # Group (not collapse) by trip suffix — a dict comprehension here previously kept
-        # only the last manifest seen per suffix, non-deterministically (no ORDER BY on
-        # the underlying query), whenever one trip legitimately had multiple manifests.
-        wide_by_suffix: dict[str, list[dict]] = {}
-        for m in wide_manifests:
-            if m.get("technique_trip"):
-                wide_by_suffix.setdefault(_trip_to_suffix(m["technique_trip"]), []).append(m)
-
-        to_resolve = []  # (stub, chosen manifest dict)
-        for s in remaining_stubs:
-            candidates = wide_by_suffix.get(s.inv_job_number or "", [])
-            if not candidates:
-                continue
-            if len(candidates) == 1:
-                to_resolve.append((s, candidates[0]))
-            else:
-                # Multiple manifests share this suffix in the wide window — score by
-                # closeness to the stub's own ALG-billed quantities instead of taking
-                # an arbitrary one.
-                score_weights = get_manifest_weights([c["manifest"] for c in candidates])
-                for c in candidates:
-                    wd = score_weights.get(c["manifest"], {})
-                    c["technique_weight"]  = wd.get("technique_weight", 0)
-                    c["technique_pallets"] = wd.get("technique_pallets", 0)
-                    c["technique_pcs"]     = wd.get("technique_pcs", 0)
-                best, score = _closest_technique_match(
-                    candidates, float(s.alg_weight or 0), s.alg_pallets or 0, s.alg_pcs or 0,
-                )
-                to_resolve.append((s, best))
-                if score > _CLOSE_MATCH_THRESHOLD:
-                    logger.warning(
-                        "[PULL WIDE FALLBACK] %s -> closest match among %d candidates on trip "
-                        "suffix '%s' still has a large discrepancy (score=%.3f) - verify manually",
-                        s.invoice_number, len(candidates), s.inv_job_number, score,
-                    )
-        if to_resolve:
-            weights_by_manifest = get_manifest_weights([m["manifest"] for _, m in to_resolve])
-            for stub, m in to_resolve:
-                row = _create_technique_record_from_fallback(db, m, weights_by_manifest.get(m["manifest"], {}))
-                row.invoice_number = stub.invoice_number
-                row.inv_job_number = stub.inv_job_number
-                row.amount         = stub.amount
-                row.alg_weight     = stub.alg_weight
-                row.alg_pallets    = stub.alg_pallets
-                row.alg_pcs        = stub.alg_pcs
-                row.match_strategy = "job_name"
-                _finish_resolving_stub(
-                    row, stub.invoice_email_sender, stub.invoice_sent_at, settings.INVOICE_FOLDER,
-                    _get_tariff_rate, _diesel_price, _fsc_pct,
-                )
-                _compute_diffs(row)
-                db.delete(stub)
-                wide_resolved += 1
-            db.commit()
-            logger.info("[PULL] Wide fallback (40-day) resolved %d previously-stuck stub(s)", wide_resolved)
+    # NOTE (2026-07-20): a bulk wide-window (90-day, briefly 40-day) live Technique
+    # sweep over every remaining invoice_only stub used to run here. Stacked onto this
+    # route's own main-pull live query in the same request, it reliably pushed this
+    # endpoint past API Gateway's hard 30s integration timeout whenever any stub
+    # existed (confirmed live post-deploy: main pull ~15s + wide fallback ~13s+ = at
+    # or past the ceiling) — and no day-count narrowing reliably fixed it, since a
+    # cold Lambda/Aurora start can alone eat most of the 30s before either query even
+    # starts. Moved to _process_invoice_csv() instead: the wide search now runs once,
+    # per newly-unmatched invoice, at upload/poll-folder time — its own request, its
+    # own budget, isolated from the daily pull. See _wide_fallback_technique_search().
 
     msg = f"Loaded {loaded} manifest(s)."
     if rematched:
         msg += f" Re-matched {rematched} invoice stub(s)."
-    if wide_resolved:
-        msg += f" Resolved {wide_resolved} previously-stuck stub(s) via wide lookback."
     return {
         "records_loaded": loaded,
         "rematched": rematched,
-        "wide_resolved": wide_resolved,
         "date": date.today().isoformat(),
         "message": msg,
     }
@@ -2055,6 +1989,65 @@ def _partition_candidates_by_resolution(candidates: list):
     return usable, resolved
 
 
+def _wide_fallback_technique_search(
+    job_name: str, alg_weight: "float | None", alg_pallets: "int | None", alg_pcs: "int | None",
+    days_back: int = 90,
+) -> "dict | None":
+    """
+    Live Technique search across `days_back` days (default 90) for a trip or manifest
+    whose suffix matches job_name — the same two-tier trip-then-manifest suffix logic
+    as the normal-window match in _process_invoice_csv() (strategies 2/2b), just
+    against a much wider date range. Called from _process_invoice_csv() (2026-07-20)
+    only once an invoice has found nothing at all in the already-pulled DB data —
+    i.e. right before it would otherwise become an invoice_only stub — so a real but
+    not-yet-pulled trip (or one whose despatch date lags the normal 20-day pull
+    window) still matches immediately instead of waiting for a bulk sweep.
+
+    This logic used to run as a bulk sweep over every remaining stub inside
+    pull_technique_data() itself; moved here because stacking it onto that route's
+    own live pull reliably exceeded API Gateway's 30s timeout (see the removal note
+    in pull_technique_data()). Run once per newly-unmatched invoice instead, it has
+    this request's own budget to itself.
+
+    Returns the best-matching manifest dict (as returned by get_technique_data()),
+    or None if nothing matches even in the wide window.
+    """
+    from backend.data_layer import get_technique_data, get_manifest_weights
+
+    wide_manifests = _dedupe_technique_rows(get_technique_data(days_back=days_back))
+
+    by_trip_suffix: dict[str, list[dict]] = {}
+    by_manifest_suffix: dict[str, list[dict]] = {}
+    for m in wide_manifests:
+        if m.get("technique_trip"):
+            by_trip_suffix.setdefault(_trip_to_suffix(m["technique_trip"]), []).append(m)
+        if m.get("manifest"):
+            by_manifest_suffix.setdefault(_manifest_to_suffix(m["manifest"]), []).append(m)
+
+    candidates = by_trip_suffix.get(job_name) or by_manifest_suffix.get(job_name) or []
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Multiple manifests share this suffix in the wide window — score by closeness
+    # to the invoice's own billed quantities instead of taking an arbitrary one.
+    score_weights = get_manifest_weights([c["manifest"] for c in candidates])
+    for c in candidates:
+        wd = score_weights.get(c["manifest"], {})
+        c["technique_weight"]  = wd.get("technique_weight", 0)
+        c["technique_pallets"] = wd.get("technique_pallets", 0)
+        c["technique_pcs"]     = wd.get("technique_pcs", 0)
+    best, score = _closest_technique_match(candidates, float(alg_weight or 0), alg_pallets or 0, alg_pcs or 0)
+    if score > _CLOSE_MATCH_THRESHOLD:
+        logger.warning(
+            "[INVOICE WIDE FALLBACK] closest match among %d candidates on suffix '%s' "
+            "still has a large discrepancy (score=%.3f) - verify manually",
+            len(candidates), job_name, score,
+        )
+    return best
+
+
 def _apply_invoice_match(
     matched_rec,
     match_strategy: str,
@@ -2542,6 +2535,31 @@ def _process_invoice_csv(
                 match_strategy = "pallets_pieces"
                 logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
                                invoice_no, matched_rec.technique_trip)
+
+    # 4b. Wide live fallback (2026-07-20): nothing in our already-pulled DB data matched
+    # this invoice at all — before giving up and creating an invoice_only stub, check
+    # live Technique data across a much wider window. Catches a real trip/manifest whose
+    # despatch date just falls outside the daily pull's normal 20-day window (an ALG
+    # invoice batch can lag well over 3 weeks behind despatch). Skipped for Wolf/311
+    # (Job Name is a Prophecy BOL, not a trip/manifest suffix — nothing to search for)
+    # and comingle invoices (no Technique record ever exists for these by design).
+    if (
+        matched_rec is None and job_name
+        and not effective_prophecy_bol
+        and not (cust_job_no or "").upper().startswith("CM")
+        and not settings.USE_MOCK_DATA
+    ):
+        wide_match = _wide_fallback_technique_search(job_name, total_weight, total_pallets, total_pcs)
+        if wide_match is not None:
+            from backend.data_layer import get_manifest_weights
+            weight_data = get_manifest_weights([wide_match["manifest"]]).get(wide_match["manifest"], {})
+            matched_rec = _create_technique_record_from_fallback(db, wide_match, weight_data)
+            match_strategy = "job_name"
+            logger.info(
+                "[INVOICE] %s -> matched via wide (90-day) live fallback on suffix '%s' "
+                "(no match in already-pulled data)",
+                invoice_no, job_name,
+            )
 
     if matched_rec is None:
         is_wolf_stub = bool(effective_prophecy_bol)

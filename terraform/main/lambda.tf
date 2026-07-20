@@ -13,6 +13,12 @@ resource "aws_lambda_function" "app" {
   package_type  = "Image"
   image_uri     = "${aws_ecr_repository.app.repository_url}@${data.aws_ecr_image.app.image_digest}"
 
+  # Required for aws_lambda_provisioned_concurrency_config below — provisioned
+  # concurrency can only target a published, immutable version, never $LATEST.
+  # Each apply that changes image_uri publishes a new numbered version; the
+  # "live" alias and its provisioned concurrency move to it automatically.
+  publish = true
+
   # 29s matches API Gateway's hard request timeout (see CLAUDE.md deployment
   # notes) — no point allowing Lambda to run longer than the caller will wait.
   timeout     = 29
@@ -41,4 +47,24 @@ resource "aws_lambda_function" "app" {
 
 output "lambda_function_name" {
   value = aws_lambda_function.app.function_name
+}
+
+# --- Provisioned concurrency (added 2026-07-20) ---
+# A cold Lambda execution environment (fresh container, Python imports, Secrets
+# Manager fetch, first Aurora connection) measured at ~13-23s in live testing —
+# on top of the live AWP-SQL-PROD query itself (~15-23s), this reliably pushed
+# POST /api/admin/pull past API Gateway's hard 30s integration timeout. Keeping
+# one execution environment permanently warm removes the cold-start cost
+# entirely (does NOT reduce the on-prem query's own network latency — that part
+# is unrelated to Lambda and still varies run to run).
+resource "aws_lambda_alias" "live" {
+  name             = "live"
+  function_name    = aws_lambda_function.app.function_name
+  function_version = aws_lambda_function.app.version
+}
+
+resource "aws_lambda_provisioned_concurrency_config" "app" {
+  function_name                     = aws_lambda_function.app.function_name
+  qualifier                         = aws_lambda_alias.live.name
+  provisioned_concurrent_executions = 1
 }
