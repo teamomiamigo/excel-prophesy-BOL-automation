@@ -10,6 +10,7 @@ dist/
 *.log
 test_invoices_*/
 backend/test_data/processed/
+backend/invoice_pdf_cache/
 .obsidian/
 
 # Terraform state — contains resource ARNs/metadata, never belongs in git;

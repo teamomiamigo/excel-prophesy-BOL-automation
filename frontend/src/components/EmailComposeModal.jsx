@@ -49,7 +49,16 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
     return [header, sep, rows].join('\n');
   }
 
-  function handleDownloadInvoicePdfs() {
+  function handleDownloadInvoices() {
+    // senderLabel is the invoice_email_sender this batch is grouped by — the
+    // same key the backend merged/stored a combined PDF under at upload time
+    // (see App.jsx's uploadInvoiceFiles). 'No Sender' means these records
+    // never carried a real sender label (e.g. a manual single-invoice
+    // upload), so there's no precomputed batch key to ask for.
+    if (senderLabel && senderLabel !== 'No Sender') {
+      window.open(`/api/invoices/batch-pdf?sender=${encodeURIComponent(senderLabel)}`, '_blank');
+      return;
+    }
     const zNumbers = records
       .flatMap(r => (r.invoice_number || '').split(',').map(z => z.trim()).filter(Boolean))
       .filter((z, i, arr) => arr.indexOf(z) === i); // dedupe
@@ -74,6 +83,10 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
     const subject = encodeURIComponent(subjectField);
     const body = encodeURIComponent(buildPlainTable());
     window.location.href = `mailto:${to}?subject=${subject}&body=${body}`;
+    // mailto links can't carry an attachment — there's no way around that
+    // browser/email-client limitation — so trigger the merged invoice PDF
+    // download at the same time, ready to drag into the draft this just opened.
+    handleDownloadInvoices();
   }
 
   async function handleMarkSent() {
@@ -232,7 +245,7 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
                 Open in Outlook
               </button>
               <button
-                onClick={handleDownloadInvoicePdfs}
+                onClick={handleDownloadInvoices}
                 title="Download all invoice PDFs for this batch merged into one file — attach to your email"
                 style={{
                   background: '#f9fafb',
@@ -245,7 +258,7 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
                   cursor: 'pointer',
                 }}
               >
-                Download Invoice PDFs
+                Download Invoices
               </button>
             </div>
             <button
