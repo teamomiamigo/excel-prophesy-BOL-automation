@@ -1321,17 +1321,22 @@ def pull_technique_data(db: Session = Depends(get_db)):
 
     # --- Wide fallback: stubs still unmatched may reference a real trip whose despatch
     # date just falls outside this pull's days_back=20 window. Check a much wider
-    # 90-day window once (widened from 21 days 2026-07-17 -- an ALG invoice batch can
-    # lag well over 3 weeks behind despatch, e.g. a 6-25 batch processed 7-17; matches
-    # the window already proven correct on the per-record Retry button), rather than
-    # never re-checking Technique at all for these. Only runs when there's actually a
-    # stub to resolve, so this doesn't add cost to a normal day's pull. ---
+    # window once (originally widened from 21 to 90 days on 2026-07-17 -- an ALG invoice
+    # batch can lag well over 3 weeks behind despatch, e.g. a 6-25 batch processed 7-17 --
+    # then narrowed to 40 days on 2026-07-20: stacked onto the main 20-day pull in the
+    # same request, the 90-day version reliably pushed this endpoint past API Gateway's
+    # hard 30s integration timeout whenever any invoice_only stub existed (measured: main
+    # pull ~15s + 90-day fallback ~13s = ~28s, right at the ceiling). 40 days keeps most of
+    # the lag coverage while leaving headroom. The per-record Retry button (a single,
+    # unstacked request) still safely uses the full 90-day window -- see its own comment.
+    # Only runs when there's actually a stub to resolve, so this doesn't add cost to a
+    # normal day's pull. ---
     remaining_stubs = db.query(BOLRecord).filter(
         BOLRecord.match_strategy == "invoice_only", BOLRecord.bol_number.is_(None)
     ).all()
     wide_resolved = 0
     if remaining_stubs:
-        wide_manifests = _dedupe_technique_rows(get_technique_data(days_back=90))
+        wide_manifests = _dedupe_technique_rows(get_technique_data(days_back=40))
         # Group (not collapse) by trip suffix — a dict comprehension here previously kept
         # only the last manifest seen per suffix, non-deterministically (no ORDER BY on
         # the underlying query), whenever one trip legitimately had multiple manifests.
@@ -1386,7 +1391,7 @@ def pull_technique_data(db: Session = Depends(get_db)):
                 db.delete(stub)
                 wide_resolved += 1
             db.commit()
-            logger.info("[PULL] Wide fallback (90-day) resolved %d previously-stuck stub(s)", wide_resolved)
+            logger.info("[PULL] Wide fallback (40-day) resolved %d previously-stuck stub(s)", wide_resolved)
 
     msg = f"Loaded {loaded} manifest(s)."
     if rematched:
@@ -3458,9 +3463,13 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     On-demand retry for one stuck invoice_only stub: check a wide (90-day) Technique
     window immediately instead of waiting for the next "Pull Manifests" click. Reuses
     _create_technique_record_from_fallback()/_compute_diffs()/_finish_resolving_stub()
-    so this stays in sync with the automatic wide fallback in pull_technique_data()
-    (which uses the same 90-day window as of 2026-07-17 — this button is just the
-    manually-triggered, single-record version of the same search).
+    so this stays in sync with the automatic wide fallback in pull_technique_data() —
+    same search logic, just a single-record, on-demand version. Deliberately kept at
+    90 days rather than the 40-day window pull_technique_data() uses (2026-07-20): this
+    endpoint's live Technique query isn't stacked onto anything else in the same
+    request, so it has the full ~29s ceiling to itself and comfortably fits the 90-day
+    query alone (measured ~13s) — see the wide-fallback comment in pull_technique_data()
+    for why the bulk pull can't afford the same window.
     """
     if settings.USE_MOCK_DATA:
         raise HTTPException(status_code=400, detail="Retry-match is disabled in mock mode.")
