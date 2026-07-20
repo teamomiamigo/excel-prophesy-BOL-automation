@@ -11,6 +11,12 @@ variable "chg_approved_sql_access" {
 # SQL Server (1433) to these two specific hosts, nothing else. Do not widen
 # this beyond what was represented to security/CAB.
 #
+# The SG360-TECH-PRD1 egress rule the CHG ticket approved was removed 2026-07-20:
+# it only ever existed to support a direct SQL connection that turned out to be
+# dead code (see documentation/Developmental Documentation.md's 2026-07-20 entry —
+# ShipperPlus_Segerdahl never lived on that host). AWP-SQL-PROD egress remains,
+# unchanged and still within what was approved.
+#
 # All rules for this security group are managed as separate
 # aws_security_group_rule resources below, NOT as inline egress blocks here.
 # Mixing the two causes Terraform to treat externally-added rules (like the
@@ -20,7 +26,7 @@ variable "chg_approved_sql_access" {
 resource "aws_security_group" "lambda_sql_access" {
   count       = var.chg_approved_sql_access ? 1 : 0
   name        = "${var.project_name}-lambda-sql-access"
-  description = "Outbound SQL Server access only, to AWP-SQL-PROD and SG360-TECH-PRD1"
+  description = "Outbound SQL Server access only, to AWP-SQL-PROD"
   vpc_id      = "vpc-013b795209b52a39a"
 }
 
@@ -32,17 +38,6 @@ resource "aws_security_group_rule" "lambda_egress_awp_sql_prod" {
   to_port           = 1433
   protocol          = "tcp"
   cidr_blocks       = ["172.17.23.172/32"]
-  security_group_id = aws_security_group.lambda_sql_access[0].id
-}
-
-resource "aws_security_group_rule" "lambda_egress_tech_prd1" {
-  count             = var.chg_approved_sql_access ? 1 : 0
-  type              = "egress"
-  description       = "SG360-TECH-PRD1"
-  from_port         = 1433
-  to_port           = 1433
-  protocol          = "tcp"
-  cidr_blocks       = ["172.17.23.5/32"]
   security_group_id = aws_security_group.lambda_sql_access[0].id
 }
 

@@ -27,8 +27,6 @@ _STATIC_DNS_OVERRIDES = {
     "sg360-bol-aurora.cluster-cppw8xnzpofk.us-east-1.rds.amazonaws.com": "172.31.11.70",
     "AWP-SQL-PROD": "172.17.23.172",
     "AWP-SQL-PROD.ad.sg360.com": "172.17.23.172",
-    "SG360-TECH-PRD1": "172.17.23.5",
-    "SG360-TECH-PRD1.ad.sg360.com": "172.17.23.5",
 }
 
 _original_getaddrinfo = socket.getaddrinfo
@@ -79,8 +77,17 @@ class Settings(BaseSettings):
     # .env rather than changing this default, which would silently break Lambda.
     SQLSERVER_ODBC_DRIVER: str = "ODBC Driver 18 for SQL Server"
 
-    # Direct connection to SG360-TECH-PRD1 (ShipperPlus host).
-    # When set, get_prophecy_data() uses this instead of the SQLAPPS3 linked server.
+    # Unused as of 2026-07-20 — get_prophecy_data()/get_prophecy_pallet_data() used to
+    # try a direct connection to SG360-TECH-PRD1 first, on the assumption it hosted
+    # ShipperPlus_Segerdahl locally. Confirmed live that it doesn't (that database only
+    # exists on a separate box, AWP-SHIPPERPLUS, reachable solely via the SQLAPPS3 linked
+    # server both AWP-SQL-PROD and SG360-TECH-PRD1 have) -- the direct path could never
+    # have succeeded, and no credential fixes that. The code path was removed; these 3
+    # fields are left declared (not deleted) because Settings inherits extra='forbid'
+    # from pydantic_settings.BaseSettings, so removing them while the local .env or the
+    # sg360-bol-live-credentials secret still sets them would crash the app at the next
+    # cold start. Slated for removal in a follow-up that also edits .env/the secret in
+    # the same sitting -- see documentation/Developmental Documentation.md, 2026-07-20 entry.
     TECH_PRD1_SERVER: str = "SG360-TECH-PRD1"
     TECH_PRD1_USER: str = ""
     TECH_PRD1_PASSWORD: str = ""

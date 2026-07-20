@@ -23,23 +23,6 @@ logger = logging.getLogger(__name__)
 # Connection helper
 # ---------------------------------------------------------------------------
 
-def _get_tech_prd1_connection():
-    """Direct SQL auth connection to SG360-TECH-PRD1 (ShipperPlus host).
-    Requires TECH_PRD1_USER and TECH_PRD1_PASSWORD in .env.
-    """
-    import pyodbc
-    from backend.config import settings
-    conn_str = (
-        f"DRIVER={{{settings.SQLSERVER_ODBC_DRIVER}}};"
-        f"SERVER={settings.TECH_PRD1_SERVER};"
-        f"DATABASE=ShipperPlus_Segerdahl;"
-        f"UID={settings.TECH_PRD1_USER};"
-        f"PWD={settings.TECH_PRD1_PASSWORD};"
-        f"Encrypt=yes;TrustServerCertificate=yes;"
-    )
-    return pyodbc.connect(conn_str, timeout=30)
-
-
 def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail"):
     """
     Return a pyodbc connection to the given SQL Server instance.
@@ -290,7 +273,7 @@ def get_manifest_weights(manifest_numbers: list[str]) -> dict[str, dict]:
 # Prophecy / ShipperPlus (future — load_id from Query 1 is the link)
 # ---------------------------------------------------------------------------
 
-# Via SQLAPPS3 linked server on AWP-SQL-PROD (used when TECH_PRD1 credentials not set)
+# The only route to ShipperPlus_Segerdahl — see module docstring.
 _PROPHECY_BOL_QUERY = """
 SELECT
     COALESCE(NULLIF(s.pooled_to_load_id, 0), s.load_id) AS bol_number,
@@ -305,29 +288,12 @@ WHERE s.pooled_to_load_id = ?
 GROUP BY COALESCE(NULLIF(s.pooled_to_load_id, 0), s.load_id)
 """
 
-# Direct query when connected to SG360-TECH-PRD1 (no 4-part name needed)
-_PROPHECY_DIRECT_QUERY = """
-SELECT
-    COALESCE(NULLIF(s.pooled_to_load_id, 0), s.load_id) AS bol_number,
-    SUM(oh.pieces)  AS total_pieces,
-    SUM(oh.weight)  AS total_weight,
-    SUM(oh.pallets) AS total_pallets
-FROM dbo.Shipments AS s
-INNER JOIN dbo.order_headers AS oh
-    ON s.shipment_id = oh.shipment_id
-WHERE s.pooled_to_load_id = ?
-   OR (ISNULL(s.pooled_to_load_id, 0) = 0 AND s.load_id = ?)
-GROUP BY COALESCE(NULLIF(s.pooled_to_load_id, 0), s.load_id)
-"""
-
 
 def get_prophecy_data(bol_number: int) -> Optional[dict]:
     """
-    Fetch weight, pieces, and pallet count for a Prophecy BOL from ShipperPlus.
-
-    Tries direct connection to SG360-TECH-PRD1 first (when TECH_PRD1_USER/PASSWORD
-    are set in .env). Falls back to SQLAPPS3 linked server on AWP-SQL-PROD if the
-    direct connection fails (e.g. Application user lacks DB access on PRD1).
+    Fetch weight, pieces, and pallet count for a Prophecy BOL from ShipperPlus,
+    via the SQLAPPS3 linked server on AWP-SQL-PROD (the only route to
+    ShipperPlus_Segerdahl — see module docstring).
 
     Returns:
         {
@@ -336,18 +302,17 @@ def get_prophecy_data(bol_number: int) -> Optional[dict]:
             "prophecy_weight":  Decimal,
             "prophecy_pallets": int,
         }
-    Returns None if no ShipperPlus record found for this BOL.
+    Returns None if no ShipperPlus record found for this BOL, or if the query fails.
     """
-    from backend.config import settings
-
-    def _run_query(conn, query):
+    try:
+        conn = _get_connection()
         cursor = conn.cursor()
-        cursor.execute(query, (bol_number, bol_number))
+        cursor.execute(_PROPHECY_BOL_QUERY, (bol_number, bol_number))
         row = cursor.fetchone()
         conn.close()
-        return row
-
-    def _to_result(row):
+        if not row:
+            logger.warning("[PROPHECY] No ShipperPlus record found for BOL %s", bol_number)
+            return None
         logger.info("[PROPHECY] BOL %s → pcs=%s wt=%s pallets=%s", bol_number, row[1], row[2], row[3])
         return {
             "bol_number":       int(row[0]),
@@ -355,26 +320,8 @@ def get_prophecy_data(bol_number: int) -> Optional[dict]:
             "prophecy_weight":  Decimal(str(row[2])) if row[2] else Decimal("0"),
             "prophecy_pallets": int(row[3]) if row[3] else 0,
         }
-
-    # 1. Try direct connection to SG360-TECH-PRD1 if credentials are configured.
-    if settings.TECH_PRD1_USER and settings.TECH_PRD1_PASSWORD:
-        try:
-            row = _run_query(_get_tech_prd1_connection(), _PROPHECY_DIRECT_QUERY)
-            if row:
-                return _to_result(row)
-            logger.warning("[PROPHECY] No ShipperPlus record on PRD1 for BOL %s — trying SQLAPPS3", bol_number)
-        except Exception as exc:
-            logger.warning("[PROPHECY] PRD1 connection failed for BOL %s (%s) — falling back to SQLAPPS3", bol_number, exc)
-
-    # 2. Fall back to SQLAPPS3 linked server on AWP-SQL-PROD (Windows auth).
-    try:
-        row = _run_query(_get_connection(), _PROPHECY_BOL_QUERY)
-        if not row:
-            logger.warning("[PROPHECY] No ShipperPlus record found for BOL %s", bol_number)
-            return None
-        return _to_result(row)
     except Exception as exc:
-        logger.error("[PROPHECY] SQLAPPS3 query also failed for BOL %s: %s", bol_number, exc)
+        logger.error("[PROPHECY] Query failed for BOL %s: %s", bol_number, exc)
         return None
 
 
@@ -389,21 +336,13 @@ WHERE s.pooled_to_load_id = ?
    OR (ISNULL(s.pooled_to_load_id, 0) = 0 AND s.load_id = ?)
 """
 
-_PROPHECY_PALLET_DIRECT_QUERY = """
-SELECT oh.destination_id, oh.destination_zip, oh.weight
-FROM dbo.Shipments AS s
-INNER JOIN dbo.order_headers AS oh
-    ON s.shipment_id = oh.shipment_id
-WHERE s.pooled_to_load_id = ?
-   OR (ISNULL(s.pooled_to_load_id, 0) = 0 AND s.load_id = ?)
-"""
-
 
 def get_prophecy_pallet_data(bol_number: int) -> list[dict]:
     """
-    Fetch per-row destination + weight for a Prophecy BOL from ShipperPlus order_headers —
-    the Wolf/311 equivalent of get_pallet_data_for_manifests(), used to independently
-    calculate access_prog from SG360's own data instead of ALG's invoiced weight.
+    Fetch per-row destination + weight for a Prophecy BOL from ShipperPlus order_headers,
+    via the SQLAPPS3 linked server on AWP-SQL-PROD — the Wolf/311 equivalent of
+    get_pallet_data_for_manifests(), used to independently calculate access_prog from
+    SG360's own data instead of ALG's invoiced weight.
 
     destination_id is SCF/NDC-prefixed (e.g. "SCF080") like VisualMail's Locations.AccountNumber —
     confirmed live to hold that format, though it's sometimes NULL; destination_zip (raw 5-digit
@@ -412,16 +351,15 @@ def get_prophecy_pallet_data(bol_number: int) -> list[dict]:
     Returns a list of {"destination_id": str|None, "destination_zip": str, "weight": Decimal}.
     Returns [] if no rows found or the query fails (caller should fall back to ALG's own weight).
     """
-    from backend.config import settings
-
-    def _run_query(conn, query):
+    try:
+        conn = _get_connection()
         cursor = conn.cursor()
-        cursor.execute(query, (bol_number, bol_number))
+        cursor.execute(_PROPHECY_PALLET_QUERY, (bol_number, bol_number))
         rows = cursor.fetchall()
         conn.close()
-        return rows
-
-    def _to_result(rows):
+        if not rows:
+            logger.warning("[PROPHECY] No pallet rows found for BOL %s", bol_number)
+            return []
         return [
             {
                 "destination_id": row[0],
@@ -430,24 +368,8 @@ def get_prophecy_pallet_data(bol_number: int) -> list[dict]:
             }
             for row in rows
         ]
-
-    if settings.TECH_PRD1_USER and settings.TECH_PRD1_PASSWORD:
-        try:
-            rows = _run_query(_get_tech_prd1_connection(), _PROPHECY_PALLET_DIRECT_QUERY)
-            if rows:
-                return _to_result(rows)
-            logger.warning("[PROPHECY] No pallet rows on PRD1 for BOL %s — trying SQLAPPS3", bol_number)
-        except Exception as exc:
-            logger.warning("[PROPHECY] PRD1 pallet query failed for BOL %s (%s) — falling back to SQLAPPS3", bol_number, exc)
-
-    try:
-        rows = _run_query(_get_connection(), _PROPHECY_PALLET_QUERY)
-        if not rows:
-            logger.warning("[PROPHECY] No pallet rows found for BOL %s", bol_number)
-            return []
-        return _to_result(rows)
     except Exception as exc:
-        logger.error("[PROPHECY] SQLAPPS3 pallet query also failed for BOL %s: %s", bol_number, exc)
+        logger.error("[PROPHECY] Pallet query failed for BOL %s: %s", bol_number, exc)
         return []
 
 
