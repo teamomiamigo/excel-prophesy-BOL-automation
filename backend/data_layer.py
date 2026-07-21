@@ -501,6 +501,106 @@ def get_alg_tariff_rate(dest_id: str) -> Optional[dict]:
         db.close()
 
 
+# A single anomalous invoice line (e.g. a $0 credit/adjustment row masquerading as a
+# minimum-charge floor) must not corrupt a shared rate table every future calculation
+# depends on — bound what reconcile_alg_tariff_rates() will treat as a real observed minimum.
+_MIN_CHARGE_PLAUSIBLE_RANGE = (0.01, 500.0)
+
+
+def reconcile_alg_tariff_rates(entries: list[tuple[str, float, "Optional[float]"]]) -> list[dict]:
+    """
+    Self-updating counterpart to get_alg_tariff_rate(): given (dest_id, rate1, observed_mc1)
+    tuples gathered from one invoice's own directly-billed zones (built in
+    _apply_access_prog_calc()'s per-pallet loop — only pallets where THIS invoice billed
+    that exact zip3 directly, never a nearest-zone tolerance guess), treats ALG's own
+    invoice as ground truth and writes it into alg_tariff_rates — so the table keeps
+    itself current from every real invoice instead of depending on a periodic manual
+    re-export from Marge/Phil.
+
+    rate1 is always trusted and applied — this column is independently confirmed reliable
+    against ALG's own printed Rate (see CLAUDE.md's access_prog calculation notes).
+    observed_mc1 is the $ actually billed on this invoice's own line where a minimum-charge
+    floor fired; None means no floor was observed this time — that must NOT overwrite an
+    existing stored mc1 (silence isn't evidence it's wrong), but a genuinely new dest_id
+    with no observed floor yet is inserted with a provisional $10 default (the most common
+    tier across real invoices) that self-corrects the first time a real floor is observed
+    there. observed_mc1 outside _MIN_CHARGE_PLAUSIBLE_RANGE is treated as not-observed
+    rather than written.
+
+    One session for the whole batch (all pallets on one invoice), not one per pallet — this
+    runs on every invoice upload/recompute, and a 100+ pallet invoice must not open 100+ DB
+    connections. Best-effort and never raises: a failure here must not break the cost
+    calculation it rode in on.
+
+    Returns a list of {"dest_id", "action": "insert"|"update", ...} for whatever actually
+    changed (empty list if nothing did or on any failure).
+    """
+    if not entries:
+        return []
+
+    from backend.database import SessionLocal
+    from backend.models import AlgTariffRate
+
+    db = SessionLocal()
+    results: list[dict] = []
+    try:
+        for dest_id, rate1, observed_mc1 in entries:
+            dest_id_key = (dest_id or "").strip().upper()
+            if not dest_id_key:
+                continue
+            if observed_mc1 is not None and not (
+                _MIN_CHARGE_PLAUSIBLE_RANGE[0] <= observed_mc1 <= _MIN_CHARGE_PLAUSIBLE_RANGE[1]
+            ):
+                logger.warning(
+                    "[ALG_RATE_LEARN] dest_id=%s observed mc1=%.2f outside plausible range %s "
+                    "— ignoring, not writing",
+                    dest_id_key, observed_mc1, _MIN_CHARGE_PLAUSIBLE_RANGE,
+                )
+                observed_mc1 = None
+
+            rate1_dec = Decimal(str(round(rate1, 4)))
+            row = db.query(AlgTariffRate).filter(AlgTariffRate.dest_id == dest_id_key).first()
+
+            if row is None:
+                mc1_dec = (
+                    Decimal(str(round(observed_mc1, 2))) if observed_mc1 is not None else Decimal("10.00")
+                )
+                db.add(AlgTariffRate(dest_id=dest_id_key, rate1=rate1_dec, mc1=mc1_dec))
+                logger.info(
+                    "[ALG_RATE_LEARN] insert dest_id=%s rate1=%s mc1=%s (mc1_source=%s)",
+                    dest_id_key, rate1_dec, mc1_dec,
+                    "observed" if observed_mc1 is not None else "provisional_default",
+                )
+                results.append({
+                    "dest_id": dest_id_key, "action": "insert",
+                    "rate1": float(rate1_dec), "mc1": float(mc1_dec),
+                })
+                continue
+
+            changed = {}
+            if abs(float(row.rate1) - float(rate1_dec)) > 0.0001:
+                changed["rate1"] = {"old": float(row.rate1), "new": float(rate1_dec)}
+                row.rate1 = rate1_dec
+            if observed_mc1 is not None:
+                mc1_dec = Decimal(str(round(observed_mc1, 2)))
+                if abs(float(row.mc1) - float(mc1_dec)) > 0.005:
+                    changed["mc1"] = {"old": float(row.mc1), "new": float(mc1_dec)}
+                    row.mc1 = mc1_dec
+            if changed:
+                logger.info("[ALG_RATE_LEARN] update dest_id=%s changed=%s", dest_id_key, changed)
+                results.append({"dest_id": dest_id_key, "action": "update", "changed": changed})
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("[ALG_RATE_LEARN] batch reconciliation failed, rolled back")
+        return []
+    finally:
+        db.close()
+
+    return results
+
+
 def get_tariff_rate(destination_zip3: str, weight: float,
                     _diesel_price: Optional[float] = None,
                     _fsc_pct: Optional[Decimal] = None) -> Optional[dict]:

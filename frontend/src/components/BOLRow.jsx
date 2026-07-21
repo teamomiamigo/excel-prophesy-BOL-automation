@@ -91,6 +91,78 @@ function fmtDiff(val) {
   return n > 0 ? `+${n.toLocaleString('en-US')}` : n.toLocaleString('en-US');
 }
 
+// Cost summary popover (GET /api/bols/{id}/cost-breakdown) — shown on hover over the
+// Calc Cost cell. Deliberately a rollup, not a per-pallet table: a real invoice can carry
+// 100+ line items, and Katie only needs to know whether this number is trustworthy and
+// why, not which specific pallet did what.
+function CostBreakdownPopover({ data }) {
+  if (data === 'loading') {
+    return (
+      <div style={POPOVER_STYLE}>
+        <div style={{ color: '#6b7280' }}>Checking…</div>
+      </div>
+    );
+  }
+  if (data === 'error' || !data) {
+    return (
+      <div style={POPOVER_STYLE}>
+        <div style={{ color: '#6b7280' }}>Cost check unavailable (live mode only, or invoice file not found).</div>
+      </div>
+    );
+  }
+  const pallets = data.pallets || [];
+  const total = pallets.length;
+  const noRate = pallets.filter(p => p.rate_source === 'none').length;
+  const approxRate = pallets.filter(p => p.rate_source === 'legacy_tariff_rates').length;
+  const uncertainMin = pallets.filter(p => p.mc1_source && p.mc1_source !== 'alg_tariff_rates').length;
+  const floored = pallets.filter(p => p.floored).length;
+  const isStale = data.recomputed_access_prog != null && data.stored_access_prog != null
+    && Math.abs(data.recomputed_access_prog - data.stored_access_prog) > 0.01;
+  const clean = noRate === 0 && approxRate === 0 && uncertainMin === 0;
+
+  return (
+    <div style={POPOVER_STYLE}>
+      <div style={{ fontWeight: 700, marginBottom: 4 }}>
+        Cost check — {total} pallet{total === 1 ? '' : 's'}
+      </div>
+      {isStale && (
+        <div style={{ color: '#b45309', marginBottom: 4 }}>
+          Stored {fmtMoney(data.stored_access_prog)} vs. just-recomputed {fmtMoney(data.recomputed_access_prog)} — re-run recompute-access-prog to refresh.
+        </div>
+      )}
+      {clean ? (
+        <div style={{ color: '#16a34a' }}>All pallets priced via a confirmed rate + minimum charge.</div>
+      ) : (
+        <ul style={{ margin: 0, paddingLeft: 16, color: '#92400e' }}>
+          {noRate > 0 && <li>{noRate} pallet{noRate === 1 ? '' : 's'} had no rate found at all — dropped from the total.</li>}
+          {approxRate > 0 && <li>{approxRate} pallet{approxRate === 1 ? '' : 's'} priced via an approximate (nearest-zone) rate.</li>}
+          {uncertainMin > 0 && <li>{uncertainMin} pallet{uncertainMin === 1 ? '' : 's'}' minimum charge couldn't be confirmed against alg_tariff_rates.</li>}
+        </ul>
+      )}
+      {floored > 0 && (
+        <div style={{ color: '#6b7280', marginTop: 4 }}>{floored} pallet{floored === 1 ? '' : 's'} hit a minimum-charge floor.</div>
+      )}
+    </div>
+  );
+}
+
+const POPOVER_STYLE = {
+  position: 'absolute',
+  top: '100%',
+  right: 0,
+  marginTop: 4,
+  background: '#fff',
+  border: '1px solid #d1d5db',
+  borderRadius: 6,
+  boxShadow: '0 4px 12px rgba(0,0,0,0.12)',
+  padding: 10,
+  fontSize: 11,
+  whiteSpace: 'normal',
+  zIndex: 20,
+  width: 300,
+  textAlign: 'left',
+};
+
 
 const TD = {
   padding: '8px 10px',
@@ -122,7 +194,20 @@ const PLACEHOLDER = { width: '100%', height: 26 };
 
 export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isMarkingDoNotPay, isExportingSid, isCheckingBol, isRetryingMatch, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onDoNotPay, onExportSid, onCheckBol, onRetryMatch, onToggleSelect }) {
   const [hovered, setHovered] = useState(false);
+  const [costHovered, setCostHovered] = useState(false);
+  const [costBreakdown, setCostBreakdown] = useState(null); // cached once fetched: null | 'loading' | 'error' | {...}
   const isFlagged = bol.status === 'flagged';
+
+  function handleCostEnter() {
+    setCostHovered(true);
+    if (costBreakdown == null && bol.invoice_number) {
+      setCostBreakdown('loading');
+      fetch(`/api/bols/${bol.id}/cost-breakdown`)
+        .then(res => { if (!res.ok) throw new Error('unavailable'); return res.json(); })
+        .then(data => setCostBreakdown(data))
+        .catch(() => setCostBreakdown('error'));
+    }
+  }
   // Invoice-only stub that never matched any Technique/Prophecy record — Retry
   // (try again next pull) and 3P (write it off as third-party) are both offered,
   // since a stub like this can otherwise sit forever with no way to resolve it.
@@ -252,17 +337,21 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
           : <span style={{ color: '#d1d5db' }}>—</span>
         }
       </td>
-      <td style={TD_R}
+      <td style={{ ...TD_R, position: 'relative' }}
         title={bol.base_tariff != null && bol.fsc_pct != null
           ? `Base: ${fmtMoney(bol.base_tariff)} × FSC (${(parseFloat(bol.fsc_pct) * 100).toFixed(1)}%) = ${fmtMoney(bol.access_prog)}`
             + (bol.weight_source_fallback ? ' — estimate uses ALG\'s invoiced weight; our own pallet data was unavailable' : '')
             + (bol.tariff_zone_approximate ? ' — one or more zones used a nearest-zone rate guess, not an exact match' : '')
+            + (bol.min_charge_uncertain ? ' — one or more zones\' minimum-charge floor could not be confirmed against alg_tariff_rates; hover for details' : '')
           : undefined}
+        onMouseEnter={handleCostEnter}
+        onMouseLeave={() => setCostHovered(false)}
       >
         {fmtMoney(bol.access_prog)}
-        {(bol.weight_source_fallback || bol.tariff_zone_approximate) && (
+        {(bol.weight_source_fallback || bol.tariff_zone_approximate || bol.min_charge_uncertain) && (
           <span style={{ marginLeft: 4, fontSize: 10, background: '#fef3c7', color: '#92400e', borderRadius: 3, padding: '1px 5px', fontWeight: 700, letterSpacing: '0.02em' }}>~EST</span>
         )}
+        {costHovered && bol.invoice_number && <CostBreakdownPopover data={costBreakdown} />}
       </td>
       <td style={{ ...TD_R, fontWeight: 600 }}>{fmtMoney(bol.amount)}</td>
 
