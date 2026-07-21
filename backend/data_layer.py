@@ -54,7 +54,11 @@ def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail")
             f"Trusted_Connection=yes;"
             f"Encrypt=yes;TrustServerCertificate=yes;"
         )
-    return pyodbc.connect(conn_str, timeout=30)
+    # 8s, not pyodbc's default 30s: the Lambda function itself hard-times-out at
+    # 29s (terraform/main/lambda.tf), so a 30s connect timeout guarantees an
+    # ungraceful Lambda kill (bare HTTP 500, nothing caught/logged) instead of a
+    # fast, catchable connection failure on a slow/unreachable AWP-SQL-PROD.
+    return pyodbc.connect(conn_str, timeout=8)
 
 
 # ---------------------------------------------------------------------------

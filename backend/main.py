@@ -2001,8 +2001,15 @@ def _parse_alg_csv_context(reader: "csv.DictReader") -> dict:
             continue
 
         ctx["invoice_no"] = inv
-        ctx["job_name"] = (row.get("Job Name") or "").strip()      # matching key
-        ctx["alg_bol_no"] = (row.get("BOL No") or "").strip()      # ALG reference, not used for matching
+        # First non-blank row wins (same convention as cust_job_no below) — a
+        # multi-line invoice's Job Name is normally repeated on every line, but
+        # if a later line item happens to leave it blank, blindly overwriting
+        # would clear an already-correct matching key to '' and misclassify a
+        # real trip as unmatched.
+        if not ctx["job_name"]:
+            ctx["job_name"] = (row.get("Job Name") or "").strip()      # matching key
+        if not ctx["alg_bol_no"]:
+            ctx["alg_bol_no"] = (row.get("BOL No") or "").strip()      # ALG reference, not used for matching
         try:
             ctx["total_pcs"] += int(float(row.get("Pcs") or 0))
             ctx["total_weight"] += float(row.get("GrossWt") or 0)

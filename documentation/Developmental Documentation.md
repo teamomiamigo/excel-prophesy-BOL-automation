@@ -1,4 +1,4 @@
-*updated 2026-07-20*
+*updated 2026-07-21*
 
 Running log of development work on this branch — what changed, why, and anything non-obvious for the next person (human dev or Claude Code) touching this code. Pairs with `CLAUDE.md` (architecture/business rules, kept current) and the GitHub issue backlog (what's queued up next).
 
@@ -14,6 +14,12 @@ Stable technical notes that don't belong to one changelog entry — add here whe
 ## Changelog
 
 One entry per closed issue. Newest on top.
+
+### 2026-07-21 — Invoice-upload batch failures: job-name overwrite bug + AWP-SQL-PROD connect timeout longer than Lambda's own timeout
+**What:** `_parse_alg_csv_context()` (backend/main.py) now keeps the first non-blank `Job Name`/`BOL No` across a multi-line invoice's CSV rows instead of letting every row overwrite it — matches the existing `cust_job_no` convention two lines below in the same function. `_get_connection()`'s AWP-SQL-PROD connect timeout (backend/data_layer.py) shortened from pyodbc's default 30s to 8s.
+**Why:** Reported symptom was the last invoice in a batch upload consistently failing — either a bare `HTTP 500`, or a false "no match" stub with an empty job name. Pulled the actual CloudWatch traceback for the `HTTP 500` case (`Z557600`): the real historical cause was the `is_ignored` NOT NULL bug already flagged as a risk in #69's own Gotcha note and fixed the same day it happened (2026-07-16, commit `c1c336d`) — not a new bug, and its fix predates the current deploy, but no invoice has been uploaded against the live site since to confirm. The blank-job-name stub (`Z558131`), however, is real and still open: a multi-line invoice with Job Name populated on an early freight line but blank on a later one had its matching key silently cleared to `''`, misclassifying a real trip as unmatched. The connect-timeout mismatch is a separate, independent risk found while investigating: any unmatched invoice's live wide-fallback search can guarantee an ungraceful Lambda kill on a slow/unreachable on-prem connection, since 30s > the Lambda's own 29s hard timeout.
+**Files:** backend/main.py (`_parse_alg_csv_context`), backend/data_layer.py (`_get_connection`), CLAUDE.md
+**Gotcha:** The `is_ignored` root cause is very likely already resolved in production (fix commit is older than the current `live-20260720123701` deploy tag) but has never been re-verified with a real upload since the 07-16 incident — the next live batch upload is the first real signal either way.
 
 ### 2026-07-20 — TECH_PRD1 direct-connection path removed (was never fixable, not a credentials bug)
 **What:** Deleted the dead "direct connection to SG360-TECH-PRD1" attempt from `get_prophecy_data()`/`get_prophecy_pallet_data()` (`backend/data_layer.py`) — `_get_tech_prd1_connection()`, `_PROPHECY_DIRECT_QUERY`, `_PROPHECY_PALLET_DIRECT_QUERY` all removed. Both functions now go straight to the SQLAPPS3-via-AWP-SQL-PROD query that was already carrying 100% of this traffic. Also removed the two now-dead `SG360-TECH-PRD1` entries from `_STATIC_DNS_OVERRIDES` (`backend/config.py`), corrected `CLAUDE.md`'s `.env` quick-start and data-sources table, and dropped the `TECH_PRD1_*` block from `.env.example`.
