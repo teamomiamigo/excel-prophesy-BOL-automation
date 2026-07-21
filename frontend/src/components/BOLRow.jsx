@@ -103,10 +103,10 @@ function CostBreakdownPopover({ data }) {
       </div>
     );
   }
-  if (data === 'error' || !data) {
+  if (!data || data._error) {
     return (
       <div style={POPOVER_STYLE}>
-        <div style={{ color: '#6b7280' }}>Cost check unavailable (live mode only, or invoice file not found).</div>
+        <div style={{ color: '#6b7280' }}>{(data && data._error) || 'Cost check failed — request error.'}</div>
       </div>
     );
   }
@@ -116,8 +116,6 @@ function CostBreakdownPopover({ data }) {
   const approxRate = pallets.filter(p => p.rate_source === 'legacy_tariff_rates').length;
   const uncertainMin = pallets.filter(p => p.mc1_source && p.mc1_source !== 'alg_tariff_rates').length;
   const floored = pallets.filter(p => p.floored).length;
-  const isStale = data.recomputed_access_prog != null && data.stored_access_prog != null
-    && Math.abs(data.recomputed_access_prog - data.stored_access_prog) > 0.01;
   const clean = noRate === 0 && approxRate === 0 && uncertainMin === 0;
 
   return (
@@ -125,11 +123,6 @@ function CostBreakdownPopover({ data }) {
       <div style={{ fontWeight: 700, marginBottom: 4 }}>
         Cost check — {total} pallet{total === 1 ? '' : 's'}
       </div>
-      {isStale && (
-        <div style={{ color: '#b45309', marginBottom: 4 }}>
-          Stored {fmtMoney(data.stored_access_prog)} vs. just-recomputed {fmtMoney(data.recomputed_access_prog)} — re-run recompute-access-prog to refresh.
-        </div>
-      )}
       {clean ? (
         <div style={{ color: '#16a34a' }}>All pallets priced via a confirmed rate + minimum charge.</div>
       ) : (
@@ -195,7 +188,7 @@ const PLACEHOLDER = { width: '100%', height: 26 };
 export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isMarkingDoNotPay, isExportingSid, isCheckingBol, isRetryingMatch, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onCompareOpen, onDoNotPay, onExportSid, onCheckBol, onRetryMatch, onToggleSelect }) {
   const [hovered, setHovered] = useState(false);
   const [costHovered, setCostHovered] = useState(false);
-  const [costBreakdown, setCostBreakdown] = useState(null); // cached once fetched: null | 'loading' | 'error' | {...}
+  const [costBreakdown, setCostBreakdown] = useState(null); // cached once fetched: null | 'loading' | { _error } | {...}
   const isFlagged = bol.status === 'flagged';
 
   function handleCostEnter() {
@@ -203,9 +196,12 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
     if (costBreakdown == null && bol.invoice_number) {
       setCostBreakdown('loading');
       fetch(`/api/bols/${bol.id}/cost-breakdown`)
-        .then(res => { if (!res.ok) throw new Error('unavailable'); return res.json(); })
-        .then(data => setCostBreakdown(data))
-        .catch(() => setCostBreakdown('error'));
+        .then(async res => {
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) { setCostBreakdown({ _error: data.detail || `HTTP ${res.status}` }); return; }
+          setCostBreakdown(data);
+        })
+        .catch(() => setCostBreakdown({ _error: 'Cost check failed — request error.' }));
     }
   }
   // Invoice-only stub that never matched any Technique/Prophecy record — Retry

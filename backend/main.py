@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import logging
 import os
 import time
@@ -88,11 +89,12 @@ async def lifespan(app: FastAPI):
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS weight_source_fallback BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_ambiguous_trip BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS min_charge_uncertain BOOLEAN NOT NULL DEFAULT FALSE"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS cost_calc_detail TEXT"))
             _conn.commit()
         logger.info(
             "DB column migration for base_tariff/fsc_pct/is_third_party/is_do_not_pay/"
             "invoice_sent_at/alg_fsc_pct/alg_fsc_cost/tariff_zone_approximate/weight_source_fallback/"
-            "is_ambiguous_trip/min_charge_uncertain complete "
+            "is_ambiguous_trip/min_charge_uncertain/cost_calc_detail complete "
             "(is_ignored dropped 2026-07-16 — see Developmental Documentation.md)."
         )
     logger.info(
@@ -1833,9 +1835,14 @@ def _apply_access_prog_calc(
     rate structure is legitimately ALG's pricing (using it isn't a violation of
     independence; substituting their weight/pallet counts for ours would be). Sets
     alg_fsc_pct/alg_fsc_cost and the tariff_zone_approximate/weight_source_fallback/
-    min_charge_uncertain flags. Shared by _process_invoice_csv() (every invoice upload),
-    the POST /api/admin/recompute-access-prog backfill, and
-    GET /api/bols/{id}/cost-breakdown (via `detail` — see below).
+    min_charge_uncertain flags. Called from every real invoice-processing site
+    (_process_invoice_csv()'s upload/stub-resolution paths, Wolf/311 stub creation,
+    and the POST /api/admin/recompute-access-prog backfill) — each of those call
+    sites passes `detail=[]` and persists the result onto BOLRecord.cost_calc_detail
+    (JSON), which GET /api/bols/{id}/cost-breakdown then simply reads back rather
+    than ever calling this function itself (see 2026-07-21: that route used to
+    re-parse the original invoice CSV on every call, which only worked in local dev
+    — INVOICE_FOLDER is a UNC path the deployed Lambda can never reach).
 
     alg_blended_rate — the invoice's own freight-total / total-cwt ($/cwt, FSC excluded),
     used as a whole-load fallback when per-zone rating covers less than
@@ -1843,22 +1850,21 @@ def _apply_access_prog_calc(
 
     alg_min_charge_by_zip3 — per-zip3 $ actually billed on THIS invoice where a minimum-
     charge floor fired (see _parse_alg_csv_context()). Used both to flag
-    min_charge_uncertain and to teach alg_tariff_rates (data_layer.reconcile_alg_tariff_rates)
-    for any pallet whose zip3 this invoice billed directly — see 2026-07-21's investigation:
-    alg_tariff_rates was found ~100% accurate for every destination checked by hand, so the
-    original 2026-07-16 "source the minimum from alg_tariff_rates.mc1" fix wasn't a coverage
-    problem — this self-learning pass is a safety net against the table drifting out of sync
-    in the future, not a fix for that specific still-open runtime bug (see
-    GET /api/bols/{id}/cost-breakdown's docstring).
+    min_charge_uncertain (only when the floor actually determined the price via the
+    less-trustworthy legacy source, or when no floor info exists anywhere — fixed
+    2026-07-21, previously fired on any alg_tariff_rates miss regardless of whether
+    it mattered, flagging nearly every real record including several with a
+    provably correct dollar amount) and to teach alg_tariff_rates
+    (data_layer.reconcile_alg_tariff_rates) for any pallet whose zip3 this invoice
+    billed directly.
 
     detail — when a list is passed, one dict per pallet is appended describing exactly how
     that pallet was priced (dest_id, zip3, weight, rate source, rate/mc1 used, whether the
-    floor fired). Purely additive — never changes matched_rec or the DB.
+    floor fired). Purely additive — never changes matched_rec or the DB directly; callers
+    that want it persisted json.dumps() it onto cost_calc_detail themselves.
 
-    learn — set False to suppress the alg_tariff_rates reconciliation pass entirely. Every
-    real invoice-processing call site leaves this True; GET /api/bols/{id}/cost-breakdown
-    passes False, since that route can be called on-demand from a hover and must never
-    write to a shared table just because someone looked at a tooltip.
+    learn — set False to suppress the alg_tariff_rates reconciliation pass. Every real
+    call site leaves this True (default).
 
     See CLAUDE.md's "access_prog calculation" section for the full rationale/priority order.
     """
@@ -1873,7 +1879,18 @@ def _apply_access_prog_calc(
     own_pallets: list[tuple[str, float, "str | None"]] = []  # (zip3, weight, exact_dest_id)
     if effective_prophecy_bol:
         from backend.data_layer import get_prophecy_pallet_data as _get_prophecy_pallet_data
-        for prow in _get_prophecy_pallet_data(int(effective_prophecy_bol)):
+        # Same graceful-degradation contract as the get_pallet_data_for_manifests
+        # branch below -- a slow/hung live query here should leave own_pallets empty
+        # (weight_source_fallback=True), not fail the whole invoice upload.
+        try:
+            prophecy_rows = _get_prophecy_pallet_data(int(effective_prophecy_bol))
+        except Exception as exc:
+            logger.error(
+                "[ACCESS_PROG] get_prophecy_pallet_data failed for BOL %s: %s",
+                effective_prophecy_bol, exc,
+            )
+            prophecy_rows = []
+        for prow in prophecy_rows:
             dest_id = prow.get("destination_id")
             dest_zip = prow.get("destination_zip")
             # Prefer the actual postal zip3 (destination_zip) over the SCF zone code
@@ -1962,15 +1979,25 @@ def _apply_access_prog_calc(
                 mc1_used, mc1_source = alg_min["mc1"], "alg_tariff_rates"
             else:
                 # alg_tariff_rates was independently confirmed ~100% accurate for every
-                # destination checked by hand 2026-07-21, so a miss here that still lands
-                # on this branch (rate matched fine) is worth surfacing even though it
-                # doesn't affect the RATE — flag it distinctly from tariff_zone_approximate,
-                # which is about the rate lookup falling back, not this minimum sub-lookup.
-                any_min_charge_uncertain = True
+                # destination checked by hand 2026-07-21, but a miss here only actually
+                # matters if it changed the price or left us with zero floor information —
+                # confirmed 2026-07-21 that flagging on every miss regardless (the previous
+                # behavior) fired on nearly every real record, including ones whose dollar
+                # amount was independently verified correct, since it only takes one such
+                # pallet out of a hundred to flag the whole record.
                 zone_info = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
                 if zone_info and zone_info.get("minimum_freight") is not None:
                     base = max(base, zone_info["minimum_freight"])
                     mc1_used, mc1_source = zone_info["minimum_freight"], "legacy_tariff_rates"
+                    if base == mc1_used:
+                        # The floor actually determined the price, using the less-
+                        # trustworthy legacy source instead of alg_tariff_rates.
+                        any_min_charge_uncertain = True
+                else:
+                    # No floor info anywhere — not alg_tariff_rates, not the legacy card.
+                    # Can't rule out a real minimum charge we're simply missing; silence
+                    # here isn't confirmation that no floor applies.
+                    any_min_charge_uncertain = True
             with_fsc = base * (Decimal("1") + _effective_fsc_pct) if _effective_fsc_pct is not None else base
             new_base_sum += base
             new_tariff_sum += with_fsc
@@ -2277,13 +2304,17 @@ def _finish_resolving_stub(
         round(ctx["alg_freight_total"] / (ctx["total_weight"] / 100.0), 4)
         if ctx.get("alg_freight_total") and ctx.get("total_weight") else None
     )
+    _cost_detail: list = []
     _apply_access_prog_calc(
         rec, rec.match_strategy, effective_prophecy_bol,
         ctx["alg_rate_by_zip3"], ctx["fsc_rate_val"], ctx["fsc_cost_val"],
         _get_tariff_rate, _diesel_price, _fsc_pct,
         alg_blended_rate=_blended,
         alg_min_charge_by_zip3=ctx.get("alg_min_charge_by_zip3"),
+        detail=_cost_detail,
     )
+    if _cost_detail:
+        rec.cost_calc_detail = json.dumps(_cost_detail)
     if rec.access_prog is not None and rec.amount:
         rec.cost_pct = Decimal(str(round(float(rec.access_prog) / float(rec.amount), 6)))
 
@@ -2419,49 +2450,63 @@ def _wide_fallback_technique_search(
     """
     from backend.data_layer import get_technique_data, get_manifest_weights
 
-    wide_manifests = _dedupe_technique_rows(get_technique_data(days_back=days_back))
+    try:
+        wide_manifests = _dedupe_technique_rows(get_technique_data(days_back=days_back))
 
-    # Same "how many manifests does this trip have" count pull_technique_data() computes
-    # for is_ambiguous_trip -- records created via this wide fallback previously never set
-    # it at all (always defaulted False), so a genuinely ambiguous trip found only here
-    # could never show the ~UNVERIFIED badge.
-    trip_manifest_counts: dict[str, int] = {}
-    for m in wide_manifests:
-        if m.get("technique_trip"):
-            trip_manifest_counts[m["technique_trip"]] = trip_manifest_counts.get(m["technique_trip"], 0) + 1
+        # Same "how many manifests does this trip have" count pull_technique_data() computes
+        # for is_ambiguous_trip -- records created via this wide fallback previously never set
+        # it at all (always defaulted False), so a genuinely ambiguous trip found only here
+        # could never show the ~UNVERIFIED badge.
+        trip_manifest_counts: dict[str, int] = {}
+        for m in wide_manifests:
+            if m.get("technique_trip"):
+                trip_manifest_counts[m["technique_trip"]] = trip_manifest_counts.get(m["technique_trip"], 0) + 1
 
-    by_trip_suffix: dict[str, list[dict]] = {}
-    by_manifest_suffix: dict[str, list[dict]] = {}
-    for m in wide_manifests:
-        if m.get("technique_trip"):
-            by_trip_suffix.setdefault(_trip_to_suffix(m["technique_trip"]), []).append(m)
-        if m.get("manifest"):
-            by_manifest_suffix.setdefault(_manifest_to_suffix(m["manifest"]), []).append(m)
+        by_trip_suffix: dict[str, list[dict]] = {}
+        by_manifest_suffix: dict[str, list[dict]] = {}
+        for m in wide_manifests:
+            if m.get("technique_trip"):
+                by_trip_suffix.setdefault(_trip_to_suffix(m["technique_trip"]), []).append(m)
+            if m.get("manifest"):
+                by_manifest_suffix.setdefault(_manifest_to_suffix(m["manifest"]), []).append(m)
 
-    candidates = by_trip_suffix.get(job_name) or by_manifest_suffix.get(job_name) or []
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        candidates[0]["_trip_manifest_count"] = trip_manifest_counts.get(candidates[0].get("technique_trip"), 0)
-        return candidates[0]
+        candidates = by_trip_suffix.get(job_name) or by_manifest_suffix.get(job_name) or []
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            candidates[0]["_trip_manifest_count"] = trip_manifest_counts.get(candidates[0].get("technique_trip"), 0)
+            return candidates[0]
 
-    # Multiple manifests share this suffix in the wide window — score by closeness
-    # to the invoice's own billed quantities instead of taking an arbitrary one.
-    score_weights = get_manifest_weights([c["manifest"] for c in candidates])
-    for c in candidates:
-        wd = score_weights.get(c["manifest"], {})
-        c["technique_weight"]  = wd.get("technique_weight", 0)
-        c["technique_pallets"] = wd.get("technique_pallets", 0)
-        c["technique_pcs"]     = wd.get("technique_pcs", 0)
-    best, score = _closest_technique_match(candidates, float(alg_weight or 0), alg_pallets or 0, alg_pcs or 0)
-    if score > _CLOSE_MATCH_THRESHOLD:
+        # Multiple manifests share this suffix in the wide window — score by closeness
+        # to the invoice's own billed quantities instead of taking an arbitrary one.
+        score_weights = get_manifest_weights([c["manifest"] for c in candidates])
+        for c in candidates:
+            wd = score_weights.get(c["manifest"], {})
+            c["technique_weight"]  = wd.get("technique_weight", 0)
+            c["technique_pallets"] = wd.get("technique_pallets", 0)
+            c["technique_pcs"]     = wd.get("technique_pcs", 0)
+        best, score = _closest_technique_match(candidates, float(alg_weight or 0), alg_pallets or 0, alg_pcs or 0)
+        if score > _CLOSE_MATCH_THRESHOLD:
+            logger.warning(
+                "[INVOICE WIDE FALLBACK] closest match among %d candidates on suffix '%s' "
+                "still has a large discrepancy (score=%.3f) - verify manually",
+                len(candidates), job_name, score,
+            )
+        best["_trip_manifest_count"] = trip_manifest_counts.get(best.get("technique_trip"), 0)
+        return best
+    except Exception as exc:
+        # A hung/slow on-prem query here used to guarantee an ungraceful Lambda kill
+        # (bare HTTP 500, no traceback -- confirmed 2026-07-21 via CloudWatch on a real
+        # invoice upload) since nothing caught it. Treat any failure the same as "no
+        # match in the wide window either" -- the caller already handles a None return
+        # by falling through to a normal invoice_only stub, which can still resolve on
+        # a later pull's DB-side re-match pass.
         logger.warning(
-            "[INVOICE WIDE FALLBACK] closest match among %d candidates on suffix '%s' "
-            "still has a large discrepancy (score=%.3f) - verify manually",
-            len(candidates), job_name, score,
+            "[INVOICE WIDE FALLBACK] live Technique search failed for suffix '%s' "
+            "(days_back=%d): %s — treating as no match.",
+            job_name, days_back, exc,
         )
-    best["_trip_manifest_count"] = trip_manifest_counts.get(best.get("technique_trip"), 0)
-    return best
+        return None
 
 
 def _apply_invoice_match(
@@ -2618,13 +2663,17 @@ def _apply_invoice_match(
         if invoice_sent_at:
             matched_rec.invoice_sent_at = invoice_sent_at
         if not already_done:
+            _cost_detail: list = []
             _apply_access_prog_calc(
                 matched_rec, match_strategy, effective_prophecy_bol,
                 alg_rate_by_zip3, fsc_rate_val, fsc_cost_val,
                 _get_tariff_rate, _diesel_price, _fsc_pct,
                 alg_blended_rate=alg_blended_rate,
                 alg_min_charge_by_zip3=alg_min_charge_by_zip3,
+                detail=_cost_detail,
             )
+            if _cost_detail:
+                matched_rec.cost_calc_detail = json.dumps(_cost_detail)
         if matched_rec.amount and matched_rec.access_prog:
             matched_rec.cost_pct = Decimal(
                 str(round(float(matched_rec.access_prog) / float(matched_rec.amount), 6))
@@ -3093,13 +3142,17 @@ def _process_invoice_csv(
                     stub.prophecy_pcs     = prop["prophecy_pcs"]
                     _compute_diffs(stub)
                 if _get_tariff_rate is not None:
+                    _cost_detail: list = []
                     _apply_access_prog_calc(
                         stub, "prophecy_bol", effective_prophecy_bol,
                         alg_rate_by_zip3, fsc_rate_val, fsc_cost_val,
                         _get_tariff_rate, _diesel_price, _fsc_pct,
                         alg_blended_rate=alg_blended_rate,
                         alg_min_charge_by_zip3=alg_min_charge_by_zip3,
+                        detail=_cost_detail,
                     )
+                    if _cost_detail:
+                        stub.cost_calc_detail = json.dumps(_cost_detail)
                     if stub.amount and stub.access_prog:
                         stub.cost_pct = Decimal(str(round(float(stub.access_prog) / float(stub.amount), 6)))
                 db.commit()
@@ -3658,16 +3711,20 @@ def recompute_access_prog(db: Session = Depends(get_db)):
             round(ctx["alg_freight_total"] / (ctx["total_weight"] / 100.0), 4)
             if ctx.get("alg_freight_total") and ctx.get("total_weight") else None
         )
+        _cost_detail: list = []
         _apply_access_prog_calc(
             rec, rec.match_strategy, effective_prophecy_bol,
             ctx["alg_rate_by_zip3"], ctx["fsc_rate_val"], ctx["fsc_cost_val"],
             _get_tariff_rate, _diesel_price, _fsc_pct,
             alg_blended_rate=_blended,
             alg_min_charge_by_zip3=ctx.get("alg_min_charge_by_zip3"),
+            detail=_cost_detail,
         )
         if rec.access_prog is None:
             skipped_no_own_data += 1
             continue
+        if _cost_detail:
+            rec.cost_calc_detail = json.dumps(_cost_detail)
         if rec.amount and rec.access_prog:
             rec.cost_pct = Decimal(str(round(float(rec.access_prog) / float(rec.amount), 6)))
         fixed += 1
@@ -3683,94 +3740,46 @@ def recompute_access_prog(db: Session = Depends(get_db)):
 @app.get("/api/bols/{record_id}/cost-breakdown", tags=["Admin"])
 def get_cost_breakdown(record_id: uuid.UUID, db: Session = Depends(get_db)):
     """
-    Read-only per-pallet breakdown of how Calculated Cost was (or would be) computed for
-    one record — re-locates and re-parses the record's own invoice CSV
-    (_find_invoice_file, require_csv=True) and re-runs _apply_access_prog_calc() against a
-    disposable, never-committed scratch record with `learn=False`, so this route can be
-    called on demand (e.g. a dashboard hover) without ever writing to the DB — not the
-    record, not the shared alg_tariff_rates table.
+    Read-only per-pallet breakdown of how Calculated Cost was computed for one record —
+    reads the `cost_calc_detail` JSON stored on the record at real-calculation time
+    (see _apply_access_prog_calc()'s `detail` param, populated at every real call site:
+    invoice upload, stub resolution, Wolf/311 stub creation, and the
+    recompute-access-prog backfill).
 
-    Built 2026-07-21 for two purposes: (1) the dashboard's per-record Calculated Cost
-    tooltip — which destination(s) drove an uncertain or unexpected number; (2) the
-    diagnostic tool for an open investigation — alg_tariff_rates was independently
-    confirmed ~100% accurate for every destination checked by hand this session (see
-    documentation/tariff_minimum_charge_audit.md), yet Calculated Cost on several real
-    records — including ones created the same day as this route — still doesn't reflect
-    the correct minimum-charge floor. Comparing this route's per-pallet `pallets` output
-    against that audit log is the way to find that disconnect: if `mc1_source` here
-    already reads "alg_tariff_rates" with the right value, the bug is downstream of this
-    calc; if it reads "none_found"/"legacy_tariff_rates" for a destination the audit log
-    says IS in alg_tariff_rates, the bug is in how `exact_dest_id` reaches this function.
+    Rewritten 2026-07-21: this route used to re-locate and re-parse the record's own
+    invoice CSV from INVOICE_FOLDER on every call, which only ever worked in local dev —
+    INVOICE_FOLDER is a Windows UNC share the deployed Lambda has no env var for and can
+    never mount regardless, so this route 404'd for every record, always, on the live app.
+    Storing the breakdown once at calc time instead of re-deriving it on demand means this
+    now works identically in local dev and on the deployed Lambda, and needs no live query
+    or file access at all.
     """
-    if settings.USE_MOCK_DATA:
-        raise HTTPException(status_code=400, detail="Not available in mock mode.")
-
     rec = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
     if rec is None:
         raise HTTPException(status_code=404, detail="Record not found.")
     if not rec.invoice_number:
         raise HTTPException(status_code=422, detail="This record has no invoice to break down.")
-
-    folder = settings.INVOICE_FOLDER
-    if not folder or not os.path.isdir(folder):
-        raise HTTPException(status_code=404, detail="INVOICE_FOLDER is not configured or does not exist.")
-
-    hit = _find_invoice_file(folder, rec.invoice_number, require_csv=True)
-    if hit is None:
-        raise HTTPException(status_code=404, detail=f"Original invoice CSV for {rec.invoice_number} not found.")
-    path, _media_type = hit
+    if not rec.cost_calc_detail:
+        raise HTTPException(
+            status_code=404,
+            detail="This record hasn't been recomputed since cost-breakdown storage was "
+                   "added — run recompute-access-prog to backfill it.",
+        )
     try:
-        with open(path, "rb") as f:
-            content = f.read()
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Could not read invoice file: {exc}")
-
-    reader = csv.DictReader(io.StringIO(content.decode("utf-8", errors="replace")))
-    ctx = _parse_alg_csv_context(reader)
-
-    from backend.data_layer import get_tariff_rate as _get_tariff_rate
-    from backend.data_layer import get_current_diesel_price, get_fsc_rate as _get_fsc_rate
-    _diesel_price = get_current_diesel_price()
-    _fsc_pct = _get_fsc_rate(_diesel_price) if _diesel_price is not None else None
-
-    # See _finish_resolving_stub()'s identical fix -- stored match_strategy can go
-    # stale, so route structurally (no manifest, real bol_number) instead.
-    effective_prophecy_bol = str(rec.bol_number) if not rec.manifest and rec.bol_number else None
-    _blended = (
-        round(ctx["alg_freight_total"] / (ctx["total_weight"] / 100.0), 4)
-        if ctx.get("alg_freight_total") and ctx.get("total_weight") else None
-    )
-
-    # Disposable, never-added-to-session copy — _apply_access_prog_calc() writes onto
-    # this, not `rec`, so nothing here can ever be committed back even by accident.
-    scratch = BOLRecord(
-        manifest=rec.manifest,
-        technique_weight=rec.technique_weight,
-        technique_pallets=rec.technique_pallets,
-        technique_pcs=rec.technique_pcs,
-    )
-    detail: list = []
-    _apply_access_prog_calc(
-        scratch, rec.match_strategy, effective_prophecy_bol,
-        ctx["alg_rate_by_zip3"], ctx["fsc_rate_val"], ctx["fsc_cost_val"],
-        _get_tariff_rate, _diesel_price, _fsc_pct,
-        alg_blended_rate=_blended,
-        alg_min_charge_by_zip3=ctx.get("alg_min_charge_by_zip3"),
-        detail=detail,
-        learn=False,
-    )
+        detail = json.loads(rec.cost_calc_detail)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=500, detail="Stored cost-breakdown detail is corrupted.")
 
     return {
         "record_id": str(rec.id),
         "invoice_number": rec.invoice_number,
         "match_strategy": rec.match_strategy,
-        "stored_access_prog": float(rec.access_prog) if rec.access_prog is not None else None,
-        "stored_amount": float(rec.amount) if rec.amount is not None else None,
-        "stored_cost_pct": float(rec.cost_pct) if rec.cost_pct is not None else None,
-        "recomputed_access_prog": float(scratch.access_prog) if scratch.access_prog is not None else None,
-        "recomputed_min_charge_uncertain": scratch.min_charge_uncertain,
-        "recomputed_tariff_zone_approximate": scratch.tariff_zone_approximate,
-        "recomputed_weight_source_fallback": scratch.weight_source_fallback,
+        "access_prog": float(rec.access_prog) if rec.access_prog is not None else None,
+        "amount": float(rec.amount) if rec.amount is not None else None,
+        "cost_pct": float(rec.cost_pct) if rec.cost_pct is not None else None,
+        "min_charge_uncertain": rec.min_charge_uncertain,
+        "tariff_zone_approximate": rec.tariff_zone_approximate,
+        "weight_source_fallback": rec.weight_source_fallback,
         "pallets": detail,
     }
 

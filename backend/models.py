@@ -172,6 +172,15 @@ class BOLRecord(Base):
     # A pallet can price via ALG's own exact invoiced rate (no rate approximation at all) and
     # still have an unconfirmed minimum-charge floor, which this flag alone catches.
     min_charge_uncertain: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # JSON-encoded list of per-pallet cost-calc detail dicts (dest_id, zip3, weight,
+    # rate_source, rate_used, mc1_used, mc1_source, floored, base, with_fsc) -- the
+    # same shape _apply_access_prog_calc()'s `detail` param builds. Stored once at
+    # real-calculation time so GET /api/bols/{id}/cost-breakdown never needs to
+    # re-locate/re-parse the original invoice CSV (INVOICE_FOLDER is a Windows UNC
+    # path the deployed Lambda can never reach). Null until first computed under
+    # this scheme; a pre-existing record stays null until recompute-access-prog
+    # backfills it.
+    cost_calc_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # True when this manifest's technique_trip had more than one manifest in the most
     # recent Technique pull. Recomputed fresh on every pull (same lifecycle as
     # technique_weight itself) — un-flags automatically if the trip resolves to one manifest.

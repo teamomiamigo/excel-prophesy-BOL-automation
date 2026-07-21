@@ -58,7 +58,16 @@ def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail")
     # 29s (terraform/main/lambda.tf), so a 30s connect timeout guarantees an
     # ungraceful Lambda kill (bare HTTP 500, nothing caught/logged) instead of a
     # fast, catchable connection failure on a slow/unreachable AWP-SQL-PROD.
-    return pyodbc.connect(conn_str, timeout=8)
+    conn = pyodbc.connect(conn_str, timeout=8)
+    # Query-level timeout, distinct from the connect() timeout above: pyodbc applies
+    # Connection.timeout to every cursor.execute() made on this connection. Without
+    # it, a slow/hung linked-server query (once connected) can block indefinitely,
+    # past Lambda's 29s hard wall, with no traceback -- confirmed 2026-07-21 via
+    # CloudWatch on a real invoice upload (Z557856) that hard-timed-out this way
+    # inside _wide_fallback_technique_search(). 15s leaves 8s(connect)+15s(query)=23s
+    # for one live call, with margin left for the rest of request processing.
+    conn.timeout = 15
+    return conn
 
 
 # ---------------------------------------------------------------------------
