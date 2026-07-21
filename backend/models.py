@@ -303,6 +303,28 @@ class BOLSummary(BaseModel):
     updated_at: datetime
 
 
+class ManifestCandidate(BOLSummary):
+    """One manifest sharing a trip with an ambiguous-match record, scored against
+    the invoice actually attached to that trip — see GET /trip-manifests."""
+    score: Optional[float] = None
+    is_best_fit: bool = False
+
+
+class TripManifestsResponse(BaseModel):
+    """All manifests sharing one Technique trip, for manual verification of which
+    one an ALG invoice really belongs to when is_ambiguous_trip is set."""
+    technique_trip: Optional[str] = None
+    reference_id: Optional[uuid.UUID] = None
+    invoice_number: Optional[str] = None
+    invoice_email_sender: Optional[str] = None
+    inv_job_number: Optional[str] = None
+    amount: Optional[Decimal] = None
+    alg_weight: Optional[Decimal] = None
+    alg_pallets: Optional[int] = None
+    alg_pcs: Optional[int] = None
+    candidates: list[ManifestCandidate]
+
+
 class FlagRequest(BaseModel):
     reason: str = Field(..., min_length=3, max_length=500)
 

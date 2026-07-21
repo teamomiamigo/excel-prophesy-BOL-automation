@@ -118,7 +118,7 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort 
 export default function BOLTable({
   bols, loading, approvingId, unflaggingId, markingThirdPartyId, markingDoNotPayId, exportingSidId, checkingBolId, retryingMatchId,
   filterText, onFilterChange, selectedIds, onToggleSelect, onToggleSelectAll, sort, onSort,
-  onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onDoNotPay, onExportSid, onCheckBol, onRetryMatch,
+  onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onCompareOpen, onDoNotPay, onExportSid, onCheckBol, onRetryMatch,
 }) {
   const lower = (filterText || '').toLowerCase();
   const matchesBol = b => !filterText || [
@@ -209,6 +209,7 @@ export default function BOLTable({
       onNotesUpdate:       notes => onNotesUpdate(bol.id, notes),
       onMarkThirdParty:    () => onMarkThirdParty(bol.id),
       onReassignOpen:      onReassignOpen,
+      onCompareOpen:       onCompareOpen,
       onDoNotPay:          onDoNotPay,
       onExportSid:         () => onExportSid(bol.id),
       onCheckBol:          () => onCheckBol(bol.id),
