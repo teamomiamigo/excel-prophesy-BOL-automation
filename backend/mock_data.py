@@ -36,7 +36,7 @@ MOCK_BOLS = [
         "prop_reship": Decimal("3258.15"),
         "access_prog": Decimal("3177.77"),
         "amount": Decimal("3139.85"),
-        "cost_pct": Decimal("1.012079"),   # 101.21% — green (access_prog / amount)
+        "cost_pct": Decimal("0.988067"),   # 98.81% — green (amount / access_prog)
         "base_tariff": Decimal("2328.26"),
         "fsc_pct": Decimal("0.365000"),
         "prophecy_weight": Decimal("30237.00"),
@@ -79,7 +79,7 @@ MOCK_BOLS = [
         "prop_reship": Decimal("2764.35"),
         "access_prog": Decimal("3155.38"),
         "amount": Decimal("2806.27"),
-        "cost_pct": Decimal("1.124404"),   # 112.44% — red (>10% above)
+        "cost_pct": Decimal("0.889360"),   # 88.94% — red (>10% below)
         "base_tariff": Decimal("2311.27"),
         "fsc_pct": Decimal("0.365000"),
         "prophecy_weight": Decimal("20479.00"),
@@ -122,7 +122,7 @@ MOCK_BOLS = [
         "prop_reship": Decimal("1446.82"),
         "access_prog": Decimal("1496.88"),
         "amount": Decimal("1484.48"),
-        "cost_pct": Decimal("1.008353"),   # 100.84% — green
+        "cost_pct": Decimal("0.991716"),   # 99.17% — green
         "base_tariff": Decimal("1096.64"),
         "fsc_pct": Decimal("0.365000"),
         "prophecy_weight": Decimal("12881.00"),
@@ -165,7 +165,7 @@ MOCK_BOLS = [
         "prop_reship": Decimal("1593.85"),
         "access_prog": Decimal("1834.57"),
         "amount": Decimal("1696.34"),
-        "cost_pct": Decimal("1.081494"),   # 108.15% — red (>6% above)
+        "cost_pct": Decimal("0.924653"),   # 92.47% — red (>6% below)
         "base_tariff": Decimal("1343.65"),
         "fsc_pct": Decimal("0.365000"),
         "prophecy_weight": Decimal("11869.00"),
@@ -176,7 +176,7 @@ MOCK_BOLS = [
         "pcs_diff": 0,
         "notes": "cancels out",
         "status": "flagged",
-        "flag_reason": "Cost % above 105% — Access Prog significantly higher than invoice amount",
+        "flag_reason": "Cost % below 95% — Access Prog significantly higher than invoice amount",
         "approved_at": None,
         "approved_by": None,
         "needs_sid_export": True,   # Type A — no BOL yet
@@ -208,7 +208,7 @@ MOCK_BOLS = [
         "prop_reship": Decimal("1918.57"),
         "access_prog": Decimal("2027.76"),
         "amount": Decimal("1935.13"),
-        "cost_pct": Decimal("1.047617"),   # 104.76% — orange (3–6% above)
+        "cost_pct": Decimal("0.954319"),   # 95.43% — orange (3–6% below)
         "base_tariff": Decimal("1485.13"),
         "fsc_pct": Decimal("0.365000"),
         "prophecy_weight": Decimal("15322.00"),
@@ -251,7 +251,7 @@ MOCK_BOLS = [
         "prop_reship": Decimal("3051.01"),
         "access_prog": Decimal("4764.08"),
         "amount": Decimal("4501.57"),
-        "cost_pct": Decimal("1.058315"),   # 105.83% — orange (3–6% above)
+        "cost_pct": Decimal("0.944898"),   # 94.49% — orange (3–6% below)
         "base_tariff": Decimal("3490.46"),
         "fsc_pct": Decimal("0.365000"),
         "prophecy_weight": Decimal("34522.00"),
@@ -294,7 +294,7 @@ MOCK_BOLS = [
         "prop_reship": Decimal("3966.84"),
         "access_prog": Decimal("5692.42"),
         "amount": Decimal("5751.56"),
-        "cost_pct": Decimal("0.989718"),   # 98.97% — green
+        "cost_pct": Decimal("1.010389"),   # 101.04% — green
         "base_tariff": Decimal("4170.42"),
         "fsc_pct": Decimal("0.365000"),
         "prophecy_weight": Decimal("398013.00"),
@@ -337,7 +337,7 @@ MOCK_BOLS = [
         "prop_reship": Decimal("2825.07"),
         "access_prog": Decimal("4053.93"),
         "amount": Decimal("4096.40"),
-        "cost_pct": Decimal("0.989632"),   # 98.96% — green
+        "cost_pct": Decimal("1.010476"),   # 101.05% — green
         "base_tariff": Decimal("2970.50"),
         "fsc_pct": Decimal("0.365000"),
         "prophecy_weight": Decimal("42415.00"),
@@ -380,7 +380,7 @@ MOCK_BOLS = [
         "prop_reship": Decimal("1706.80"),
         "access_prog": Decimal("2599.69"),
         "amount": Decimal("2506.75"),
-        "cost_pct": Decimal("1.037063"),   # 103.71% — orange (3–6% above)
+        "cost_pct": Decimal("0.964250"),   # 96.43% — orange (3–6% below)
         "base_tariff": Decimal("1904.19"),
         "fsc_pct": Decimal("0.365000"),
         "prophecy_weight": Decimal("23541.00"),
@@ -649,7 +649,7 @@ MOCK_BOLS = [
         "prop_reship": None,
         "access_prog": Decimal("2534.10"),
         "amount": Decimal("2650.00"),
-        "cost_pct": Decimal("0.956264"),
+        "cost_pct": Decimal("1.045736"),   # 104.57% — orange (3–6% above)
         "base_tariff": Decimal("1856.85"),
         "fsc_pct": Decimal("0.365000"),
         "prophecy_weight": Decimal("16350.00"),
