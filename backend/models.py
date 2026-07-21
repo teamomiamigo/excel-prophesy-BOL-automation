@@ -152,6 +152,7 @@ class BOLRecord(Base):
     access_prog: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     # Stored as ratio (0.9881 = 98.81%) for fast queries; computed: amount / access_prog
+    # (reverted 2026-07-21 — was access_prog/amount 2026-07-16 to 2026-07-21)
     cost_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
     # Rate breakdown for tooltip: base_tariff × (1 + fsc_pct) = access_prog
     base_tariff: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)

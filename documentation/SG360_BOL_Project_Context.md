@@ -115,7 +115,7 @@ mail.dat file
 
 ## The Key Variance Metric
 
-**Cost % = amount ÷ access_prog** (actual ALG charge ÷ expected tariff rate)
+**Cost % = amount ÷ access_prog** (actual ALG charge ÷ expected tariff rate) — confirmed current as of the 2026-07-21 reversal (was `access_prog / amount` 2026-07-16 to 2026-07-21)
 
 Stored as ratio (e.g., 0.9881 = 98.81%).
 
@@ -175,7 +175,7 @@ bol_records
   prop_reship       Numeric(10,2), nullable  ← Prophecy estimate
   access_prog       Numeric(10,2), nullable  ← tariff rate calculation
   amount            Numeric(10,2), nullable  ← actual ALG charge
-  cost_pct          Numeric(8,6), nullable   ← amount/access_prog stored as ratio
+  cost_pct          Numeric(8,6), nullable   ← amount/access_prog stored as ratio (confirmed current 2026-07-21)
   prophecy_weight   Numeric(12,2), nullable
   weight_diff       Numeric(12,2), nullable  ← prophecy - technique
   prophecy_pallets  Integer, nullable

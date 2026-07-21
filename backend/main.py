@@ -697,7 +697,7 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
 
         if target_rec.get("amount") and target_rec.get("access_prog"):
             target_rec["cost_pct"] = round(
-                float(target_rec["access_prog"]) / float(target_rec["amount"]), 6
+                float(target_rec["amount"]) / float(target_rec["access_prog"]), 6
             )
         target_rec["updated_at"] = datetime.now(timezone.utc)
 
@@ -790,7 +790,7 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
 
     if target_row.amount and target_row.access_prog:
         target_row.cost_pct = Decimal(str(round(
-            float(target_row.access_prog) / float(target_row.amount), 6
+            float(target_row.amount) / float(target_row.access_prog), 6
         )))
     target_row.updated_at = datetime.now(timezone.utc)
 
@@ -2316,7 +2316,7 @@ def _finish_resolving_stub(
     if _cost_detail:
         rec.cost_calc_detail = json.dumps(_cost_detail)
     if rec.access_prog is not None and rec.amount:
-        rec.cost_pct = Decimal(str(round(float(rec.access_prog) / float(rec.amount), 6)))
+        rec.cost_pct = Decimal(str(round(float(rec.amount) / float(rec.access_prog), 6)))
 
 
 _CLOSE_MATCH_THRESHOLD = 0.15  # combined relative difference across weight/pallets/pcs;
@@ -2450,8 +2450,15 @@ def _wide_fallback_technique_search(
     """
     from backend.data_layer import get_technique_data, get_manifest_weights
 
+    # 15s query cap here specifically -- this search runs inside an invoice
+    # upload/poll request that's already done other work, so it needs to leave
+    # room in Lambda's 29s wall (8s connect + 15s query = 23s, some margin left).
+    # Not the default for get_technique_data()/get_manifest_weights() in general --
+    # see _get_connection()'s query_timeout docstring.
     try:
-        wide_manifests = _dedupe_technique_rows(get_technique_data(days_back=days_back))
+        wide_manifests = _dedupe_technique_rows(
+            get_technique_data(days_back=days_back, query_timeout=15)
+        )
 
         # Same "how many manifests does this trip have" count pull_technique_data() computes
         # for is_ambiguous_trip -- records created via this wide fallback previously never set
@@ -2479,7 +2486,7 @@ def _wide_fallback_technique_search(
 
         # Multiple manifests share this suffix in the wide window — score by closeness
         # to the invoice's own billed quantities instead of taking an arbitrary one.
-        score_weights = get_manifest_weights([c["manifest"] for c in candidates])
+        score_weights = get_manifest_weights([c["manifest"] for c in candidates], query_timeout=15)
         for c in candidates:
             wd = score_weights.get(c["manifest"], {})
             c["technique_weight"]  = wd.get("technique_weight", 0)
@@ -2600,7 +2607,7 @@ def _apply_invoice_match(
             matched_rec["invoice_sent_at"] = invoice_sent_at
         if matched_rec.get("amount") and matched_rec.get("access_prog"):
             matched_rec["cost_pct"] = round(
-                float(matched_rec["access_prog"]) / float(matched_rec["amount"]), 6
+                float(matched_rec["amount"]) / float(matched_rec["access_prog"]), 6
             )
         # Diffs: ALG vs Prophecy for Wolf/311, ALG vs Technique for Corp.
         alg_w   = matched_rec.get("alg_weight")
@@ -2676,7 +2683,7 @@ def _apply_invoice_match(
                 matched_rec.cost_calc_detail = json.dumps(_cost_detail)
         if matched_rec.amount and matched_rec.access_prog:
             matched_rec.cost_pct = Decimal(
-                str(round(float(matched_rec.access_prog) / float(matched_rec.amount), 6))
+                str(round(float(matched_rec.amount) / float(matched_rec.access_prog), 6))
             )
         # Wolf/311: refresh Prophecy weight/pallets/pcs from ShipperPlus when this invoice
         # matched via a Prophecy BOL number this time around.
@@ -3154,7 +3161,7 @@ def _process_invoice_csv(
                     if _cost_detail:
                         stub.cost_calc_detail = json.dumps(_cost_detail)
                     if stub.amount and stub.access_prog:
-                        stub.cost_pct = Decimal(str(round(float(stub.access_prog) / float(stub.amount), 6)))
+                        stub.cost_pct = Decimal(str(round(float(stub.amount) / float(stub.access_prog), 6)))
                 db.commit()
         logger.info(
             "[INVOICE] %s → no match, stub created (bol=%s, note=%s)",
@@ -3726,7 +3733,7 @@ def recompute_access_prog(db: Session = Depends(get_db)):
         if _cost_detail:
             rec.cost_calc_detail = json.dumps(_cost_detail)
         if rec.amount and rec.access_prog:
-            rec.cost_pct = Decimal(str(round(float(rec.access_prog) / float(rec.amount), 6)))
+            rec.cost_pct = Decimal(str(round(float(rec.amount) / float(rec.access_prog), 6)))
         fixed += 1
 
     db.commit()

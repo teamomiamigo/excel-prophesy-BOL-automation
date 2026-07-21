@@ -59,7 +59,9 @@ export function isUnverifiedQuantity(bol) {
 }
 
 // ---------------------------------------------------------------------------
-// Cost % variance logic — primary metric (amount / access_prog)
+// Cost % variance logic — primary metric (amount / access_prog) — reverted 2026-07-21
+// (was access_prog/amount 2026-07-16 to 2026-07-21). Color logic below is
+// symmetric/direction-agnostic — unaffected by either flip.
 // Green: within 3% | Orange: 3–6% off | Red: >6% off
 // ---------------------------------------------------------------------------
 function getCostPctStyle(costPct) {
