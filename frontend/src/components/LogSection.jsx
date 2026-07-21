@@ -62,7 +62,7 @@ function StatusBadge({ status }) {
 }
 
 function InvoiceTypeBadge({ record }) {
-  const type = record.is_third_party ? 'Third Party' : (record.needs_sid_export ? 'Corp' : 'Wolf/311');
+  const type = record.is_third_party ? 'Third Party' : (record.technique_trip != null ? 'Corp' : 'Wolf/311');
   const style = type === 'Third Party'
     ? { bg: '#fff7ed', color: '#c2410c' }
     : { bg: '#f3f4f6', color: '#374151' };
