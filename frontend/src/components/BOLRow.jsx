@@ -120,7 +120,7 @@ const ICON_BTN = {
 // Actions column: fixed-size empty slot — same footprint as a button, reads as "nothing here"
 const PLACEHOLDER = { width: '100%', height: 26 };
 
-export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isMarkingDoNotPay, isExportingSid, isCheckingBol, isRetryingMatch, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onDoNotPay, onExportSid, onCheckBol, onRetryMatch, onToggleSelect }) {
+export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isMarkingDoNotPay, isExportingSid, isCheckingBol, isRetryingMatch, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onCompareOpen, onDoNotPay, onExportSid, onCheckBol, onRetryMatch, onToggleSelect }) {
   const [hovered, setHovered] = useState(false);
   const isFlagged = bol.status === 'flagged';
   // Invoice-only stub that never matched any Technique/Prophecy record — Retry
@@ -186,7 +186,15 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
                 : undefined}
             >
               {fmtNum(wgt)}{wgt != null ? P : null}
-              {unverified && (
+              {unverified && bol.is_ambiguous_trip ? (
+                <span
+                  onClick={() => onCompareOpen && onCompareOpen(bol.id)}
+                  title="Click to compare this trip's other manifests against the matched invoice"
+                  style={{ marginLeft: 4, fontSize: 10, background: '#fef3c7', color: '#92400e', borderRadius: 3, padding: '1px 5px', fontWeight: 700, letterSpacing: '0.02em', cursor: 'pointer', textDecoration: 'underline dotted' }}
+                >
+                  ~UNVERIFIED
+                </span>
+              ) : unverified && (
                 <span style={{ marginLeft: 4, fontSize: 10, background: '#fef3c7', color: '#92400e', borderRadius: 3, padding: '1px 5px', fontWeight: 700, letterSpacing: '0.02em' }}>~UNVERIFIED</span>
               )}
             </td>

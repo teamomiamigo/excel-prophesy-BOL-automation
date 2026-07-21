@@ -6,6 +6,7 @@ import ThirdPartySection from './components/ThirdPartySection.jsx';
 import ApprovedSection from './components/ApprovedSection.jsx';
 import FlagModal from './components/FlagModal.jsx';
 import ReassignInvoiceModal from './components/ReassignInvoiceModal.jsx';
+import CompareManifestsModal from './components/CompareManifestsModal.jsx';
 import LogSection from './components/LogSection.jsx';
 import BulkActionToolbar from './components/BulkActionToolbar.jsx';
 
@@ -36,6 +37,7 @@ export default function App() {
   const [movingToLogLoading, setMovingToLogLoading] = useState(false);
   const [reassignTargetId, setReassignTargetId] = useState(null);
   const [reassignSubmitting, setReassignSubmitting] = useState(false);
+  const [compareTargetId, setCompareTargetId] = useState(null);
   const [markingDoNotPayId, setMarkingDoNotPayId] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'log'
   const [pullLoading, setPullLoading] = useState(false);
@@ -774,6 +776,7 @@ export default function App() {
         throw new Error(body.detail || `Reassign failed (${res.status})`);
       }
       setReassignTargetId(null);
+      setCompareTargetId(null);
       await fetchPending();
     } catch (err) {
       setError(err.message);
@@ -1151,6 +1154,7 @@ export default function App() {
               onNotesUpdate={handleNotesUpdate}
               onMarkThirdParty={handleMarkThirdParty}
               onReassignOpen={id => setReassignTargetId(id)}
+              onCompareOpen={id => setCompareTargetId(id)}
               onDoNotPay={handleDoNotPay}
               onExportSid={handleExportRecordToProphecy}
               onCheckBol={handleCheckBol}
@@ -1231,6 +1235,15 @@ export default function App() {
           onClose={() => setReassignTargetId(null)}
           onReassign={handleReassignInvoice}
           onDoNotPay={handleDoNotPay}
+        />
+      )}
+
+      {compareTargetId && (
+        <CompareManifestsModal
+          bol={pendingBols.find(b => b.id === compareTargetId) || null}
+          submitting={reassignSubmitting}
+          onClose={() => setCompareTargetId(null)}
+          onReassign={handleReassignInvoice}
         />
       )}
 

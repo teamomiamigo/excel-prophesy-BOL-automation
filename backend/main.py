@@ -29,6 +29,7 @@ from backend.models import (
     Base, BOLRecord, ApprovalHistory, BOLStatus, ActionType,
     BOLSummary, FlagRequest, ApproveRequest,
     ExportRequest, ExportResponse, HealthResponse,
+    ManifestCandidate, TripManifestsResponse,
 )
 from backend.mock_data import MOCK_BOLS
 from backend.email_service import send_bol_export_email
@@ -808,6 +809,71 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
 
     db.commit()
     return {"success": True, "action": action, "target_trip": target_trip}
+
+
+@app.get("/api/bols/{record_id}/trip-manifests", response_model=TripManifestsResponse, tags=["BOLs"])
+def get_trip_manifests(record_id: str, db: Session = Depends(get_db)):
+    """
+    Every manifest sharing this record's Technique trip, for manual verification
+    of an is_ambiguous_trip row — one trip can split into several manifests, and
+    nothing here guesses which one an invoice really belongs to; it just surfaces
+    all of them, scored against whichever manifest the invoice actually landed on,
+    so a human can decide. DB/mock only — no live Technique query.
+    """
+    if settings.USE_MOCK_DATA:
+        source = _find_mock(record_id)
+        trip = source.get("technique_trip")
+        if not trip:
+            raise HTTPException(status_code=400, detail="This record has no technique_trip to compare siblings for")
+        siblings = [r for r in _mock_state.values() if r.get("technique_trip") == trip]
+    else:
+        source_row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+        if not source_row:
+            raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
+        trip = source_row.technique_trip
+        if not trip:
+            raise HTTPException(status_code=400, detail="This record has no technique_trip to compare siblings for")
+        siblings = db.query(BOLRecord).filter(BOLRecord.technique_trip == trip).all()
+        source = source_row
+
+    reference = source if _cget(source, "invoice_number") else next(
+        (s for s in siblings if _cget(s, "invoice_number")), None
+    )
+
+    score_by_id: dict[str, float] = {}
+    best_id: Optional[str] = None
+    if reference is not None:
+        scored = _score_technique_candidates(
+            siblings,
+            _cget(reference, "alg_weight"),
+            _cget(reference, "alg_pallets"),
+            _cget(reference, "alg_pcs"),
+        )
+        score_by_id = {str(_cget(c, "id")): s for c, s in scored}
+        best_id = str(_cget(scored[0][0], "id"))
+
+    candidates = []
+    for s in siblings:
+        cand = ManifestCandidate.model_validate(s if not isinstance(s, dict) else _record_to_summary(s))
+        sid = str(cand.id)
+        cand.score = score_by_id.get(sid)
+        cand.is_best_fit = sid == best_id if best_id is not None else False
+        candidates.append(cand)
+    if reference is not None:
+        candidates.sort(key=lambda c: c.score if c.score is not None else float("inf"))
+
+    return TripManifestsResponse(
+        technique_trip=trip,
+        reference_id=_cget(reference, "id") if reference is not None else None,
+        invoice_number=_cget(reference, "invoice_number") if reference is not None else None,
+        invoice_email_sender=_cget(reference, "invoice_email_sender") if reference is not None else None,
+        inv_job_number=_cget(reference, "inv_job_number") if reference is not None else None,
+        amount=_cget(reference, "amount") if reference is not None else None,
+        alg_weight=_cget(reference, "alg_weight") if reference is not None else None,
+        alg_pallets=_cget(reference, "alg_pallets") if reference is not None else None,
+        alg_pcs=_cget(reference, "alg_pcs") if reference is not None else None,
+        candidates=candidates,
+    )
 
 
 @app.patch("/api/bols/{record_id}/notes", response_model=BOLSummary, tags=["BOLs"])
@@ -2123,16 +2189,14 @@ def _cget(c, field):
     return c.get(field) if isinstance(c, dict) else getattr(c, field, None)
 
 
-def _closest_technique_match(candidates: list, total_weight, total_pallets, total_pcs):
+def _score_technique_candidates(candidates: list, total_weight, total_pallets, total_pcs):
     """
     Given several BOLRecords/dicts sharing one trip suffix, score each by combined
     relative difference between its own technique_weight/pallets/pcs and the
-    invoice's billed quantities, and return (best_candidate, best_score). Reuses the
-    same quantity-comparison idea as the pallets+pieces last-resort strategy below,
-    just scoped to disambiguate within one trip instead of matching globally by
-    exact equality only. Missing quantity data on a candidate scores as a full
-    mismatch (1.0) on that axis rather than being skipped, so a record with no
-    technique data never wins over one with real, closely-matching data.
+    invoice's billed quantities, and return every (candidate, score) pair sorted
+    best-first. Missing quantity data on a candidate scores as a full mismatch
+    (1.0) on that axis rather than being skipped, so a record with no technique
+    data never wins over one with real, closely-matching data.
     """
     def _get(c, field):
         return c.get(field) if isinstance(c, dict) else getattr(c, field, None)
@@ -2149,8 +2213,18 @@ def _closest_technique_match(candidates: list, total_weight, total_pallets, tota
             + _rel_diff(_get(c, "technique_pcs"), total_pcs)
         )
 
-    scored = sorted(((c, _score(c)) for c in candidates), key=lambda pair: pair[1])
-    return scored[0]
+    return sorted(((c, _score(c)) for c in candidates), key=lambda pair: pair[1])
+
+
+def _closest_technique_match(candidates: list, total_weight, total_pallets, total_pcs):
+    """
+    Reuses the same quantity-comparison idea as the pallets+pieces last-resort
+    strategy below, just scoped to disambiguate within one trip instead of
+    matching globally by exact equality only. Returns (best_candidate, best_score)
+    — see _score_technique_candidates for the full ranked list (used by the
+    trip-manifests comparison endpoint).
+    """
+    return _score_technique_candidates(candidates, total_weight, total_pallets, total_pcs)[0]
 
 
 def _partition_candidates_by_resolution(candidates: list):
