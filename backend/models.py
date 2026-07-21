@@ -166,6 +166,12 @@ class BOLRecord(Base):
     # True when our own pallet-level weight data (Technique/VisualMail or Prophecy) was
     # unavailable and access_prog fell back to ALG's self-reported invoice weight.
     weight_source_fallback: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # True when at least one pallet's minimum-freight-charge floor could not be confirmed
+    # against alg_tariff_rates.mc1 (exact_dest_id missing/not found there) — distinct from
+    # tariff_zone_approximate, which is about the RATE lookup falling back, not the MINIMUM.
+    # A pallet can price via ALG's own exact invoiced rate (no rate approximation at all) and
+    # still have an unconfirmed minimum-charge floor, which this flag alone catches.
+    min_charge_uncertain: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # True when this manifest's technique_trip had more than one manifest in the most
     # recent Technique pull. Recomputed fresh on every pull (same lifecycle as
     # technique_weight itself) — un-flags automatically if the trip resolves to one manifest.
@@ -277,6 +283,7 @@ class BOLSummary(BaseModel):
     alg_fsc_cost: Optional[Decimal] = None
     tariff_zone_approximate: bool = False
     weight_source_fallback: bool = False
+    min_charge_uncertain: bool = False
     is_ambiguous_trip: bool = False
     prophecy_weight: Optional[Decimal] = None
     weight_diff: Optional[Decimal] = None

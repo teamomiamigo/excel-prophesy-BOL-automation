@@ -87,11 +87,12 @@ async def lifespan(app: FastAPI):
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS tariff_zone_approximate BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS weight_source_fallback BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_ambiguous_trip BOOLEAN NOT NULL DEFAULT FALSE"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS min_charge_uncertain BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.commit()
         logger.info(
             "DB column migration for base_tariff/fsc_pct/is_third_party/is_do_not_pay/"
             "invoice_sent_at/alg_fsc_pct/alg_fsc_cost/tariff_zone_approximate/weight_source_fallback/"
-            "is_ambiguous_trip complete "
+            "is_ambiguous_trip/min_charge_uncertain complete "
             "(is_ignored dropped 2026-07-16 — see Developmental Documentation.md)."
         )
     logger.info(
@@ -906,7 +907,7 @@ _INVOICE_FIELDS_TO_NULL = [
     "access_prog", "amount", "cost_pct", "base_tariff", "fsc_pct", "alg_fsc_pct", "alg_fsc_cost",
     "match_strategy", "weight_diff", "pallet_diff", "pcs_diff", "notes", "flag_reason",
 ]
-_INVOICE_FIELDS_TO_FALSE = ["tariff_zone_approximate", "weight_source_fallback"]
+_INVOICE_FIELDS_TO_FALSE = ["tariff_zone_approximate", "weight_source_fallback", "min_charge_uncertain"]
 
 
 @app.post("/api/admin/reset-invoices", tags=["Admin"])
@@ -1822,30 +1823,55 @@ def _apply_access_prog_calc(
     _diesel_price,
     _fsc_pct,
     alg_blended_rate: "float | None" = None,
+    alg_min_charge_by_zip3: "dict | None" = None,
+    detail: "list | None" = None,
+    learn: bool = True,
 ) -> None:
     """
     Compute access_prog/base_tariff/fsc_pct from SG360's OWN weight/pallet/piece data —
     never ALG's — applied against ALG's own invoiced per-zone rate, since the tariff/zone
     rate structure is legitimately ALG's pricing (using it isn't a violation of
     independence; substituting their weight/pallet counts for ours would be). Sets
-    alg_fsc_pct/alg_fsc_cost and the tariff_zone_approximate/weight_source_fallback flags.
-    Shared by _process_invoice_csv() (every invoice upload) and the
-    POST /api/admin/recompute-access-prog backfill.
+    alg_fsc_pct/alg_fsc_cost and the tariff_zone_approximate/weight_source_fallback/
+    min_charge_uncertain flags. Shared by _process_invoice_csv() (every invoice upload),
+    the POST /api/admin/recompute-access-prog backfill, and
+    GET /api/bols/{id}/cost-breakdown (via `detail` — see below).
 
     alg_blended_rate — the invoice's own freight-total / total-cwt ($/cwt, FSC excluded),
     used as a whole-load fallback when per-zone rating covers less than
     _RATE_COVERAGE_THRESHOLD of our weight.
 
+    alg_min_charge_by_zip3 — per-zip3 $ actually billed on THIS invoice where a minimum-
+    charge floor fired (see _parse_alg_csv_context()). Used both to flag
+    min_charge_uncertain and to teach alg_tariff_rates (data_layer.reconcile_alg_tariff_rates)
+    for any pallet whose zip3 this invoice billed directly — see 2026-07-21's investigation:
+    alg_tariff_rates was found ~100% accurate for every destination checked by hand, so the
+    original 2026-07-16 "source the minimum from alg_tariff_rates.mc1" fix wasn't a coverage
+    problem — this self-learning pass is a safety net against the table drifting out of sync
+    in the future, not a fix for that specific still-open runtime bug (see
+    GET /api/bols/{id}/cost-breakdown's docstring).
+
+    detail — when a list is passed, one dict per pallet is appended describing exactly how
+    that pallet was priced (dest_id, zip3, weight, rate source, rate/mc1 used, whether the
+    floor fired). Purely additive — never changes matched_rec or the DB.
+
+    learn — set False to suppress the alg_tariff_rates reconciliation pass entirely. Every
+    real invoice-processing call site leaves this True; GET /api/bols/{id}/cost-breakdown
+    passes False, since that route can be called on-demand from a hover and must never
+    write to a shared table just because someone looked at a tooltip.
+
     See CLAUDE.md's "access_prog calculation" section for the full rationale/priority order.
     """
-    from backend.data_layer import get_alg_tariff_rate
+    from backend.data_layer import get_alg_tariff_rate, reconcile_alg_tariff_rates
+
+    alg_min_charge_by_zip3 = alg_min_charge_by_zip3 or {}
 
     _effective_fsc_pct = Decimal(str(fsc_rate_val)) if fsc_rate_val is not None else _fsc_pct
     matched_rec.alg_fsc_pct = Decimal(str(fsc_rate_val)) if fsc_rate_val is not None else None
     matched_rec.alg_fsc_cost = Decimal(str(round(fsc_cost_val, 2))) if fsc_cost_val is not None else None
 
     own_pallets: list[tuple[str, float, "str | None"]] = []  # (zip3, weight, exact_dest_id)
-    if match_strategy == "prophecy_bol" and effective_prophecy_bol:
+    if effective_prophecy_bol:
         from backend.data_layer import get_prophecy_pallet_data as _get_prophecy_pallet_data
         for prow in _get_prophecy_pallet_data(int(effective_prophecy_bol)):
             dest_id = prow.get("destination_id")
@@ -1893,14 +1919,25 @@ def _apply_access_prog_calc(
         # synced) — no independent data means no independent estimate. Leave access_prog
         # blank rather than substituting ALG's own invoiced weight.
         matched_rec.tariff_zone_approximate = False
+        matched_rec.min_charge_uncertain = False
         return
 
     new_tariff_sum = Decimal("0")
     new_base_sum = Decimal("0")
     any_approximate = False
+    any_min_charge_uncertain = False
+    # (dest_id, this invoice's own directly-billed rate, observed floor $ or None) — only
+    # for pallets whose exact zip3 this invoice billed directly (never a nearest-zone
+    # tolerance guess); fed to reconcile_alg_tariff_rates() after the loop so a shared table
+    # every future calculation depends on only ever learns from a genuine same-invoice hit.
+    to_learn: list[tuple[str, float, "float | None"]] = []
     total_weight = sum(w for _, w, _ in own_pallets)
     rated_weight = 0.0
     for zip3, weight, exact_dest_id in own_pallets:
+        direct_rate = alg_rate_by_zip3.get(zip3)
+        if exact_dest_id and direct_rate is not None:
+            to_learn.append((exact_dest_id, direct_rate, alg_min_charge_by_zip3.get(zip3)))
+
         # Rate/zone structure is ALG's own pricing — use their invoiced rate for this
         # zone first; our internal rate card is only a fallback for a zone this invoice
         # didn't happen to bill.
@@ -1918,16 +1955,35 @@ def _apply_access_prog_calc(
             # e.g. $556 of a $571 gap on one real invoice traced directly to this).
             # Only fall back to the old card if this exact dest_id isn't in alg_tariff_rates.
             alg_min = get_alg_tariff_rate(exact_dest_id) if exact_dest_id else None
+            mc1_used = None
+            mc1_source = None
             if alg_min is not None:
                 base = max(base, alg_min["mc1"])
+                mc1_used, mc1_source = alg_min["mc1"], "alg_tariff_rates"
             else:
+                # alg_tariff_rates was independently confirmed ~100% accurate for every
+                # destination checked by hand 2026-07-21, so a miss here that still lands
+                # on this branch (rate matched fine) is worth surfacing even though it
+                # doesn't affect the RATE — flag it distinctly from tariff_zone_approximate,
+                # which is about the rate lookup falling back, not this minimum sub-lookup.
+                any_min_charge_uncertain = True
                 zone_info = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
                 if zone_info and zone_info.get("minimum_freight") is not None:
                     base = max(base, zone_info["minimum_freight"])
+                    mc1_used, mc1_source = zone_info["minimum_freight"], "legacy_tariff_rates"
             with_fsc = base * (Decimal("1") + _effective_fsc_pct) if _effective_fsc_pct is not None else base
             new_base_sum += base
             new_tariff_sum += with_fsc
             rated_weight += weight
+            if detail is not None:
+                detail.append({
+                    "dest_id": exact_dest_id, "zip3": zip3, "weight": weight,
+                    "rate_source": "invoice_own_rate", "rate_used": alg_rate,
+                    "mc1_used": float(mc1_used) if mc1_used is not None else None,
+                    "mc1_source": mc1_source,
+                    "floored": mc1_used is not None and base == mc1_used,
+                    "base": float(base), "with_fsc": float(with_fsc),
+                })
             continue
         # This invoice didn't bill this exact zone — next choice is an exact match
         # against ALG's own published rate table (alg_tariff_rates, keyed on the same
@@ -1942,6 +1998,14 @@ def _apply_access_prog_calc(
             new_base_sum += base
             new_tariff_sum += with_fsc
             rated_weight += weight
+            if detail is not None:
+                detail.append({
+                    "dest_id": exact_dest_id, "zip3": zip3, "weight": weight,
+                    "rate_source": "alg_tariff_rates", "rate_used": float(alg_tariff["rate1"]),
+                    "mc1_used": float(alg_tariff["mc1"]), "mc1_source": "alg_tariff_rates",
+                    "floored": base == alg_tariff["mc1"],
+                    "base": float(base), "with_fsc": float(with_fsc),
+                })
             continue
         tariff = _get_tariff_rate(zip3, weight, _diesel_price=_diesel_price, _fsc_pct=_effective_fsc_pct)
         if tariff:
@@ -1955,6 +2019,15 @@ def _apply_access_prog_calc(
                     "fell back to nearest zone (Phil needs a real rate for this zip3)",
                     getattr(matched_rec, "invoice_number", None), zip3, weight,
                 )
+            if detail is not None:
+                detail.append({
+                    "dest_id": exact_dest_id, "zip3": zip3, "weight": weight,
+                    "rate_source": "legacy_tariff_rates", "rate_used": None,
+                    "mc1_used": float(tariff["minimum_freight"]) if tariff.get("minimum_freight") is not None else None,
+                    "mc1_source": "legacy_tariff_rates" if tariff.get("minimum_freight") is not None else None,
+                    "floored": None,
+                    "base": float(tariff.get("base_tariff") or 0), "with_fsc": float(tariff["access_prog"]),
+                })
         else:
             any_approximate = True
             logger.warning(
@@ -1962,6 +2035,16 @@ def _apply_access_prog_calc(
                 "no ALG rate either, zone dropped from access_prog entirely (Phil needs a real rate for this zip3)",
                 getattr(matched_rec, "invoice_number", None), zip3, weight,
             )
+            if detail is not None:
+                detail.append({
+                    "dest_id": exact_dest_id, "zip3": zip3, "weight": weight,
+                    "rate_source": "none", "rate_used": None, "mc1_used": None,
+                    "mc1_source": None, "floored": None, "base": None, "with_fsc": None,
+                })
+
+    matched_rec.min_charge_uncertain = any_min_charge_uncertain
+    if to_learn and learn:
+        reconcile_alg_tariff_rates(to_learn)
 
     coverage = (rated_weight / total_weight) if total_weight > 0 else 0.0
 
@@ -2037,6 +2120,12 @@ def _parse_alg_csv_context(reader: "csv.DictReader") -> dict:
         "fsc_cost_val": None,
         "total_billed": None,
         "alg_rate_by_zip3": {},
+        # Per-zip3, the $ actually billed on a line where ALG's own minimum-freight-charge
+        # floor fired (printed Rate x GrossWt would have computed less than Billed$) — see
+        # the detection below. Feeds the self-updating alg_tariff_rates reconciliation in
+        # _apply_access_prog_calc(); a zip3 absent here means no floor was observed on this
+        # invoice for that zone, not that no minimum applies.
+        "alg_min_charge_by_zip3": {},
         # Freight-only dollar total (sum of freight-row Billed$, excludes the FSC
         # footer) — feeds the blended-rate fallback in _apply_access_prog_calc when
         # per-zone joins can't cover enough of the load.
@@ -2101,6 +2190,17 @@ def _parse_alg_csv_context(reader: "csv.DictReader") -> dict:
             )
             if raw_zip and effective_rate:
                 ctx["alg_rate_by_zip3"].setdefault(raw_zip[:3], effective_rate)
+            # Detect a real minimum-freight-charge floor on this line: when the printed
+            # Rate would compute less than what was actually billed, ALG applied its own
+            # per-destination minimum for this zone (confirmed 2026-07-21 against real
+            # invoices — Traverse City MI, Abilene TX, etc. — that this observed $ figure
+            # exactly matches ALG's real contracted minimum for that destination). Only
+            # trustworthy when Rate was genuinely printed (rate_val > 0); a derived
+            # effective_rate would trivially "match" billed and could never reveal a floor.
+            if raw_zip and rate_val > 0 and gross_wt > 0 and billed > 0:
+                expected_charge = round(rate_val * gross_wt / 100.0, 2)
+                if abs(expected_charge - billed) > 0.02:
+                    ctx["alg_min_charge_by_zip3"].setdefault(raw_zip[:3], billed)
         except (ValueError, TypeError):
             pass
         try:
@@ -2167,9 +2267,12 @@ def _finish_resolving_stub(
 
     reader = csv.DictReader(io.StringIO(content.decode("utf-8", errors="replace")))
     ctx = _parse_alg_csv_context(reader)
-    effective_prophecy_bol = (
-        str(rec.bol_number) if rec.match_strategy == "prophecy_bol" and rec.bol_number else None
-    )
+    # Not rec.match_strategy == "prophecy_bol" -- that field is stored and can go stale
+    # (a duplicate re-upload used to silently overwrite it to "invoice_number" before
+    # 2026-07-20's fix; any record corrupted before that fix still carries the wrong
+    # value today). "No Technique manifest, but a real BOL" is what a Wolf/311 load
+    # structurally *is*, independent of whatever match_strategy currently says.
+    effective_prophecy_bol = str(rec.bol_number) if not rec.manifest and rec.bol_number else None
     _blended = (
         round(ctx["alg_freight_total"] / (ctx["total_weight"] / 100.0), 4)
         if ctx.get("alg_freight_total") and ctx.get("total_weight") else None
@@ -2179,6 +2282,7 @@ def _finish_resolving_stub(
         ctx["alg_rate_by_zip3"], ctx["fsc_rate_val"], ctx["fsc_cost_val"],
         _get_tariff_rate, _diesel_price, _fsc_pct,
         alg_blended_rate=_blended,
+        alg_min_charge_by_zip3=ctx.get("alg_min_charge_by_zip3"),
     )
     if rec.access_prog is not None and rec.amount:
         rec.cost_pct = Decimal(str(round(float(rec.access_prog) / float(rec.amount), 6)))
@@ -2380,6 +2484,7 @@ def _apply_invoice_match(
     _fsc_pct,
     db: Session,
     alg_blended_rate: "Optional[float]" = None,
+    alg_min_charge_by_zip3: "Optional[dict]" = None,
 ) -> dict:
     """
     Apply one parsed invoice's data to one already-matched record (dict in mock
@@ -2518,6 +2623,7 @@ def _apply_invoice_match(
                 alg_rate_by_zip3, fsc_rate_val, fsc_cost_val,
                 _get_tariff_rate, _diesel_price, _fsc_pct,
                 alg_blended_rate=alg_blended_rate,
+                alg_min_charge_by_zip3=alg_min_charge_by_zip3,
             )
         if matched_rec.amount and matched_rec.access_prog:
             matched_rec.cost_pct = Decimal(
@@ -2580,6 +2686,9 @@ def _process_invoice_csv(
     # (the tariff/zone structure is legitimately ALG's pricing) — our internal rate card is
     # only a fallback for a zone this invoice didn't happen to bill.
     alg_rate_by_zip3: dict[str, float] = ctx["alg_rate_by_zip3"]
+    # Per-zip3 $ actually billed where this invoice's own minimum-charge floor fired — feeds
+    # the self-updating alg_tariff_rates reconciliation in _apply_access_prog_calc().
+    alg_min_charge_by_zip3: dict[str, float] = ctx["alg_min_charge_by_zip3"]
     # Whole-invoice blended $/cwt (freight only, FSC excluded) — the fallback rate when
     # per-zone joins can't cover enough of our load's weight.
     alg_blended_rate: Optional[float] = (
@@ -2989,6 +3098,7 @@ def _process_invoice_csv(
                         alg_rate_by_zip3, fsc_rate_val, fsc_cost_val,
                         _get_tariff_rate, _diesel_price, _fsc_pct,
                         alg_blended_rate=alg_blended_rate,
+                        alg_min_charge_by_zip3=alg_min_charge_by_zip3,
                     )
                     if stub.amount and stub.access_prog:
                         stub.cost_pct = Decimal(str(round(float(stub.access_prog) / float(stub.amount), 6)))
@@ -3025,6 +3135,7 @@ def _process_invoice_csv(
         invoice_email_sender, invoice_sent_at,
         _get_tariff_rate, _diesel_price, _fsc_pct, db,
         alg_blended_rate=alg_blended_rate,
+        alg_min_charge_by_zip3=alg_min_charge_by_zip3,
     )
     matched_trip = result["matched_trip"]
     matched_manifest = result["matched_manifest"]
@@ -3448,6 +3559,7 @@ def fix_duplicate_invoice_matches(db: Session = Depends(get_db)):
             loser.pcs_diff       = None
             loser.tariff_zone_approximate = False
             loser.weight_source_fallback  = False
+            loser.min_charge_uncertain    = False
             loser.notes = None
             if loser.status != BOLStatus.APPROVED:
                 loser.status = BOLStatus.PENDING
@@ -3534,9 +3646,14 @@ def recompute_access_prog(db: Session = Depends(get_db)):
         reader = csv.DictReader(io.StringIO(content.decode("utf-8", errors="replace")))
         ctx = _parse_alg_csv_context(reader)
 
-        effective_prophecy_bol = (
-            str(rec.bol_number) if rec.match_strategy == "prophecy_bol" and rec.bol_number else None
-        )
+        # See _finish_resolving_stub()'s identical fix: stored match_strategy can go
+        # stale (silently overwritten pre-2026-07-20), so route on manifest/bol_number
+        # structurally instead of trusting the stored classification. Without this, a
+        # corrupted row here doesn't just skip -- _apply_access_prog_calc() finds no
+        # own pallet data via either path and sets rec.access_prog to None in place,
+        # which db.commit() below would persist, silently wiping a previously-correct
+        # value (not merely a no-op skip).
+        effective_prophecy_bol = str(rec.bol_number) if not rec.manifest and rec.bol_number else None
         _blended = (
             round(ctx["alg_freight_total"] / (ctx["total_weight"] / 100.0), 4)
             if ctx.get("alg_freight_total") and ctx.get("total_weight") else None
@@ -3546,6 +3663,7 @@ def recompute_access_prog(db: Session = Depends(get_db)):
             ctx["alg_rate_by_zip3"], ctx["fsc_rate_val"], ctx["fsc_cost_val"],
             _get_tariff_rate, _diesel_price, _fsc_pct,
             alg_blended_rate=_blended,
+            alg_min_charge_by_zip3=ctx.get("alg_min_charge_by_zip3"),
         )
         if rec.access_prog is None:
             skipped_no_own_data += 1
@@ -3560,6 +3678,101 @@ def recompute_access_prog(db: Session = Depends(get_db)):
         fixed, skipped_no_file, skipped_no_own_data,
     )
     return {"fixed": fixed, "skipped_no_file": skipped_no_file, "skipped_no_own_data": skipped_no_own_data}
+
+
+@app.get("/api/bols/{record_id}/cost-breakdown", tags=["Admin"])
+def get_cost_breakdown(record_id: uuid.UUID, db: Session = Depends(get_db)):
+    """
+    Read-only per-pallet breakdown of how Calculated Cost was (or would be) computed for
+    one record — re-locates and re-parses the record's own invoice CSV
+    (_find_invoice_file, require_csv=True) and re-runs _apply_access_prog_calc() against a
+    disposable, never-committed scratch record with `learn=False`, so this route can be
+    called on demand (e.g. a dashboard hover) without ever writing to the DB — not the
+    record, not the shared alg_tariff_rates table.
+
+    Built 2026-07-21 for two purposes: (1) the dashboard's per-record Calculated Cost
+    tooltip — which destination(s) drove an uncertain or unexpected number; (2) the
+    diagnostic tool for an open investigation — alg_tariff_rates was independently
+    confirmed ~100% accurate for every destination checked by hand this session (see
+    documentation/tariff_minimum_charge_audit.md), yet Calculated Cost on several real
+    records — including ones created the same day as this route — still doesn't reflect
+    the correct minimum-charge floor. Comparing this route's per-pallet `pallets` output
+    against that audit log is the way to find that disconnect: if `mc1_source` here
+    already reads "alg_tariff_rates" with the right value, the bug is downstream of this
+    calc; if it reads "none_found"/"legacy_tariff_rates" for a destination the audit log
+    says IS in alg_tariff_rates, the bug is in how `exact_dest_id` reaches this function.
+    """
+    if settings.USE_MOCK_DATA:
+        raise HTTPException(status_code=400, detail="Not available in mock mode.")
+
+    rec = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Record not found.")
+    if not rec.invoice_number:
+        raise HTTPException(status_code=422, detail="This record has no invoice to break down.")
+
+    folder = settings.INVOICE_FOLDER
+    if not folder or not os.path.isdir(folder):
+        raise HTTPException(status_code=404, detail="INVOICE_FOLDER is not configured or does not exist.")
+
+    hit = _find_invoice_file(folder, rec.invoice_number, require_csv=True)
+    if hit is None:
+        raise HTTPException(status_code=404, detail=f"Original invoice CSV for {rec.invoice_number} not found.")
+    path, _media_type = hit
+    try:
+        with open(path, "rb") as f:
+            content = f.read()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read invoice file: {exc}")
+
+    reader = csv.DictReader(io.StringIO(content.decode("utf-8", errors="replace")))
+    ctx = _parse_alg_csv_context(reader)
+
+    from backend.data_layer import get_tariff_rate as _get_tariff_rate
+    from backend.data_layer import get_current_diesel_price, get_fsc_rate as _get_fsc_rate
+    _diesel_price = get_current_diesel_price()
+    _fsc_pct = _get_fsc_rate(_diesel_price) if _diesel_price is not None else None
+
+    # See _finish_resolving_stub()'s identical fix -- stored match_strategy can go
+    # stale, so route structurally (no manifest, real bol_number) instead.
+    effective_prophecy_bol = str(rec.bol_number) if not rec.manifest and rec.bol_number else None
+    _blended = (
+        round(ctx["alg_freight_total"] / (ctx["total_weight"] / 100.0), 4)
+        if ctx.get("alg_freight_total") and ctx.get("total_weight") else None
+    )
+
+    # Disposable, never-added-to-session copy — _apply_access_prog_calc() writes onto
+    # this, not `rec`, so nothing here can ever be committed back even by accident.
+    scratch = BOLRecord(
+        manifest=rec.manifest,
+        technique_weight=rec.technique_weight,
+        technique_pallets=rec.technique_pallets,
+        technique_pcs=rec.technique_pcs,
+    )
+    detail: list = []
+    _apply_access_prog_calc(
+        scratch, rec.match_strategy, effective_prophecy_bol,
+        ctx["alg_rate_by_zip3"], ctx["fsc_rate_val"], ctx["fsc_cost_val"],
+        _get_tariff_rate, _diesel_price, _fsc_pct,
+        alg_blended_rate=_blended,
+        alg_min_charge_by_zip3=ctx.get("alg_min_charge_by_zip3"),
+        detail=detail,
+        learn=False,
+    )
+
+    return {
+        "record_id": str(rec.id),
+        "invoice_number": rec.invoice_number,
+        "match_strategy": rec.match_strategy,
+        "stored_access_prog": float(rec.access_prog) if rec.access_prog is not None else None,
+        "stored_amount": float(rec.amount) if rec.amount is not None else None,
+        "stored_cost_pct": float(rec.cost_pct) if rec.cost_pct is not None else None,
+        "recomputed_access_prog": float(scratch.access_prog) if scratch.access_prog is not None else None,
+        "recomputed_min_charge_uncertain": scratch.min_charge_uncertain,
+        "recomputed_tariff_zone_approximate": scratch.tariff_zone_approximate,
+        "recomputed_weight_source_fallback": scratch.weight_source_fallback,
+        "pallets": detail,
+    }
 
 
 @app.post("/api/admin/poll-email", tags=["Admin"])
