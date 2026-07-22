@@ -127,6 +127,8 @@ All live-mode dependencies (`pyodbc`, `sqlalchemy[mssql]`, `boto3`, `mangum`) ar
 | GET | `/api/invoices/{z}/file` | Serve the invoice file for a Z-number; checks S3 (`INVOICE_S3_BUCKET`) first with a presigned-URL redirect, then falls back to `INVOICE_FOLDER` (live) or `test_data/` (mock), searching root + one level of dated sender subfolders; prefers PDF over CSV |
 | POST | `/api/invoices/poll-folder` | Scan `INVOICE_FOLDER` (root + one level of dated sender subfolders) for unprocessed CSVs → process each, parsing sender/date from the subfolder name; files stay in place, dedup via DB `invoice_number`. Same per-invoice wide-fallback search as `/api/invoices/upload` above applies to each unmatched CSV in the scan — a poll picking up several never-pulled invoices at once pays that live-query cost once per invoice, sequentially, not just once for the whole batch |
 | GET | `/api/export/invoice-pdfs` | Download a merged PDF of all invoice PDFs for the given `?invoice_numbers=Z1,Z2,...`; fetches each from S3 (`INVOICE_S3_BUCKET`) first, falls back to `INVOICE_FOLDER`; skips any not found rather than failing the whole batch; returns 404 if none found. Triggered by "Download Invoice PDFs" in EmailComposeModal |
+| POST | `/api/invoices/merge-batch-pdfs` | Merge and disk-cache (`backend/invoice_pdf_cache/`) the combined invoice PDF for one upload batch — every record sharing the given `sender` (`invoice_email_sender`). Called once by the frontend after a whole folder's per-file `/api/invoices/upload` calls finish, so the merge isn't redone on every download click; safe to re-call later (e.g. after a stub resolves and gains its own PDF) |
+| GET | `/api/invoices/batch-pdf` | Serve the merged batch PDF for `?sender=...`; fast path reads the cache written by `merge-batch-pdfs`, otherwise merges on the fly and caches the result — covers batches uploaded before this endpoint existed or where the upload-time merge was skipped/failed |
 | GET | `/api/export/prophecy-sid` | Download Prophecy SID import CSV for approved manifests (live mode only); also stamps `sid_exported_at` on each included record |
 | POST | `/api/bols/{id}/export-prophecy-sid` | Per-record SID export — pushes one pending Type A record to Prophecy without waiting for a batch approval; same CSV logic as the bulk route, scoped to one manifest |
 | POST | `/api/bols/{id}/refresh-bol` | Refresh one record's manifest-side data: re-pulls weight/pallets/pieces and checks Prophecy for a BOL (`get_technique_data()` filtered to one manifest), without a full Technique pull — ~10s live (hits AWP-SQL-PROD), near-instant if the record already has a BOL. Weight source depends on `bol_number`: `get_manifest_weights()` (Query B) before a BOL exists, `get_manifest_weights_from_sid()` (the SID-export query) once one does — see "Ambiguous trips" below. Does not touch invoice-side fields (access_prog/cost_pct/amount/alg_*) |
@@ -309,6 +311,7 @@ Quantity differences (weight_diff, pallet_diff, pcs_diff) are secondary — show
 - `cost_calc_detail` (Text/JSON, nullable): per-pallet rate-resolution breakdown, stored at calc time — see "Key variance metric" and the `GET /api/bols/{id}/cost-breakdown` route above
 - `is_ambiguous_trip` (Boolean, default False): flag when this manifest's trip had more than one manifest in the most recent pull — see "Ambiguous trips / resolution-preference matching"
 - `is_third_party` (Boolean): excludes from SID + accounting exports; reversible
+- `no_invoice` (Boolean, default False): set True on mock records 13-14 to test the 3rd Party button. Appears vestigial — `isThirdPartyEligible()` in `frontend/src/components/BOLRow.jsx` (the actual gate on that button) checks only `is_third_party`/`bol_number`/`technique_trip`+`amount` and never reads this field. Don't assume it drives any real behavior without re-checking first.
 - `is_do_not_pay` (Boolean): marks an unmatched invoice-only record do-not-pay — unlike `is_third_party`, does NOT exclude from the accounting export; it's included and rendered as "DO NOT PAY"/"DNP" instead of an amount. Setting it also sets `status=approved`. Reversible
 - `needs_sid_export` (Boolean): True = Type A record (no BOL yet); False = Type B (BOL already in Prophecy). `_apply_bol_status()` (shared by the bulk pull and `POST /api/bols/{id}/refresh-bol`) only flips a record back to Type A when it never had a `bol_number` — once a record is Type B, a later Technique/ShipperPlus query returning no `load_id` is treated as a transient query/join hiccup, not proof the BOL vanished from Prophecy, so `bol_number`/`needs_sid_export` are left alone rather than flip-flopped
 - `match_strategy` (String): how the invoice was matched — `"invoice_number"` (Z-number re-upload), `"job_name"` (trip or manifest suffix, or a re-scored retry-match), `"prophecy_bol"` (Wolf/311, Job Name is a Prophecy BOL), `"pallets_pieces"` (last-resort exact quantity match), or `"invoice_only"` for an unmatched stub — never null once an invoice has been processed
@@ -346,12 +349,15 @@ backend/main.py lifespan — DB schema migrations are inline `ALTER TABLE ... AD
 backend/test_data/       — Sample ALG invoice CSVs for testing the upload flow in mock mode
                            Z555226_test.csv → matches trip TEC_T_0109888 (BOL No 109888)
                            Z555227_test.csv → matches trip TEC_T_0109889 (BOL No 109889)
+backend/invoice_pdf_cache/ — Gitignored runtime cache of merged per-sender batch invoice PDFs, written
+                           by `POST /api/invoices/merge-batch-pdfs` and read by `GET /api/invoices/batch-pdf`
 test_invoices_0622/      — 26 real Z-number CSVs from Tanya's June 22 email (e.g. Z557707.CSV).
                            Use for live-mode invoice upload testing. NOT committed — real production
                            data; add to .gitignore if not already excluded.
-documentation/           — Six .md spec files (Design & Workflow, Requirements & SQL Mapping,
-                           SECURITY.md, SG360_BOL_Project_Context.md, Agentic Automation Architecture.md,
-                           etc.). Reference for business rules and SQL source queries; not runtime code.
+documentation/           — Eight .md spec files: Design and Workflow - BOL Reconciliation.md, Requirements
+                           and SQL Mapping.md, SECURITY.md, SG360_BOL_Project_Context.md, Agentic Automation
+                           Architecture.md, AWS Deployment.md, tariff_minimum_charge_audit.md. Reference for
+                           business rules and SQL source queries; not runtime code.
                            Developmental Documentation.md is the running dev changelog — one entry per
                            closed GitHub issue, appended by the `/commit` command
                            (`.claude/commands/commit.md`). Read it for recent history that isn't yet
