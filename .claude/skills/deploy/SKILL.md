@@ -10,7 +10,7 @@ There is **no EC2 server or long-running process to "boot up" or "kill."** The a
 
 - **Backend** — Lambda (container image, pulled from ECR by digest) behind an API Gateway HTTP API. "Redeploying" means building a new Docker image, pushing it to ECR, and pointing the Lambda function at the new image via Terraform. AWS replaces running execution environments automatically on the next invoke — there's nothing to manually stop/start.
 - **Database** — Aurora Serverless v2 Postgres, VPC-private. Only reachable from Lambda's security group — not from a dev machine directly.
-- **Frontend** — S3 static bucket + CloudFront. Redeploying means build → `aws s3 sync --delete` → CloudFront invalidation.
+- **Frontend** — S3 static bucket + CloudFront. Redeploying means build → two-pass `aws s3 sync`/`cp` (immutable long-cache for content-hashed assets, no-cache for `index.html` — fixed 2026-07-22, see Step 4) → CloudFront invalidation.
 
 `deploy.ps1` (repo root) already encodes the real mechanics for both halves. This skill wraps it with pre-flight checks, the human-approval gate for `terraform apply`, and post-deploy verification — it does not reimplement the deploy logic itself.
 
@@ -90,7 +90,7 @@ cd C:\nikhilm\excel-prophesy-BOL-automation
 .\deploy.ps1 -Frontend
 ```
 
-Builds the Vite app, syncs `frontend/dist` to the `frontend_bucket_name` S3 bucket with `--delete`, and invalidates CloudFront (`/*`). No approval gate — matches the script's own design (static assets, trivially re-deployable).
+Builds the Vite app, then syncs `frontend/dist` to the `frontend_bucket_name` S3 bucket in two passes (fixed 2026-07-22 — see the Cache-Control check in Step 5 below): everything except `index.html` gets `--cache-control "public, max-age=31536000, immutable"` (safe since Vite content-hashes these filenames), then `index.html` itself is uploaded separately with `--cache-control "no-cache, no-store, must-revalidate"` so browsers always revalidate it instead of serving a stale local copy indefinitely. Then invalidates CloudFront (`/*`). No approval gate — matches the script's own design (static assets, trivially re-deployable).
 
 ### Step 5 — Post-deploy verification
 
@@ -109,13 +109,22 @@ $approved = Invoke-WebRequest "$base/api/bols/approved" -UseBasicParsing | Conve
 - `db_online: false` → Aurora unreachable — check `lambda_sql_security_group.tf` / VPC config, check the static-IP DNS workaround in `backend/config.py` is still valid
 - Any 5xx / timeout → check CloudWatch Logs for the `sg360-bol-api` Lambda function; likely a runtime error in the new image
 
-**To confirm the deployed Lambda can still reach on-prem sources (not just Aurora)** — this is the real proof that "servers are still connected and data is being pulled":
+**Cache-Control check (added 2026-07-22)** — confirms the frontend sync's cache headers actually landed, not just that the files themselves are correct. A missing/wrong header here means the *next* deploy will look "stale" to users again even though the content is right, exactly like the incident that prompted this check:
 
 ```powershell
-Invoke-WebRequest "$base/api/admin/pull" -Method POST -UseBasicParsing | ConvertFrom-Json
+$indexResp = Invoke-WebRequest "$base/" -UseBasicParsing
+$indexResp.Headers["Cache-Control"]   # expect: no-cache, no-store, must-revalidate
+
+# Optional: also check a hashed asset (parse its filename out of the HTML body first)
+if ($indexResp.Content -match 'assets/(index-[A-Za-z0-9_]+\.js)') {
+    $assetResp = Invoke-WebRequest "$base/assets/$($Matches[1])" -UseBasicParsing
+    $assetResp.Headers["Cache-Control"]   # expect: public, max-age=31536000, immutable
+}
 ```
 
-A successful response (with a manifest/record count, not an error) confirms Lambda→AWP-SQL-PROD/VisualMail connectivity survived the redeploy. This actually pulls live data — mention to the user that it will run before triggering it, since it's a real operation against production sources, not a read-only check.
+If `Cache-Control` on `/` is missing or doesn't say `no-cache`, the two-pass S3 sync in `deploy.ps1` (Step 4) didn't apply correctly — re-run `.\deploy.ps1 -Frontend` and check for an `aws s3 cp`/`sync` error in its output before assuming the deploy is broken structurally.
+
+**On-prem Technique/AWP-SQL-PROD connectivity** — there is no longer a single bulk endpoint to smoke-test this with (`POST /api/admin/pull` was removed in Phase 4, 2026-07-22 — nothing replaced it as a manual trigger). The real, current path that exercises Lambda→AWP-SQL-PROD connectivity is the automatic retry-match that fires after any invoice upload/poll (`_wide_fallback_technique_search()`) — the most reliable post-deploy confirmation is watching a real invoice upload resolve successfully, or checking CloudWatch Logs for the Lambda for recent successful (non-timeout) queries against AWP-SQL-PROD.
 
 ### Step 6 — Report
 
@@ -132,8 +141,8 @@ Summarize: image tag deployed, whether apply ran (and what changed), frontend sy
 | ECR login 400/403 | Expired AWS SSO session or wrong region | Re-authenticate AWS CLI; script assumes `us-east-1` |
 | `terraform plan` shows unexpected WAF/IAM/security-group changes | Uncommitted or unexpected `.tf` edits picked up from the working tree | Stop, show the user `git diff -- terraform/main`, get explicit direction |
 | `db_online: false` after deploy | Aurora unreachable from Lambda, or static-IP DNS workaround in `backend/config.py` stale | Check VPC/security-group config; re-resolve `sg360-bol-aurora...rds.amazonaws.com` and the S3 endpoint IP if AWS's infra shifted |
-| `POST /api/admin/pull` fails or times out | On-prem VPN/DNS path broken, or AWP-SQL-PROD credentials issue | Check CloudWatch Logs for the Lambda; this is the same class of issue documented in `documentation/Developmental Documentation.md` (2026-07-09 entry) |
-| Frontend loads but shows stale content | CloudFront cache not invalidated, or invalidation still in progress | Re-run invalidation; check `aws cloudfront get-invalidation` status |
+| Any route hits a live Technique/AWP-SQL-PROD query and times out or 500s | On-prem VPN/DNS path broken, or AWP-SQL-PROD credentials issue | Check CloudWatch Logs for the Lambda; this is the same class of issue documented in `documentation/Developmental Documentation.md` (2026-07-09 entry). (`POST /api/admin/pull` no longer exists — removed in Phase 4, 2026-07-22 — so this now means retry-match/refresh-bol/an invoice upload's automatic retry) |
+| Frontend loads but shows stale content | Two possible causes, check both: (1) CloudFront edge cache not invalidated yet — usually resolves within a few minutes; (2) missing/wrong `Cache-Control` on `index.html`, so the *browser itself* never re-asks the server — this was the actual root cause of a real incident (2026-07-22) where CloudFront's edge already had the correct content (confirmed via direct curl) but a user's browser kept serving an old cached copy indefinitely. Check `aws cloudfront get-invalidation` status for (1); run the Cache-Control check in Step 5 for (2). If (2), tell the user to hard-refresh (Ctrl+Shift+R) or open a private window to unstick their own browser immediately, independent of any redeploy |
 
 ---
 

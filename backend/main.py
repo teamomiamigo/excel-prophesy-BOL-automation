@@ -3,11 +3,13 @@ import io
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Optional
 
 import boto3
@@ -31,6 +33,7 @@ from backend.models import (
     BOLSummary, FlagRequest, ApproveRequest,
     ExportRequest, ExportResponse, HealthResponse,
     ManifestCandidate, TripManifestsResponse,
+    TariffRate, AlgTariffRate, FuelSurchargeRate,
 )
 from backend.mock_data import MOCK_BOLS
 from backend.email_service import send_bol_export_email
@@ -3656,6 +3659,117 @@ def recompute_access_prog(db: Session = Depends(get_db)):
         fixed, skipped_no_file, skipped_no_own_data,
     )
     return {"fixed": fixed, "skipped_no_file": skipped_no_file, "skipped_no_own_data": skipped_no_own_data}
+
+
+def _rate_table_counts(db: Session) -> dict:
+    return {
+        "tariff_rates": db.query(TariffRate).count(),
+        "alg_tariff_rates": db.query(AlgTariffRate).count(),
+        "fuel_surcharge_rates": db.query(FuelSurchargeRate).count(),
+    }
+
+
+@app.get("/api/admin/rate-table-counts", tags=["Admin"])
+def rate_table_counts(db: Session = Depends(get_db)):
+    """
+    Read-only row counts for the three static rate-card tables (tariff_rates,
+    alg_tariff_rates, fuel_surcharge_rates). These are seeded once via
+    `python -m backend.seed_rates` (or POST /api/admin/seed-rate-tables below,
+    for an environment that can't reach local disk paths) and never touched by
+    any invoice-data reset (see reset_all_invoices()'s docstring) -- this route
+    exists purely so a seeding gap is visible at a glance instead of silently
+    causing every zone lookup to miss and set the ~EST badge on every record.
+
+    Found 2026-07-22: live's tariff_rates had 0 of several real zip3s that
+    local's copy had, confirmed via CloudWatch "[ZONE GAP]" warnings recurring
+    on fresh invoice uploads -- i.e. this had never been seeded against Aurora
+    at all, not a one-time stale-data issue. See seed_rate_tables() below.
+    """
+    return _rate_table_counts(db)
+
+
+# Fixed S3 keys seed_rate_tables() looks for -- upload the same three source
+# files backend/seed_rates.py's DEFAULT_*_CSV/XLSX constants point to, under
+# these names, to INVOICE_S3_BUCKET before calling that route.
+_RATE_SEED_S3_KEYS = {
+    "tariff_rates": "rate-seed/tariff_rates.csv",
+    "fuel_surcharge_rates": "rate-seed/fsc_matrix.xlsx",
+    "alg_tariff_rates": "rate-seed/alg_tariff_rates.csv",
+}
+
+
+@app.post("/api/admin/seed-rate-tables", tags=["Admin"])
+def seed_rate_tables(db: Session = Depends(get_db)):
+    """
+    (Re-)seed tariff_rates/fuel_surcharge_rates/alg_tariff_rates from S3, for an
+    environment that can't reach the local disk paths backend/seed_rates.py's
+    CLI normally reads from -- i.e. the deployed Lambda. Aurora is VPC-private
+    with no Data API (checked terraform/main/aurora.tf), so there has never
+    been a direct way to run that CLI against it; nothing in deploy.ps1 seeds
+    data either (it only ships code/infra). This route is the fix, found
+    2026-07-22 after live repeatedly set the ~EST badge on fresh invoice
+    uploads that computed cleanly on local (same code, different data) --
+    see rate_table_counts()'s docstring for the diagnosis.
+
+    Requires the three source files already uploaded to
+    s3://{INVOICE_S3_BUCKET}/rate-seed/ under the fixed keys in
+    _RATE_SEED_S3_KEYS. Reuses seed_rates.py's own loader functions unchanged
+    (same DELETE-then-bulk-insert replace semantics, same file formats) --
+    only the source (S3 instead of local disk) differs. Safe to re-run.
+    """
+    if not settings.INVOICE_S3_BUCKET:
+        raise HTTPException(status_code=400, detail="INVOICE_S3_BUCKET is not configured.")
+
+    from backend.seed_rates import load_tariff_rates, load_fsc_rates, load_alg_tariff_rates
+
+    before = _rate_table_counts(db)
+
+    s3 = boto3.client("s3", config=_S3_FAST_FAIL)
+    tmp_dir = Path(tempfile.gettempdir()) / "sg360_rate_seed"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    local_paths = {}
+    fetch_errors = {}
+    for table, key in _RATE_SEED_S3_KEYS.items():
+        dest = tmp_dir / Path(key).name
+        try:
+            s3.download_file(settings.INVOICE_S3_BUCKET, key, str(dest))
+            local_paths[table] = dest
+        except Exception as exc:
+            fetch_errors[table] = str(exc)
+
+    if fetch_errors:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Could not fetch source file(s) from s3://{settings.INVOICE_S3_BUCKET}/rate-seed/: "
+                   f"{fetch_errors}. Upload them first -- see backend/seed_rates.py for the expected "
+                   f"file formats.",
+        )
+
+    inserted = {}
+    load_errors = {}
+    try:
+        inserted["tariff_rates"] = load_tariff_rates(local_paths["tariff_rates"], db)
+    except Exception as exc:
+        db.rollback()
+        load_errors["tariff_rates"] = str(exc)
+    try:
+        inserted["fuel_surcharge_rates"] = load_fsc_rates(local_paths["fuel_surcharge_rates"], db)
+    except Exception as exc:
+        db.rollback()
+        load_errors["fuel_surcharge_rates"] = str(exc)
+    try:
+        inserted["alg_tariff_rates"] = load_alg_tariff_rates(local_paths["alg_tariff_rates"], db)
+    except Exception as exc:
+        db.rollback()
+        load_errors["alg_tariff_rates"] = str(exc)
+
+    after = _rate_table_counts(db)
+    logger.info(
+        "[SEED-RATE-TABLES] before=%s inserted=%s errors=%s after=%s",
+        before, inserted, load_errors, after,
+    )
+    return {"before": before, "inserted": inserted, "errors": load_errors, "after": after}
 
 
 @app.get("/api/bols/{record_id}/cost-breakdown", tags=["Admin"])
