@@ -103,7 +103,7 @@ All live-mode dependencies (`pyodbc`, `sqlalchemy[mssql]`, `boto3`, `mangum`) ar
 | GET | `/api/bols` | Pending + flagged records (Katie's morning view). Live mode only: filters to `invoice_number IS NOT NULL` (added 2026-07-22) so auto-persisted sibling manifests on an ambiguous trip (see "Ambiguous trips" below) don't show as their own redundant rows |
 | GET | `/api/bols/approved` | Approved records for today (or `?export_date=YYYY-MM-DD`) |
 | POST | `/api/bols/{id}/approve` | Approve a record; idempotent |
-| POST | `/api/bols/{id}/unapprove` | Revert an approved record back to pending |
+| POST | `/api/bols/{id}/unapprove` | Revert an approved record back to pending. `?clear_accounting_export=true` (added 2026-07-22, used by the Log tab's "↩ Revert to Pending" button, only shown once `accounting_exported_at` is set) additionally clears that timestamp and logs a distinguishable `reason` in `approval_history` — the "accidentally fully approved and already sent to accounting" case. `sid_exported_at` is never touched either way |
 | POST | `/api/bols/{id}/flag` | Flag a record with a reason |
 | POST | `/api/bols/{id}/unflag` | Remove flag from a record |
 | POST | `/api/bols/{id}/mark-third-party` | Mark as third-party (customer pays direct); excludes from SID export |
@@ -418,7 +418,9 @@ No Context, no reducer, no router, no `useMemo`/`useCallback` anywhere in `front
 
 ## Known bugs
 
-**`days_back` is 20** in `pull_technique_data()` — re-pull refreshes technique-side fields (weight/pallets/pcs, BOL status) but preserves invoice matches, approvals, flags, and notes on existing records. Safe to re-run any time. This route's own stub-rematch pass is now DB-only (no live query) — the live wide-fallback search that used to run here moved to `_process_invoice_csv()` on 2026-07-20 (see `/api/admin/pull` route entry above) after repeatedly exceeding API Gateway's 30s timeout when combined with this route's own live pull.
+**Log tab and Dashboard don't refresh each other on tab-switch** (noted 2026-07-22, not fixed): reverting a record from the Log tab's "↩ Revert to Pending" button (or the ordinary unapprove from `ApprovedSection.jsx`) doesn't push a live update to the other tab's already-fetched state — the reverted record won't show up in Pending until a manual reload or a refetch happens to run. Small, separate follow-up if this turns out to matter in practice.
+
+**`POST /api/admin/pull` was removed 2026-07-22 (Phase 4)** — the daily bulk Technique pull (previously documented here as "`days_back` is 20") no longer exists. New trip/manifest data is now discovered per-invoice at match time instead (`_process_invoice_csv()`/`retry_match_invoice()`/`_wide_fallback_technique_search()`) — see "Invoice matching" and "Ambiguous trips" above. Accepted consequence: nothing pre-populates an "awaiting invoice" bucket anymore.
 
 **`_finish_resolving_stub()` (new 2026-07-17, `main.py`):** shared helper covering the two things `_apply_invoice_match()` does inline during a normal upload that every other stub-resolution path had been skipping — copying `invoice_email_sender`/`invoice_sent_at` from the stub, and re-locating/re-parsing the record's own invoice CSV to compute `access_prog`/`base_tariff`/`fsc_pct`/`cost_pct` (same logic `POST /api/admin/recompute-access-prog` uses). Called from `pull_technique_data()`'s DB-side re-match and wide-fallback blocks, and from `POST /api/bols/{id}/retry-match`. No-ops silently (leaves cost fields null) if `INVOICE_FOLDER` isn't configured or the original file can't be found — same resilience contract as the recompute-access-prog backfill.
 

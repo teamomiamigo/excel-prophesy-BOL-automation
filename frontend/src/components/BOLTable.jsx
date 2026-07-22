@@ -59,7 +59,7 @@ function defaultComparator(a, b) {
   if (aNull && bNull) return 0;
   if (aNull) return 1;
   if (bNull) return -1;
-  return new Date(bv) - new Date(av); // newest first
+  return new Date(av) - new Date(bv); // oldest invoice first (Phase 7, 2026-07-22) — was newest first
 }
 
 function getComparator(sort) {
@@ -126,7 +126,8 @@ export default function BOLTable({
   ].some(v => (v || '').toLowerCase().includes(lower));
 
   // One flat table, no category grouping — sorted by Trip/Manifest/BOL/Invoice # (click a
-  // header to cycle asc/desc/default), or by invoice_sent_at descending (default, nulls last).
+  // header to cycle asc/desc/default), or by invoice_sent_at ascending — oldest invoice
+  // first (default, nulls last; flipped from newest-first 2026-07-22, Phase 7).
   const visibleBols = bols
     .filter(matchesBol)
     .slice()

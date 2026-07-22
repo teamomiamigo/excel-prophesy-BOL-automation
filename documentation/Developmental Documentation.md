@@ -15,6 +15,12 @@ Stable technical notes that don't belong to one changelog entry — add here whe
 
 One entry per closed issue. Newest on top.
 
+### 2026-07-22 — Phase 6: revert an accidentally-approved-and-exported record from the Log tab
+**What:** `POST /api/bols/{id}/unapprove` gained an optional `clear_accounting_export` query param — when true, it also clears `accounting_exported_at` and writes a distinguishing `reason` on the `ApprovalHistory` row ("Reverted from Log tab (previously sent to accounting)"), instead of the plain `reason=None` an ordinary unapprove/unflag writes. `LogSection.jsx` gained a new Actions column with a "↩ Revert to Pending" button, shown only on rows that actually have `accounting_exported_at` set. `sid_exported_at` is never touched by either path.
+**Why:** Phase 6 of the dashboard improvement plan — a record that was fully approved and already sent to accounting had no way back to pending short of a direct DB edit.
+**Files:** backend/main.py (`unapprove_bol`), frontend/src/components/LogSection.jsx
+**Gotcha:** Default `clear_accounting_export=False` keeps the existing `ApprovedSection.jsx` "↩ Revert" button's behavior byte-for-byte unchanged — verified directly (a plain unapprove still leaves `accounting_exported_at` untouched). Also confirmed the new path leaves `sid_exported_at` alone and writes the distinguishing reason, via a synthetic test record (not a real approved/exported one, to avoid touching real workflow state or triggering a real accounting email). See "Known bugs" in CLAUDE.md for the pre-existing Log/Dashboard no-cross-refresh limitation this doesn't fix.
+
 ### 2026-07-22 — Acknowledge button for severe-mismatch records with no ambiguous trip
 **What:** New `mismatch_acknowledged` flag + `POST /api/bols/{id}/acknowledge-mismatch` + a "✓ Acknowledge" button in `BOLRow.jsx`'s Actions column, in the same slot as "⚖ Compare" — shown instead of Compare when a record is `~UNVERIFIED` due to a severe weight/pallet/piece mismatch but `is_ambiguous_trip` is false (only one manifest exists, nothing to compare against). Clicking it clears the badge.
 **Why:** Direct user report right after the Compare-button work landed: a real record (`TEC_T_0110888`, invoice `Z558064`) showed `~UNVERIFIED` with no button at all — Compare correctly didn't apply (no sibling to compare), but that left literally no way to act on it. Confirmed via the API before building anything: `is_ambiguous_trip=false`, mismatch score 0.346 (way over the 0.15 threshold), `bol_number` already set.

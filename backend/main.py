@@ -346,14 +346,28 @@ def approve_bol(
 )
 def unapprove_bol(
     record_id: str,
+    clear_accounting_export: bool = False,
     db: Session = Depends(get_db),
 ):
-    """Revert an approved record back to pending review."""
+    """
+    Revert an approved record back to pending review.
+
+    clear_accounting_export=True (added 2026-07-22, used by the Log tab's "Revert to
+    Pending" button) additionally clears accounting_exported_at and logs a
+    distinguishable reason on the ApprovalHistory row -- for the "accidentally fully
+    approved this and it already went to accounting" case, as opposed to an ordinary
+    same-day undo via ApprovedSection.jsx (which never has an accounting_exported_at
+    to clear yet). sid_exported_at is deliberately never touched by either path -- a
+    real Prophecy SID really was downloaded at some point, and reverting approval
+    doesn't undo that fact.
+    """
     if settings.USE_MOCK_DATA:
         rec = _find_mock(record_id)
         rec["status"] = "pending"
         rec["approved_at"] = None
         rec["approved_by"] = None
+        if clear_accounting_export:
+            rec["accounting_exported_at"] = None
         rec["updated_at"] = datetime.now(timezone.utc)
         return _record_to_summary(rec)
 
@@ -363,10 +377,13 @@ def unapprove_bol(
     row.status = BOLStatus.PENDING
     row.approved_at = None
     row.approved_by = None
+    if clear_accounting_export:
+        row.accounting_exported_at = None
     db.add(ApprovalHistory(
         bol_id=row.id,
         action=ActionType.REOPENED,
         performed_by="coordinator",
+        reason="Reverted from Log tab (previously sent to accounting)" if clear_accounting_export else None,
     ))
     db.commit()
     db.refresh(row)
