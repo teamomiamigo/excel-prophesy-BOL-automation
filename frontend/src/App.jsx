@@ -9,6 +9,7 @@ import ReassignInvoiceModal from './components/ReassignInvoiceModal.jsx';
 import CompareManifestsModal from './components/CompareManifestsModal.jsx';
 import LogSection from './components/LogSection.jsx';
 import BulkActionToolbar from './components/BulkActionToolbar.jsx';
+import AgentActivitySection from './components/AgentActivitySection.jsx';
 
 // When Module 2 ships: extract fetch helpers to src/api/bolsApi.js
 // and move this state/logic to src/pages/BolReconciliation.jsx
@@ -39,9 +40,14 @@ export default function App() {
   const [reassignSubmitting, setReassignSubmitting] = useState(false);
   const [compareTargetId, setCompareTargetId] = useState(null);
   const [markingDoNotPayId, setMarkingDoNotPayId] = useState(null);
-  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'log'
+  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'agent-activity' | 'log'
   const [pullLoading, setPullLoading] = useState(false);
   const [pollFolderLoading, setPollFolderLoading] = useState(false);
+  const [agentProposals, setAgentProposals] = useState([]);
+  const [loadingProposals, setLoadingProposals] = useState(true);
+  const [runAgentLoading, setRunAgentLoading] = useState(false);
+  const [acceptingProposalId, setAcceptingProposalId] = useState(null);
+  const [rejectingProposalId, setRejectingProposalId] = useState(null);
   const [filterText, setFilterText] = useState('');
   const [sort, setSort] = useState({ column: null, direction: 'default' });
   const folderInputRef = useRef(null);
@@ -77,6 +83,7 @@ export default function App() {
     readyToReviewTypeA:   readyToReviewBols.filter(b => b.needs_sid_export === true).length,
     readyToReviewTypeB:   readyToReviewBols.filter(b => b.needs_sid_export === false).length,
     approvedToday:        approvedBols.length,
+    aiReviewed:           agentProposals.filter(p => p.status === 'pending').length,
   };
 
   // -------------------------------------------------------------------------
@@ -151,9 +158,23 @@ export default function App() {
     }
   }
 
+  async function fetchProposals() {
+    setLoadingProposals(true);
+    try {
+      const res = await fetch('/api/agents/proposals');
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
+      setAgentProposals(await res.json());
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoadingProposals(false);
+    }
+  }
+
   useEffect(() => {
     fetchPending();
     fetchApproved();
+    fetchProposals();
   }, []);
 
   // -------------------------------------------------------------------------
@@ -735,6 +756,47 @@ export default function App() {
     }
   }
 
+  async function handleRunAgent() {
+    setRunAgentLoading(true);
+    try {
+      const res = await fetch('/api/agents/run', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Run AI Agent failed (${res.status})`);
+      setSuccessMessage(data.message || 'AI agent run complete.');
+      await Promise.all([fetchPending(), fetchApproved(), fetchProposals()]);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRunAgentLoading(false);
+    }
+  }
+
+  async function handleAcceptProposal(proposalId) {
+    setAcceptingProposalId(proposalId);
+    try {
+      const res = await fetch(`/api/agents/proposals/${proposalId}/accept`, { method: 'POST' });
+      if (!res.ok) throw new Error(`Accept failed (${res.status})`);
+      await Promise.all([fetchPending(), fetchApproved(), fetchProposals()]);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setAcceptingProposalId(null);
+    }
+  }
+
+  async function handleRejectProposal(proposalId) {
+    setRejectingProposalId(proposalId);
+    try {
+      const res = await fetch(`/api/agents/proposals/${proposalId}/reject`, { method: 'POST' });
+      if (!res.ok) throw new Error(`Reject failed (${res.status})`);
+      await fetchProposals();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRejectingProposalId(null);
+    }
+  }
+
   async function handleRefetchBols(manifestNumbers) {
     const res = await fetch('/api/admin/refetch-bols', {
       method: 'POST',
@@ -839,8 +901,9 @@ export default function App() {
       {/* Tab bar */}
       <div style={{ background: '#fff', borderBottom: '1px solid #e5e7eb', padding: '0 24px', display: 'flex', gap: 0 }}>
         {[
-          { key: 'dashboard', label: 'Dashboard' },
-          { key: 'log',       label: 'Log' },
+          { key: 'dashboard',      label: 'Dashboard' },
+          { key: 'agent-activity', label: `Agent Activity${summary.aiReviewed > 0 ? ` (${summary.aiReviewed})` : ''}` },
+          { key: 'log',            label: 'Log' },
         ].map(tab => (
           <button
             key={tab.key}
@@ -937,6 +1000,7 @@ export default function App() {
               readyToReviewTypeA={summary.readyToReviewTypeA}
               readyToReviewTypeB={summary.readyToReviewTypeB}
               approvedToday={summary.approvedToday}
+              aiReviewed={summary.aiReviewed}
             />
 
             {/* Date / context banner + invoice upload */}
@@ -1018,6 +1082,23 @@ export default function App() {
                   disabled={invoiceUploading}
                   onChange={handleInvoiceUpload}
                 />
+                <button
+                  onClick={handleRunAgent}
+                  disabled={runAgentLoading}
+                  title="Pull new invoices, classify every pending record, and email Katie a summary"
+                  style={{
+                    background: runAgentLoading ? '#e5e7eb' : '#6366f1',
+                    color: runAgentLoading ? '#9ca3af' : '#fff',
+                    border: 'none',
+                    borderRadius: 5,
+                    padding: '4px 12px',
+                    fontWeight: 600,
+                    fontSize: 12,
+                    cursor: runAgentLoading ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {runAgentLoading ? 'Running…' : '🤖 Run AI Agent'}
+                </button>
               </span>
             </div>
 
@@ -1205,6 +1286,19 @@ export default function App() {
               onMarkSent={handleMarkSent}
             />
           </>
+        )}
+
+        {activeTab === 'agent-activity' && (
+          <AgentActivitySection
+            proposals={agentProposals}
+            loading={loadingProposals && agentProposals.length === 0}
+            acceptingId={acceptingProposalId}
+            rejectingId={rejectingProposalId}
+            onAccept={handleAcceptProposal}
+            onReject={handleRejectProposal}
+            onRunAgent={handleRunAgent}
+            runAgentLoading={runAgentLoading}
+          />
         )}
 
         {activeTab === 'log' && <LogSection />}

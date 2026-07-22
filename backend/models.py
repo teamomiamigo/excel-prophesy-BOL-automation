@@ -105,6 +105,24 @@ class ActionType(str, enum.Enum):
     DO_NOT_PAY = "do_not_pay"
 
 
+class AgentRunStatus(str, enum.Enum):
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class ProposalAction(str, enum.Enum):
+    APPROVE = "approve"
+    NEEDS_REVIEW = "needs_review"
+    FLAG = "flag"
+
+
+class ProposalStatus(str, enum.Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
 # ---------------------------------------------------------------------------
 # SQLAlchemy ORM models
 # ---------------------------------------------------------------------------
@@ -248,6 +266,87 @@ class ApprovalHistory(Base):
     bol: Mapped["BOLRecord"] = relationship("BOLRecord", back_populates="approval_history")
 
 
+class AgentRun(Base):
+    """
+    One execution of the AI agent pipeline (today: the "Run AI Agent" button;
+    eventually a scheduled server-side trigger — see the cloud-automation doc).
+
+    Never mutates a BOLRecord itself. It only produces AgentProposal rows a human
+    reviews via the Agent Activity tab or the one-click email link.
+    """
+    __tablename__ = "agent_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    status: Mapped[AgentRunStatus] = mapped_column(
+        SAEnum(AgentRunStatus), nullable=False, default=AgentRunStatus.RUNNING
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    invoices_found: Mapped[int] = mapped_column(Integer, default=0)
+    invoices_processed: Mapped[int] = mapped_column(Integer, default=0)
+    records_classified: Mapped[int] = mapped_column(Integer, default=0)
+    proposals_created: Mapped[int] = mapped_column(Integer, default=0)
+    email_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Unguessable token embedded in the one-click "approve all recommended" email link.
+    # GET /api/agents/email-batch-approve (read-only, renders a confirm page) validates
+    # it; only the POST from that page's own form actually mutates anything — this is
+    # what makes a bare GET (all any link-prefetcher like O365 Safe Links ever does)
+    # harmless. Generated once, when the summary email is built for this run.
+    email_action_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    proposals: Mapped[list["AgentProposal"]] = relationship(
+        "AgentProposal", back_populates="run", cascade="all, delete-orphan"
+    )
+
+
+class AgentProposal(Base):
+    """
+    One record's AI-drafted recommendation from a single AgentRun.
+
+    Accepting a proposal calls the same approve_bol()/flag_bol() logic a manual
+    dashboard click already uses (see _accept_proposal() in main.py) — never a
+    parallel mutation path. Rejecting has zero effect on the underlying BOLRecord.
+    """
+    __tablename__ = "agent_proposals"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agent_runs.id"), nullable=False, index=True)
+    # Not FK-constrained: in mock mode bol_record_id refers to a key in _mock_state,
+    # not a real bol_records row, so this stays a plain UUID column in both modes.
+    bol_record_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+
+    recommended_action: Mapped[ProposalAction] = mapped_column(SAEnum(ProposalAction), nullable=False)
+    # Confidence in THIS recommendation being the right call, not confidence that
+    # cost_pct/access_prog itself is accurate — those are two different questions.
+    confidence: Mapped[Decimal] = mapped_column(Numeric(4, 3), nullable=False)
+    reasoning: Mapped[str] = mapped_column(Text, nullable=False)
+    reasoning_source: Mapped[str] = mapped_column(String(20), nullable=False)  # "llm" | "template"
+    # JSON snapshot of the numbers that drove the classification (deviation, diffs,
+    # uncertainty flags) — grounds the UI tooltip without re-deriving it from a
+    # record that may have changed since this proposal was created.
+    signal_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Denormalized so the Agent Activity tab and summary email never need a join,
+    # and never drift if the underlying record changes before the proposal is reviewed.
+    invoice_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    technique_trip: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    manifest: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    cost_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+
+    status: Mapped[ProposalStatus] = mapped_column(
+        SAEnum(ProposalStatus), nullable=False, default=ProposalStatus.PENDING
+    )
+    reviewed_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reject_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    run: Mapped["AgentRun"] = relationship("AgentRun", back_populates="proposals")
+
+
 class User(Base):
     """Stubbed for future authentication module."""
     __tablename__ = "users"
@@ -369,3 +468,50 @@ class HealthResponse(BaseModel):
     version: str
     db_online: bool
     mock_mode: bool
+
+
+class AgentProposalSummary(BaseModel):
+    """One row in the Agent Activity tab / summary email."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    run_id: uuid.UUID
+    bol_record_id: uuid.UUID
+    recommended_action: ProposalAction
+    confidence: Decimal
+    reasoning: str
+    reasoning_source: str
+    signal_summary: Optional[str] = None
+    invoice_number: Optional[str] = None
+    technique_trip: Optional[str] = None
+    manifest: Optional[str] = None
+    amount: Optional[Decimal] = None
+    cost_pct: Optional[Decimal] = None
+    status: ProposalStatus
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    reject_reason: Optional[str] = None
+    created_at: datetime
+
+
+class AgentRunSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    status: AgentRunStatus
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    invoices_found: int
+    invoices_processed: int
+    records_classified: int
+    proposals_created: int
+    email_sent: bool
+    error: Optional[str] = None
+
+
+class RejectProposalRequest(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class AcceptBatchRequest(BaseModel):
+    proposal_ids: list[str] = Field(..., min_length=1)
