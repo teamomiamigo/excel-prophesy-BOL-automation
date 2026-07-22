@@ -8,9 +8,9 @@
 
 - No production data in the repo — ever
 - No credentials in code — ever
-- All database access is read-only (goal)
-- App runs locally or on internal infrastructure only
-- Nothing goes to the cloud unless IT approves it
+- All production database access is read-only (SELECT-only service account)
+- The backend runs on AWS (Lambda + API Gateway + Aurora Serverless v2); the frontend is on S3 + CloudFront — both public endpoints, not internal-only
+- The AWS deployment was built using the author's existing development AWS access — there is no separate IT/security sign-off process for it today
 
 ---
 
@@ -36,9 +36,8 @@ git status
 If you accidentally committed a secret, rotate it immediately — don't just delete the file from the next commit. The secret is in git history.
 
 ### What goes in `.env` (and nowhere else)
-- `DATABASE_URL` — includes username and password
-- `SMTP_USER` / `SMTP_PASSWORD` — O365 app password
-- Any future API keys
+
+See `CLAUDE.md`'s ".env quick-start" section for the current, full list of keys (it covers a lot more than it used to — `SQLSERVER_*`, `EIA_API_KEY`, IMAP/`ALG_SENDER_EMAIL`, `INVOICE_S3_BUCKET`, etc.) rather than duplicating that list here where it will drift. In production (AWS Lambda), none of these come from `.env` at all — see "Database credentials in AWS" below.
 
 ### What is safe to commit
 - `.env.example` — a template with placeholder values, no real secrets:
@@ -56,23 +55,22 @@ If you accidentally committed a secret, rotate it immediately — don't just del
 
 ### Principle: read-only where possible
 
-When you get SQL access from Raj/IT:
-- Request **SELECT-only** permissions on production databases
-- Never ask for INSERT, UPDATE, DELETE on production tables
-- The app only needs to read from Technique, Prophecy, and VisualMail
-- The app writes only to its own PostgreSQL database (approval records, history)
+- Production database access is **SELECT-only** — confirmed live and working against AWP-SQL-PROD (VisualMail/Technique) and the SQLAPPS3 linked server (ShipperPlus/Prophecy)
+- Never request INSERT, UPDATE, DELETE on production tables
+- The app only reads from Technique, Prophecy, and VisualMail
+- The app writes only to its own PostgreSQL database (approval records, history) — Aurora Serverless v2 in production, local Postgres in dev
 
 ### Service accounts vs personal credentials
 
 - Do not use your personal Windows/AD credentials in the app's database connection string
-- Ask Raj to create a service account (e.g. `sg360_app_readonly`) with SELECT-only permissions
-- This account's credentials go in `.env` only — never in code
+- Locally, `SQLSERVER_USER`/`SQLSERVER_PASSWORD` blank means Windows auth to AWP-SQL-PROD; in production the Lambda uses whatever service credentials are in the Secrets Manager secret (see below)
+- These credentials go in `.env` (local) or Secrets Manager (production) only — never in code
 
 ### SSMS (SQL Server Management Studio)
 
 - You can use your personal credentials in SSMS for development/exploration — that's fine
 - Those credentials never touch the application code or the repo
-- When a query is ready, it goes into `/sql/` in the repo as a `.sql` file — no credentials embedded
+- There's no `/sql/` directory convention in this repo — ad hoc queries developed in SSMS get folded directly into `data_layer.py` once confirmed working, not checked in separately
 
 ---
 
@@ -92,29 +90,38 @@ The app's own PostgreSQL database (Aurora Serverless v2, `sg360-bol-aurora`) cur
 
 ---
 
+## Public exposure (live deployment)
+
+*(Added 2026-07-22 — this section previously didn't exist, and other parts of this doc still claimed the app was internal-only even after the deployment described here went live 2026-07-09.)*
+
+The app has a real public footprint on the internet, not just internal infrastructure:
+
+- **Frontend**: S3 bucket (`sg360-bol-frontend`) behind CloudFront — a public HTTPS URL.
+- **Backend**: API Gateway HTTP API in front of the Lambda function — also a public HTTPS URL.
+- **WAF**: a CloudFront-scoped WAFv2 web ACL currently has `default_action = allow{}` (opened 2026-07-14 for testing — testers' egress IPs rotate through a NAT/VPN faster than an IP allowlist could track). **This is obscurity, not access control** — the CloudFront URL isn't linked or indexed anywhere, but anyone with the URL can reach it. The IP-allowlist rule is left intact in `terraform/main/waf.tf` and should be flipped back to `block{}` before any real production rollout.
+- Everything on-prem (AWP-SQL-PROD, SQLAPPS3) is still reached read-only, and no production data lives in this repo or in front-end code — only in Aurora and in the on-prem systems themselves.
+
+See `documentation/AWS Deployment.md` for the full infrastructure writeup, including the security-group/IAM details.
+
+---
+
 ## The Repository
 
 ### What to commit
 - Source code (`.py`, `.jsx`, `.js`, `.ts`)
-- SQL query files (`/sql/*.sql`) — no embedded credentials
 - Config templates (`.env.example`)
-- Documentation (`README.md`, `CLAUDE.md`, `STATUS.md`, this file)
+- Documentation (`README.md`, `CLAUDE.md`, this file, and the rest of `documentation/`)
 - Test files
 
 ### What never gets committed
 - `.env` (real credentials)
 - Any file containing a password, API key, or connection string with real credentials
-- Production data exports (no CSV dumps of real BOL data)
+- Production data exports (no CSV dumps of real BOL data) — `test_invoices_*/` is gitignored for this reason
 - SSMS query results saved as files
 
-### Branch strategy (keep it simple)
-```
-main          ← stable, working code
-dev           ← active development
-feature/xxx   ← individual features (optional)
-```
+### Branch strategy
 
-Don't push directly to `main` once the app is in use by Katie.
+In practice, work lands on feature/iteration branches (e.g. `development-iteration-5`) that get merged into `main` via PR — there's no separate long-lived `dev` branch. Don't push directly to `main` once Katie is using the app day-to-day.
 
 ---
 
@@ -130,10 +137,10 @@ This mode uses hardcoded test records. No database connection is made. No emails
 
 ### When connecting to real data
 
-- Run only on your work machine or on internal company infrastructure
-- Do not expose the app to the internet (no public URLs, no ngrok tunnels without IT approval)
+- Locally: this still only touches production systems read-only (SELECT-only service account), same as the live deployment
 - `DEBUG=False` in any non-local environment
 - Email sending is only active when SMTP credentials are set — until then it logs
+- The live AWS deployment (see "Public exposure" above) is already internet-reachable — there's no separate "should I expose this" decision left to make for that environment; the open question is tightening the WAF allowlist before real production rollout, not whether to go public at all
 
 ---
 
@@ -141,7 +148,7 @@ This mode uses hardcoded test records. No database connection is made. No emails
 
 If asked, here's the one-paragraph answer:
 
-*"I'm building an internal tool that automates a manual daily reconciliation process. During development it runs entirely on mock data — no production systems are touched. When we connect to real data, it will use read-only service accounts approved by IT on internal SQL Server databases (AWD-SQL-WH4, SQLAPPS3). No data leaves the corporate network. Credentials are stored in environment variables, not in code, and the repository contains no secrets. The deployment target is internal infrastructure, to be determined with Raj."*
+*"This is an internal tool that automates a manual daily reconciliation process. It's deployed on AWS — a Lambda-based API (behind API Gateway) with an Aurora Serverless v2 Postgres database, and a static frontend on S3/CloudFront — built using the developer's existing AWS access, without a separate infrastructure decision or IT sign-off process yet. It reads real data read-only from internal SQL Server systems (AWP-SQL-PROD, and ShipperPlus/Prophecy via the SQLAPPS3 linked server) using a SELECT-only service account; no data leaves the corporate network except into this AWS account. Credentials are stored in environment variables locally and in AWS Secrets Manager in production — never in code — and the repository contains no secrets. The CloudFront/API Gateway endpoints are public HTTPS URLs; a WAF is in place but currently set to allow all traffic (obscurity, not access control) while in active testing, with an IP-allowlist rule ready to enable before a real production rollout."*
 
 ---
 
@@ -151,8 +158,8 @@ If asked, here's the one-paragraph answer:
 - [ ] `grep -r "password" --include="*.py" .` — no hardcoded passwords in Python
 - [ ] `grep -r "password" --include="*.env" .` — only `.env.example` (with placeholder values) shows up
 - [ ] `USE_MOCK_DATA=True` confirmed as the default in `.env.example`
-- [ ] No production CSV files committed (check `/data/` or any exports)
+- [ ] No production CSV files committed (check `test_invoices_*/` is actually gitignored, not just present)
 
 ---
 
-*Last reviewed: 2026-07-16 (added "Database credentials in AWS" section)*
+*Last reviewed: 2026-07-22 (corrected "internal infrastructure only" / "no public URLs" claims — both contradicted by the live AWS deployment since 2026-07-09; added "Public exposure" section, fixed AWD-SQL-WH4 → AWP-SQL-PROD, removed the non-existent `/sql/` directory convention, updated branch strategy to match actual practice)*
