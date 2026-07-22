@@ -2427,37 +2427,34 @@ def _flag_if_resolved_match_looks_wrong(
 
 def _wide_fallback_technique_search(
     job_name: str, alg_weight: "float | None", alg_pallets: "int | None", alg_pcs: "int | None",
-    days_back: int = 90,
+    days_back: int = 90, query_timeout: "int | None" = 15,
 ) -> "dict | None":
     """
     Live Technique search across `days_back` days (default 90) for a trip or manifest
     whose suffix matches job_name — the same two-tier trip-then-manifest suffix logic
     as the normal-window match in _process_invoice_csv() (strategies 2/2b), just
-    against a much wider date range. Called from _process_invoice_csv() (2026-07-20)
-    only once an invoice has found nothing at all in the already-pulled DB data —
-    i.e. right before it would otherwise become an invoice_only stub — so a real but
-    not-yet-pulled trip (or one whose despatch date lags the normal 20-day pull
-    window) still matches immediately instead of waiting for a bulk sweep.
+    against a much wider date range.
 
-    This logic used to run as a bulk sweep over every remaining stub inside
-    pull_technique_data() itself; moved here because stacking it onto that route's
-    own live pull reliably exceeded API Gateway's 30s timeout (see the removal note
-    in pull_technique_data()). Run once per newly-unmatched invoice instead, it has
-    this request's own budget to itself.
+    Shared by two callers with different budget constraints (2026-07-22): the
+    on-demand retry-match route (POST /api/bols/{id}/retry-match), which has this
+    request's full ~29s ceiling to itself and passes query_timeout=None, and the
+    frontend's automatic follow-up call to that same route right after an invoice
+    upload creates a stub — also its own isolated request, also uncapped. Nothing
+    calls this function with anything left over in the same request anymore (the
+    upload-time inline call was removed 2026-07-22 — see _process_invoice_csv() —
+    because sharing a request's budget with everything else already done in that
+    request was the actual root cause of invoices that matched instantly on manual
+    retry but not on upload). query_timeout stays parameterized (default 15) rather
+    than deleted outright in case a future caller ever needs to share a budget again.
 
     Returns the best-matching manifest dict (as returned by get_technique_data()),
     or None if nothing matches even in the wide window.
     """
     from backend.data_layer import get_technique_data, get_manifest_weights
 
-    # 15s query cap here specifically -- this search runs inside an invoice
-    # upload/poll request that's already done other work, so it needs to leave
-    # room in Lambda's 29s wall (8s connect + 15s query = 23s, some margin left).
-    # Not the default for get_technique_data()/get_manifest_weights() in general --
-    # see _get_connection()'s query_timeout docstring.
     try:
         wide_manifests = _dedupe_technique_rows(
-            get_technique_data(days_back=days_back, query_timeout=15)
+            get_technique_data(days_back=days_back, query_timeout=query_timeout)
         )
 
         # Same "how many manifests does this trip have" count pull_technique_data() computes
@@ -2486,7 +2483,7 @@ def _wide_fallback_technique_search(
 
         # Multiple manifests share this suffix in the wide window — score by closeness
         # to the invoice's own billed quantities instead of taking an arbitrary one.
-        score_weights = get_manifest_weights([c["manifest"] for c in candidates], query_timeout=15)
+        score_weights = get_manifest_weights([c["manifest"] for c in candidates], query_timeout=query_timeout)
         for c in candidates:
             wd = score_weights.get(c["manifest"], {})
             c["technique_weight"]  = wd.get("technique_weight", 0)
@@ -2505,9 +2502,11 @@ def _wide_fallback_technique_search(
         # A hung/slow on-prem query here used to guarantee an ungraceful Lambda kill
         # (bare HTTP 500, no traceback -- confirmed 2026-07-21 via CloudWatch on a real
         # invoice upload) since nothing caught it. Treat any failure the same as "no
-        # match in the wide window either" -- the caller already handles a None return
-        # by falling through to a normal invoice_only stub, which can still resolve on
-        # a later pull's DB-side re-match pass.
+        # match in the wide window either" -- retry_match_invoice() already handles a
+        # None return by reporting "not found" rather than propagating the failure, and
+        # the stub it was called on is left untouched, so a later manual retry (or the
+        # next automatic one, if this was called from the frontend's post-upload retry)
+        # can simply try again.
         logger.warning(
             "[INVOICE WIDE FALLBACK] live Technique search failed for suffix '%s' "
             "(days_back=%d): %s — treating as no match.",
@@ -3035,30 +3034,16 @@ def _process_invoice_csv(
                 logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
                                invoice_no, matched_rec.technique_trip)
 
-    # 4b. Wide live fallback (2026-07-20): nothing in our already-pulled DB data matched
-    # this invoice at all — before giving up and creating an invoice_only stub, check
-    # live Technique data across a much wider window. Catches a real trip/manifest whose
-    # despatch date just falls outside the daily pull's normal 20-day window (an ALG
-    # invoice batch can lag well over 3 weeks behind despatch). Skipped for Wolf/311
-    # (Job Name is a Prophecy BOL, not a trip/manifest suffix — nothing to search for)
-    # and comingle invoices (no Technique record ever exists for these by design).
-    if (
-        matched_rec is None and job_name
-        and not effective_prophecy_bol
-        and not (cust_job_no or "").upper().startswith("CM")
-        and not settings.USE_MOCK_DATA
-    ):
-        wide_match = _wide_fallback_technique_search(job_name, total_weight, total_pallets, total_pcs)
-        if wide_match is not None:
-            from backend.data_layer import get_manifest_weights
-            weight_data = get_manifest_weights([wide_match["manifest"]]).get(wide_match["manifest"], {})
-            matched_rec = _create_technique_record_from_fallback(db, wide_match, weight_data)
-            match_strategy = "job_name"
-            logger.info(
-                "[INVOICE] %s -> matched via wide (90-day) live fallback on suffix '%s' "
-                "(no match in already-pulled data)",
-                invoice_no, job_name,
-            )
+    # Note (2026-07-22): a live 90-day wide-fallback search used to run inline here
+    # (step 4b) before giving up and creating a stub — removed because sharing this
+    # request's budget with everything already done in it (CSV parsing, and for a
+    # folder/email batch, every prior invoice in the same request) was the actual
+    # root cause of invoices that matched instantly on a manual retry-match click but
+    # not on upload. Every non-instant miss now becomes a stub immediately (below),
+    # and the frontend fires an automatic POST /api/bols/{id}/retry-match — the same
+    # wide search, in its own isolated request with the full budget to itself — right
+    # after the upload/poll response comes back. See _wide_fallback_technique_search()
+    # and retry_match_invoice().
 
     if matched_rec is None:
         is_wolf_stub = bool(effective_prophecy_bol)
@@ -3167,8 +3152,10 @@ def _process_invoice_csv(
             "[INVOICE] %s → no match, stub created (bol=%s, note=%s)",
             invoice_no, stub_bol_number, auto_note,
         )
+        stub_record = _mock_state[stub_id] if settings.USE_MOCK_DATA else stub
         return {
             "matched": is_wolf_stub,
+            "record_id": str(_cget(stub_record, "id")),
             "invoice_number": invoice_no,
             "job_name": job_name,
             "alg_bol_no": alg_bol_no,
@@ -3246,6 +3233,7 @@ def _process_invoice_csv(
     )
     return {
         "matched": True,
+        "record_id": str(_cget(matched_rec, "id")),
         "invoice_number": invoice_no,
         "job_name": job_name,
         "alg_bol_no": alg_bol_no,
@@ -4099,15 +4087,13 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
 def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     """
     On-demand retry for one stuck invoice_only stub: check a wide (90-day) Technique
-    window immediately instead of waiting for the next "Pull Manifests" click. Reuses
-    _create_technique_record_from_fallback()/_compute_diffs()/_finish_resolving_stub()
-    so this stays in sync with the automatic wide fallback in pull_technique_data() —
-    same search logic, just a single-record, on-demand version. Deliberately kept at
-    90 days rather than the 40-day window pull_technique_data() uses (2026-07-20): this
-    endpoint's live Technique query isn't stacked onto anything else in the same
-    request, so it has the full ~29s ceiling to itself and comfortably fits the 90-day
-    query alone (measured ~13s) — see the wide-fallback comment in pull_technique_data()
-    for why the bulk pull can't afford the same window.
+    window immediately. Shares _wide_fallback_technique_search() with the automatic
+    post-upload retry the frontend now fires right after every new stub is created
+    (see _process_invoice_csv()) — one search implementation instead of two that could
+    silently drift apart. query_timeout=None here (unlike the 15s cap used when this
+    search shares a request's budget with other work): this endpoint's live query isn't
+    stacked onto anything else in the same request, so it has the full ~29s ceiling to
+    itself and comfortably fits the 90-day query alone (measured ~13s).
     """
     if settings.USE_MOCK_DATA:
         raise HTTPException(status_code=400, detail="Retry-match is disabled in mock mode.")
@@ -4122,59 +4108,16 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     if not job_name_s:
         return {"matched": False, "message": "No job name on this invoice to match against."}
 
-    from backend.data_layer import get_technique_data, get_manifest_weights
-
-    manifests = _dedupe_technique_rows(get_technique_data(days_back=90))
-
-    # Same is_ambiguous_trip count pull_technique_data() computes -- retry-match creates
-    # records via _create_technique_record_from_fallback() too, which previously never
-    # set this at all (see the wide-fallback fix above).
-    trip_manifest_counts: dict[str, int] = {}
-    for m in manifests:
-        if m.get("technique_trip"):
-            trip_manifest_counts[m["technique_trip"]] = trip_manifest_counts.get(m["technique_trip"], 0) + 1
-
-    candidates = [m for m in manifests if _trip_to_suffix(m.get("technique_trip") or "") == job_name_s]
-    if not candidates:
-        # Fall back to manifest-suffix matching (issue #65) — Job Name may reflect the
-        # manifest number rather than the trip number; same fallback the main upload-time
-        # cascade now tries in _process_invoice_csv().
-        candidates = [m for m in manifests if _manifest_to_suffix(m.get("manifest") or "") == job_name_s]
-    if not candidates:
+    wide_match = _wide_fallback_technique_search(
+        job_name_s, float(stub.alg_weight or 0), stub.alg_pallets, stub.alg_pcs,
+        query_timeout=None,
+    )
+    if wide_match is None:
         return {"matched": False, "message": "Still not found in Technique (checked last 90 days)."}
 
-    loose_match_note: Optional[str] = None
-    if len(candidates) == 1:
-        match = candidates[0]
-        weight_data = get_manifest_weights([match["manifest"]]).get(match["manifest"], {})
-    else:
-        # Multiple candidates share this suffix — score by closeness to the stub's own
-        # ALG-invoiced quantities, same _closest_technique_match() logic the main
-        # upload-time cascade already uses, instead of blindly taking whichever the
-        # Technique query happened to return first.
-        weight_map = get_manifest_weights([c["manifest"] for c in candidates])
-        for c in candidates:
-            wd = weight_map.get(c["manifest"], {})
-            c["technique_weight"]  = wd.get("technique_weight", 0)
-            c["technique_pallets"] = wd.get("technique_pallets", 0)
-            c["technique_pcs"]     = wd.get("technique_pcs", 0)
-        match, score = _closest_technique_match(
-            candidates, float(stub.alg_weight or 0), stub.alg_pallets or 0, stub.alg_pcs or 0,
-        )
-        weight_data = weight_map.get(match["manifest"], {})
-        if score > _CLOSE_MATCH_THRESHOLD:
-            loose_match_note = (
-                f"Matched via closest-quantity heuristic among {len(candidates)} candidates "
-                f"sharing suffix '{job_name_s}' on retry (discrepancy score {score:.2f}) — verify manually."
-            )
-            logger.warning(
-                "[RETRY-MATCH] %s -> closest match among %d candidates '%s' still has a "
-                "large discrepancy (score=%.3f) - verify manually",
-                stub.invoice_number, len(candidates), job_name_s, score,
-            )
-
-    match["_trip_manifest_count"] = trip_manifest_counts.get(match.get("technique_trip"), 0)
-    row = _create_technique_record_from_fallback(db, match, weight_data)
+    from backend.data_layer import get_manifest_weights
+    weight_data = get_manifest_weights([wide_match["manifest"]]).get(wide_match["manifest"], {})
+    row = _create_technique_record_from_fallback(db, wide_match, weight_data)
     row.invoice_number = stub.invoice_number
     row.inv_job_number  = stub.inv_job_number
     row.amount          = stub.amount
@@ -4182,8 +4125,6 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     row.alg_pallets     = stub.alg_pallets
     row.alg_pcs         = stub.alg_pcs
     row.match_strategy  = "job_name"
-    if loose_match_note:
-        row.notes = f"{row.notes} {loose_match_note}" if row.notes else loose_match_note
     _compute_diffs(row)
 
     from backend.data_layer import get_tariff_rate as _get_tariff_rate
@@ -4198,7 +4139,7 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     db.delete(stub)
     db.commit()
     logger.info("[RETRY-MATCH] Resolved stub %s → %s", stub.invoice_number, row.technique_trip)
-    return {"matched": True, "message": f"Matched to {row.technique_trip}."}
+    return {"matched": True, "matched_trip": row.technique_trip, "message": f"Matched to {row.technique_trip}."}
 
 
 @app.get("/api/logs", response_model=list[BOLSummary], tags=["Logs"])

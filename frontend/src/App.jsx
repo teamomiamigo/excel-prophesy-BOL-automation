@@ -13,6 +13,46 @@ import BulkActionToolbar from './components/BulkActionToolbar.jsx';
 // When Module 2 ships: extract fetch helpers to src/api/bolsApi.js
 // and move this state/logic to src/pages/BolReconciliation.jsx
 
+// Bounded-concurrency runner for the automatic post-upload retry-match pass —
+// a batch upload/poll can produce several new stubs at once, and firing all their
+// live Technique searches fully in parallel would hammer AWP-SQL-PROD. No library
+// needed at this scale, just a shared work queue with a fixed number of workers.
+async function runWithConcurrency(items, limit, fn) {
+  const queue = [...items];
+  async function worker() {
+    while (queue.length > 0) {
+      const item = queue.shift();
+      await fn(item);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+
+const AUTO_RETRY_CONCURRENCY = 3;
+
+// Reconciles a batch's initial "unmatched" list against the automatic retry-match
+// pass that runs right after upload/poll (see autoRetryNewStubs) — without this, the
+// Invoice Upload/Poll Results summary keeps reporting a record as unmatched even
+// after it resolves a moment later, because that summary is otherwise built from the
+// immediate per-file response, before the automatic retry has a chance to run.
+// unmatchedByRecordId maps a stub's record_id to its entry in `unmatched`.
+function reconcileWithRetryResults(unmatched, unmatchedByRecordId, retryResults) {
+  const stillUnmatched = [...unmatched];
+  const newlyMatched = [];
+  for (const [id, result] of retryResults) {
+    const entry = unmatchedByRecordId.get(id);
+    if (!entry) continue;
+    if (result.matched) {
+      const idx = stillUnmatched.indexOf(entry);
+      if (idx !== -1) stillUnmatched.splice(idx, 1);
+      newlyMatched.push({ ...entry, trip: result.trip, strategy: 'job_name', note: undefined });
+    } else if (result.message) {
+      entry.note = result.message;
+    }
+  }
+  return { stillUnmatched, newlyMatched };
+}
+
 export default function App() {
   const [pendingBols, setPendingBols] = useState([]);
   const [approvedBols, setApprovedBols] = useState([]);
@@ -292,6 +332,32 @@ export default function App() {
     }
   }
 
+  // Automatic follow-up for stubs a CSV upload/poll just created (2026-07-22) — fires
+  // the same live wide-Technique-search retry-match already exposed as the manual
+  // magnifying-glass button, once per new stub, each in its own isolated request so
+  // none of them shares a budget with anything else (that budget-sharing was the
+  // actual bug: a real trip that matched instantly on manual retry could fail to
+  // auto-match at upload time purely because the search ran inside the same request
+  // as everything else already done in it). Returns a Map(recordId -> {matched,
+  // trip, message}) so the caller can reconcile its upload/poll results summary —
+  // without that, the summary would keep reporting a stub as unmatched even after
+  // this resolves it a moment later (the exact bug the user hit 2026-07-22).
+  async function autoRetryNewStubs(recordIds) {
+    const results = new Map();
+    if (!recordIds.length) return results;
+    await runWithConcurrency(recordIds, AUTO_RETRY_CONCURRENCY, async id => {
+      try {
+        const res = await fetch(`/api/bols/${id}/retry-match`, { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        results.set(id, { matched: !!data.matched, trip: data.matched_trip, message: data.message });
+      } catch (err) {
+        results.set(id, { matched: false, message: err.message });
+      }
+    });
+    await fetchPending();
+    return results;
+  }
+
   // -------------------------------------------------------------------------
   // Bulk actions (issue #32) — fire the same per-record endpoints used by the
   // individual action buttons, once per eligible selected record, then a
@@ -445,6 +511,8 @@ export default function App() {
     setInvoiceUploading(true);
     setUploadResults(null);
     const matched = [], unmatched = [], errors = [], conflicts = [];
+    const newStubIds = [];
+    const unmatchedByRecordId = new Map();
     for (let i = 0; i < fileEntries.length; i++) {
       const { file, folderName, pdfFile } = fileEntries[i];
       setUploadProgress(`${i + 1} of ${fileEntries.length}`);
@@ -461,7 +529,15 @@ export default function App() {
           matched.push({ name: file.name, invoice: data.invoice_number, trip: data.matched_trip, strategy: data.match_strategy, sender: data.invoice_email_sender });
           if (data.conflict) conflicts.push(data.conflict);
         } else {
-          unmatched.push({ name: file.name, invoice: data.invoice_number, jobName: data.job_name, note: data.message, sender: data.invoice_email_sender });
+          const entry = { name: file.name, invoice: data.invoice_number, jobName: data.job_name, note: data.message, sender: data.invoice_email_sender };
+          unmatched.push(entry);
+          if (data.match_strategy === 'invoice_only' && data.record_id) {
+            newStubIds.push(data.record_id);
+            unmatchedByRecordId.set(data.record_id, entry);
+            // Not a final verdict yet — the automatic retry below still has to run.
+            // Labeling this "unmatched" already would be a lie for however long that takes.
+            entry.checking = true;
+          }
         }
       } catch (err) {
         errors.push({ name: file.name, msg: err.message });
@@ -469,8 +545,26 @@ export default function App() {
     }
     setInvoiceUploading(false);
     setUploadProgress(null);
+    // Show results right away — a batch with several unmatched invoices can take up
+    // to a minute for the automatic retry pass below to finish, and going silent for
+    // that whole stretch (2026-07-22 regression) reads as "broken", not "still working".
+    // Anything still being checked is honestly labeled, then patched in place once resolved.
     setUploadResults({ matched, unmatched, errors, conflicts });
     await Promise.all([fetchPending(), fetchApproved()]);
+
+    // Automatic follow-up (2026-07-22): a stub that didn't match anything already in
+    // our DB gets one live wide-Technique-search retry right away, in its own isolated
+    // request — the same search the manual retry-match (magnifying glass) button
+    // fires, just automated. Upload itself never waits on a live query anymore (see
+    // _process_invoice_csv()'s removal note), so this is what actually resolves most
+    // new invoices now instead of it being a rare manual fallback.
+    if (newStubIds.length) {
+      const retryResults = await autoRetryNewStubs(newStubIds);
+      const { stillUnmatched, newlyMatched } = reconcileWithRetryResults(unmatched, unmatchedByRecordId, retryResults);
+      stillUnmatched.forEach(e => { e.checking = false; });
+      matched.push(...newlyMatched);
+      setUploadResults({ matched, unmatched: stillUnmatched, errors, conflicts });
+    }
 
     // Best-effort: merge this batch's invoice PDFs into one file now, so
     // "Download Invoices" in the Send to Accounting modal is ready instantly
@@ -700,6 +794,8 @@ export default function App() {
         setSuccessMessage(data.message || 'No new invoice files found.');
       } else {
         const matched = [], unmatched = [], errors = [], conflicts = [];
+        const newStubIds = [];
+        const unmatchedByRecordId = new Map();
         for (const r of (data.processed || [])) {
           if (r.error) {
             errors.push({ name: r.filename || r.invoice_number || '?', msg: r.error });
@@ -707,11 +803,27 @@ export default function App() {
             matched.push({ name: r.invoice_number, invoice: r.invoice_number, trip: r.matched_trip, strategy: r.match_strategy });
             if (r.conflict) conflicts.push(r.conflict);
           } else {
-            unmatched.push({ name: r.invoice_number, invoice: r.invoice_number, jobName: r.job_name, note: r.message });
+            const entry = { name: r.invoice_number, invoice: r.invoice_number, jobName: r.job_name, note: r.message };
+            unmatched.push(entry);
+            if (r.match_strategy === 'invoice_only' && r.record_id) {
+              newStubIds.push(r.record_id);
+              unmatchedByRecordId.set(r.record_id, entry);
+              entry.checking = true;
+            }
           }
         }
+        // Show results right away (2026-07-22) — see uploadInvoiceFiles()'s comment;
+        // a batch can take up to a minute for the automatic retry pass to finish, and
+        // going silent for that whole stretch reads as "broken", not "still working".
         setPollResults({ matched, unmatched, errors, conflicts });
         await Promise.all([fetchPending(), fetchApproved()]);
+        if (newStubIds.length) {
+          const retryResults = await autoRetryNewStubs(newStubIds);
+          const { stillUnmatched, newlyMatched } = reconcileWithRetryResults(unmatched, unmatchedByRecordId, retryResults);
+          stillUnmatched.forEach(e => { e.checking = false; });
+          matched.push(...newlyMatched);
+          setPollResults({ matched, unmatched: stillUnmatched, errors, conflicts });
+        }
       }
     } catch (err) {
       setError(err.message);
@@ -1025,7 +1137,9 @@ export default function App() {
               <div style={{ marginBottom: 16, border: '1px solid #e5e7eb', borderRadius: 6, overflow: 'hidden', fontSize: 12 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: '#f9fafb', borderBottom: '1px solid #e5e7eb' }}>
                   <span style={{ fontWeight: 600, color: '#374151' }}>
-                    Invoice Upload Results — {uploadResults.matched.length} matched &nbsp;·&nbsp; {uploadResults.unmatched.length} unmatched &nbsp;·&nbsp; {uploadResults.errors.length} errors
+                    Invoice Upload Results — {uploadResults.matched.length} matched &nbsp;·&nbsp; {uploadResults.unmatched.length} unmatched
+                    {uploadResults.unmatched.some(r => r.checking) && ` (${uploadResults.unmatched.filter(r => r.checking).length} checking Technique…)`}
+                    &nbsp;·&nbsp; {uploadResults.errors.length} errors
                   </span>
                   <button onClick={() => setUploadResults(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#9ca3af', fontSize: 14, lineHeight: 1 }}>✕</button>
                 </div>
@@ -1041,14 +1155,16 @@ export default function App() {
                   </div>
                 ))}
                 {uploadResults.unmatched.map((r, i) => (
-                  <div key={i} style={{ display: 'flex', gap: 12, padding: '5px 12px', background: '#fffbeb', borderBottom: '1px solid #fef3c7', alignItems: 'center' }}>
-                    <span style={{ color: '#d97706', fontWeight: 700, minWidth: 14 }}>—</span>
-                    <span style={{ fontWeight: 600, color: '#92400e', minWidth: 90 }}>{r.invoice}</span>
+                  <div key={i} style={{ display: 'flex', gap: 12, padding: '5px 12px', background: r.checking ? '#eff6ff' : '#fffbeb', borderBottom: r.checking ? '1px solid #bfdbfe' : '1px solid #fef3c7', alignItems: 'center' }}>
+                    <span style={{ color: r.checking ? '#2563eb' : '#d97706', fontWeight: 700, minWidth: 14 }}>{r.checking ? '⏳' : '—'}</span>
+                    <span style={{ fontWeight: 600, color: r.checking ? '#1e40af' : '#92400e', minWidth: 90 }}>{r.invoice}</span>
                     <span style={{ color: '#374151' }}>{r.name}</span>
                     <span style={{ color: r.sender ? '#6b7280' : '#dc2626', fontStyle: r.sender ? 'normal' : 'italic', fontSize: 12 }}>
                       {r.sender || '⚠ no sender detected'}
                     </span>
-                    <span style={{ marginLeft: 'auto', color: '#6b7280', fontStyle: 'italic' }}>{r.note}</span>
+                    <span style={{ marginLeft: 'auto', color: r.checking ? '#2563eb' : '#6b7280', fontStyle: 'italic' }}>
+                      {r.checking ? 'Checking Technique for a match…' : r.note}
+                    </span>
                   </div>
                 ))}
                 {uploadResults.errors.map((r, i) => (
@@ -1084,7 +1200,9 @@ export default function App() {
               <div style={{ marginBottom: 16, border: '1px solid #e5e7eb', borderRadius: 6, overflow: 'hidden', fontSize: 12 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: '#f9fafb', borderBottom: '1px solid #e5e7eb' }}>
                   <span style={{ fontWeight: 600, color: '#374151' }}>
-                    Pull Invoices Results — {pollResults.matched.length} matched &nbsp;·&nbsp; {pollResults.unmatched.length} unmatched &nbsp;·&nbsp; {pollResults.errors.length} errors
+                    Pull Invoices Results — {pollResults.matched.length} matched &nbsp;·&nbsp; {pollResults.unmatched.length} unmatched
+                    {pollResults.unmatched.some(r => r.checking) && ` (${pollResults.unmatched.filter(r => r.checking).length} checking Technique…)`}
+                    &nbsp;·&nbsp; {pollResults.errors.length} errors
                   </span>
                   <button onClick={() => setPollResults(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#9ca3af', fontSize: 14, lineHeight: 1 }}>✕</button>
                 </div>
@@ -1096,10 +1214,12 @@ export default function App() {
                   </div>
                 ))}
                 {pollResults.unmatched.map((r, i) => (
-                  <div key={i} style={{ display: 'flex', gap: 12, padding: '5px 12px', background: '#fffbeb', borderBottom: '1px solid #fef3c7', alignItems: 'center' }}>
-                    <span style={{ color: '#d97706', fontWeight: 700, minWidth: 14 }}>—</span>
-                    <span style={{ fontWeight: 600, color: '#92400e', minWidth: 90 }}>{r.invoice}</span>
-                    <span style={{ marginLeft: 'auto', color: '#6b7280', fontStyle: 'italic' }}>{r.note}</span>
+                  <div key={i} style={{ display: 'flex', gap: 12, padding: '5px 12px', background: r.checking ? '#eff6ff' : '#fffbeb', borderBottom: r.checking ? '1px solid #bfdbfe' : '1px solid #fef3c7', alignItems: 'center' }}>
+                    <span style={{ color: r.checking ? '#2563eb' : '#d97706', fontWeight: 700, minWidth: 14 }}>{r.checking ? '⏳' : '—'}</span>
+                    <span style={{ fontWeight: 600, color: r.checking ? '#1e40af' : '#92400e', minWidth: 90 }}>{r.invoice}</span>
+                    <span style={{ marginLeft: 'auto', color: r.checking ? '#2563eb' : '#6b7280', fontStyle: 'italic' }}>
+                      {r.checking ? 'Checking Technique for a match…' : r.note}
+                    </span>
                   </div>
                 ))}
                 {pollResults.errors.map((r, i) => (

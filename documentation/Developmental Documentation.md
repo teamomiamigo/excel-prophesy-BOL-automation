@@ -1,4 +1,4 @@
-*updated 2026-07-21*
+*updated 2026-07-22*
 
 Running log of development work on this branch — what changed, why, and anything non-obvious for the next person (human dev or Claude Code) touching this code. Pairs with `CLAUDE.md` (architecture/business rules, kept current) and the GitHub issue backlog (what's queued up next).
 
@@ -14,6 +14,12 @@ Stable technical notes that don't belong to one changelog entry — add here whe
 ## Changelog
 
 One entry per closed issue. Newest on top.
+
+### 2026-07-22 — Invoice auto-matching: removed the shared-budget root cause, then fixed two UX regressions it introduced
+**What:** `_process_invoice_csv()` no longer runs a live 90-day wide-fallback Technique search inline during upload/poll — every upload request is now DB-only and fast, and returns `record_id` on both the match and stub branches. The frontend (`uploadInvoiceFiles()`, `handlePollFolder()` in `App.jsx`) automatically fires `POST /api/bols/{id}/retry-match` per new stub right after the upload response comes back (concurrency-limited to 3 at once via a new `runWithConcurrency()` helper), reusing the same search the manual magnifying-glass button already called. `retry_match_invoice()` and `_wide_fallback_technique_search()` are now one shared implementation instead of two independently-written ones (the manual button's old copy had no `query_timeout`/`try-except` around its live queries — fixed as a side effect), and the route's success response now includes `matched_trip`.
+**Why:** Root cause of "matches instantly on manual retry but not on upload" was never search reliability — it was the upload-time call sharing its request's timeout budget with everything else already done in that request (CSV parsing, prior files in a batch). Isolating the search into its own request removes the timing problem entirely instead of tuning day-windows/timeouts around it.
+**Files:** backend/main.py (`_process_invoice_csv`, `_wide_fallback_technique_search`, `retry_match_invoice`), frontend/src/App.jsx (`uploadInvoiceFiles`, `handlePollFolder`, new `autoRetryNewStubs`/`runWithConcurrency`/`reconcileWithRetryResults`), CLAUDE.md
+**Gotcha:** Two real regressions surfaced during live testing of this same change and are fixed in this same commit, not follow-ups: (1) the Invoice Upload/Poll Results summary was built from the immediate per-file response, before the automatic retry-match pass had a chance to run — a record that auto-resolved a moment later still showed "unmatched" in the panel even though the Pending table itself was correct. (2) Fixing that by awaiting the whole automatic pass before showing any results made a batch with several unmatched invoices go completely silent for up to a minute-plus (each live retry-match takes ~13–26s) — no visible progress, which read as broken rather than slow. Final behavior: the results panel shows immediately, with anything still being auto-checked honestly labeled "checking Technique…", then patches in place per-item as the automatic pass resolves each one.
 
 ### 2026-07-22 — Blanket 15s query timeout was breaking the main Technique pull
 **What:** `_get_connection()` (`backend/data_layer.py`) no longer hardcodes `conn.timeout = 15` for every query on every connection — it now takes an optional `query_timeout` parameter, left unset (pyodbc default: no timeout) unless the caller opts in. `get_technique_data()` and `get_manifest_weights()` gained the same optional parameter, threaded through to `_get_connection()`. `_wide_fallback_technique_search()` (`backend/main.py`) — the one call site the 15s cap was actually built for — now passes `query_timeout=15` explicitly on both of its live calls.
