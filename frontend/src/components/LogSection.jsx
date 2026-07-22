@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import useEdgeScroll from '../hooks/useEdgeScroll.js';
 
 const TH = {
   padding: '7px 10px',
@@ -88,8 +89,13 @@ export default function LogSection() {
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
   const [senderFilter, setSenderFilter] = useState('');
+  const [revertingId, setRevertingId] = useState(null);
+  const lastFilterRef = useRef({ sd: '', ed: '', sender: '' });
+  const scrollRef = useRef(null);
+  useEdgeScroll(scrollRef, !loading && records.length > 0);
 
   async function fetchLogs(sd, ed, sender) {
+    lastFilterRef.current = { sd, ed, sender };
     setLoading(true);
     setError(null);
     try {
@@ -108,6 +114,33 @@ export default function LogSection() {
   }
 
   useEffect(() => { fetchLogs('', '', ''); }, []);
+
+  // "Accidentally fully approved" undo — only offered once a record has actually
+  // been sent to accounting (accounting_exported_at set); an ordinary same-day
+  // approved-but-not-yet-sent record already has its own revert path in
+  // ApprovedSection.jsx. Does not refresh the Dashboard tab automatically (known
+  // limitation, not fixed here) — reverted record won't show in Pending until a
+  // manual reload or tab switch triggers App.jsx's own fetchPending().
+  async function handleRevert(record) {
+    const label = record.invoice_number || record.technique_trip || record.id;
+    if (!window.confirm(
+      `Revert ${label} to pending? This undoes an invoice already reported to accounting — the SID export record (if any) is left untouched.`
+    )) return;
+    setRevertingId(record.id);
+    try {
+      const res = await fetch(`/api/bols/${record.id}/unapprove?clear_accounting_export=true`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `Revert failed (${res.status})`);
+      }
+      const { sd, ed, sender } = lastFilterRef.current;
+      await fetchLogs(sd, ed, sender);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRevertingId(null);
+    }
+  }
 
   function handleFilter(e) {
     e.preventDefault();
@@ -221,7 +254,7 @@ export default function LogSection() {
           No records found for the selected date range.
         </div>
       ) : (
-        <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb' }}>
+        <div ref={scrollRef} style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
             <thead>
               <tr>
@@ -240,6 +273,7 @@ export default function LogSection() {
                 <th style={TH}>Approved At</th>
                 <th style={TH}>Notes</th>
                 <th style={TH}>Sent to Accounting</th>
+                <th style={TH}>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -265,6 +299,30 @@ export default function LogSection() {
                   </td>
                   <td style={{ ...TD, color: '#6b7280', fontSize: 12 }}>
                     {r.accounting_exported_at ? fmtTime(r.accounting_exported_at) : '—'}
+                  </td>
+                  <td style={TD}>
+                    {r.accounting_exported_at ? (
+                      <button
+                        onClick={() => handleRevert(r)}
+                        disabled={revertingId === r.id}
+                        title="Revert to pending — undoes an invoice already reported to accounting"
+                        style={{
+                          background: revertingId === r.id ? '#e5e7eb' : '#fff',
+                          color: '#374151',
+                          border: '1px solid #d1d5db',
+                          borderRadius: 4,
+                          padding: '4px 10px',
+                          fontSize: 12,
+                          fontWeight: 600,
+                          cursor: revertingId === r.id ? 'not-allowed' : 'pointer',
+                          opacity: revertingId === r.id ? 0.7 : 1,
+                        }}
+                      >
+                        {revertingId === r.id ? '…' : '↩ Revert to Pending'}
+                      </button>
+                    ) : (
+                      <span style={{ color: '#d1d5db' }}>—</span>
+                    )}
                   </td>
                 </tr>
               ))}

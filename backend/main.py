@@ -90,11 +90,13 @@ async def lifespan(app: FastAPI):
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_ambiguous_trip BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS min_charge_uncertain BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS cost_calc_detail TEXT"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS is_dismissed BOOLEAN NOT NULL DEFAULT FALSE"))
+            _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS mismatch_acknowledged BOOLEAN NOT NULL DEFAULT FALSE"))
             _conn.commit()
         logger.info(
             "DB column migration for base_tariff/fsc_pct/is_third_party/is_do_not_pay/"
             "invoice_sent_at/alg_fsc_pct/alg_fsc_cost/tariff_zone_approximate/weight_source_fallback/"
-            "is_ambiguous_trip/min_charge_uncertain/cost_calc_detail complete "
+            "is_ambiguous_trip/min_charge_uncertain/cost_calc_detail/is_dismissed/mismatch_acknowledged complete "
             "(is_ignored dropped 2026-07-16 — see Developmental Documentation.md)."
         )
     logger.info(
@@ -204,7 +206,20 @@ def list_pending_bols(db: Session = Depends(get_db)):
 
     rows = (
         db.query(BOLRecord)
-        .filter(BOLRecord.status != BOLStatus.APPROVED)
+        .filter(
+            BOLRecord.status != BOLStatus.APPROVED,
+            # Excludes sibling-manifest stubs (2026-07-22): retry_match_invoice() now
+            # persists a trip's other manifests too when it resolves an ambiguous match
+            # (see "Ambiguous trips" in CLAUDE.md) so Compare/reassign has real data to
+            # work with — but those siblings have no invoice and aren't Katie's to review
+            # individually; they'd just be redundant rows she'd have to dismiss one by
+            # one. The trip's actual invoiced record (which does have invoice_number)
+            # still shows, badged ~UNVERIFIED, with the Compare button as the one place
+            # to see/act on its siblings. Nothing else creates an invoice-less record
+            # post-Phase-4 (the old daily bulk pull's "Awaiting Invoice" pre-population
+            # is gone), so this filter only ever excludes exactly these stubs.
+            BOLRecord.invoice_number.isnot(None),
+        )
         .order_by(
             BOLRecord.invoice_number.is_(None),
             BOLRecord.created_at,
@@ -331,14 +346,28 @@ def approve_bol(
 )
 def unapprove_bol(
     record_id: str,
+    clear_accounting_export: bool = False,
     db: Session = Depends(get_db),
 ):
-    """Revert an approved record back to pending review."""
+    """
+    Revert an approved record back to pending review.
+
+    clear_accounting_export=True (added 2026-07-22, used by the Log tab's "Revert to
+    Pending" button) additionally clears accounting_exported_at and logs a
+    distinguishable reason on the ApprovalHistory row -- for the "accidentally fully
+    approved this and it already went to accounting" case, as opposed to an ordinary
+    same-day undo via ApprovedSection.jsx (which never has an accounting_exported_at
+    to clear yet). sid_exported_at is deliberately never touched by either path -- a
+    real Prophecy SID really was downloaded at some point, and reverting approval
+    doesn't undo that fact.
+    """
     if settings.USE_MOCK_DATA:
         rec = _find_mock(record_id)
         rec["status"] = "pending"
         rec["approved_at"] = None
         rec["approved_by"] = None
+        if clear_accounting_export:
+            rec["accounting_exported_at"] = None
         rec["updated_at"] = datetime.now(timezone.utc)
         return _record_to_summary(rec)
 
@@ -348,10 +377,13 @@ def unapprove_bol(
     row.status = BOLStatus.PENDING
     row.approved_at = None
     row.approved_by = None
+    if clear_accounting_export:
+        row.accounting_exported_at = None
     db.add(ApprovalHistory(
         bol_id=row.id,
         action=ActionType.REOPENED,
         performed_by="coordinator",
+        reason="Reverted from Log tab (previously sent to accounting)" if clear_accounting_export else None,
     ))
     db.commit()
     db.refresh(row)
@@ -499,6 +531,66 @@ def unmark_third_party(
     if not row:
         raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
     row.is_third_party = False
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.post("/api/bols/{record_id}/dismiss", response_model=BOLSummary, tags=["BOLs"])
+def dismiss_sibling(record_id: str, db: Session = Depends(get_db)):
+    """
+    Dismiss a bad/duplicate sibling manifest on an ambiguous trip — for the case
+    CompareManifestsModal.jsx exists to handle: Technique split a trip into manifests
+    that don't actually both need an invoice (human error making the manifest, a stray
+    duplicate, etc.). Only ever called from that modal's "Delete" button, on a candidate
+    that isn't the one holding the actual invoice.
+
+    Reversible in principle (nothing is deleted, just hidden), but there's no undo route
+    yet since nothing in the UI surfaces a dismissed record to undo from — added
+    2026-07-22 alongside sibling-manifest persistence (see "Ambiguous trips" in
+    CLAUDE.md); add one if that changes.
+    """
+    if settings.USE_MOCK_DATA:
+        raise HTTPException(status_code=400, detail="Dismiss is disabled in mock mode.")
+
+    row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
+    if row.invoice_number:
+        raise HTTPException(
+            status_code=400,
+            detail="This record has a real invoice attached — dismiss is only for unmatched sibling manifests.",
+        )
+    row.is_dismissed = True
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.post("/api/bols/{record_id}/acknowledge-mismatch", response_model=BOLSummary, tags=["BOLs"])
+def acknowledge_mismatch(record_id: str, db: Session = Depends(get_db)):
+    """
+    Clear the ~UNVERIFIED badge for a severe weight/pallet/piece mismatch that has no
+    ambiguous trip to compare against — the Compare modal only applies when
+    is_ambiguous_trip is set (multiple manifests to actually choose between); a
+    single-manifest mismatch had no available action at all before this (added
+    2026-07-22, direct user feedback after the Compare-button work). Unlike dismiss,
+    no guard on invoice presence — this doesn't hide or change any data, just
+    acknowledges the discrepancy is expected/explained. No undo route — same reasoning
+    as dismiss.
+    """
+    if settings.USE_MOCK_DATA:
+        rec = _find_mock(record_id)
+        rec["mismatch_acknowledged"] = True
+        rec["updated_at"] = datetime.now(timezone.utc)
+        return _record_to_summary(rec)
+
+    row = db.query(BOLRecord).filter(BOLRecord.id == record_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
+    row.mismatch_acknowledged = True
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(row)
@@ -717,24 +809,29 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
     if not source_row.invoice_number:
         raise HTTPException(status_code=400, detail="Source record has no invoice to reassign")
 
-    # Find target
+    # Find target — never a dismissed sibling (2026-07-22): Katie explicitly said this
+    # manifest is bad/duplicate data via the Compare modal's Delete button, so it
+    # shouldn't be assignable as a reassign target either, even by BOL/trip/manifest
+    # number typed directly into ReassignInvoiceModal.
     target_row = None
     try:
         bol_int = int(target_str)
-        target_row = db.query(BOLRecord).filter(BOLRecord.bol_number == bol_int).first()
+        target_row = db.query(BOLRecord).filter(
+            BOLRecord.bol_number == bol_int, BOLRecord.is_dismissed.is_(False),
+        ).first()
     except ValueError:
         pass
     if not target_row and target_str.upper().startswith("TEC_T_"):
         target_row = db.query(BOLRecord).filter(
-            BOLRecord.technique_trip.ilike(target_str)
+            BOLRecord.technique_trip.ilike(target_str), BOLRecord.is_dismissed.is_(False),
         ).first()
     if not target_row and target_str.upper().startswith("TEC_M_"):
         target_row = db.query(BOLRecord).filter(
-            BOLRecord.manifest.ilike(target_str)
+            BOLRecord.manifest.ilike(target_str), BOLRecord.is_dismissed.is_(False),
         ).first()
     if not target_row:
         # Suffix match
-        for r in db.query(BOLRecord).all():
+        for r in db.query(BOLRecord).filter(BOLRecord.is_dismissed.is_(False)).all():
             trip = r.technique_trip or ""
             if trip and trip.split("_")[-1].lstrip("0") == target_str.lstrip("0"):
                 target_row = r
@@ -771,6 +868,9 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
     src_alg_weight = source_row.alg_weight
     src_alg_pallets = source_row.alg_pallets
     src_alg_pcs = source_row.alg_pcs
+    src_inv_job_number = source_row.inv_job_number
+    src_invoice_email_sender = source_row.invoice_email_sender
+    src_invoice_sent_at = source_row.invoice_sent_at
 
     if action == "merge":
         target_row.invoice_number = _merge_nums_db(target_inv, src_inv)
@@ -781,33 +881,47 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
             target_row.alg_weight = src_alg_weight
             target_row.alg_pallets = src_alg_pallets
             target_row.alg_pcs = src_alg_pcs
+            target_row.inv_job_number = src_inv_job_number
+            target_row.invoice_email_sender = src_invoice_email_sender
+            target_row.invoice_sent_at = src_invoice_sent_at
     elif action == "replace":
         target_row.invoice_number = src_inv
         target_row.amount = src_amount
         target_row.alg_weight = src_alg_weight
         target_row.alg_pallets = src_alg_pallets
         target_row.alg_pcs = src_alg_pcs
+        target_row.inv_job_number = src_inv_job_number
+        target_row.invoice_email_sender = src_invoice_email_sender
+        target_row.invoice_sent_at = src_invoice_sent_at
 
-    if target_row.amount and target_row.access_prog:
-        target_row.cost_pct = Decimal(str(round(
-            float(target_row.amount) / float(target_row.access_prog), 6
-        )))
+    # Recompute Calculated Cost + Cost % for the manifest the invoice now actually lives
+    # on (2026-07-22 fix) — previously this only recomputed cost_pct from whatever
+    # access_prog the target already had, which is null for an unmatched sibling (Calc
+    # Cost is only ever computed once a manifest actually has an invoice), so a
+    # reassigned record could show a blank/stale Calculated Cost and Cost % indefinitely.
+    # Same re-parse-the-invoice-CSV approach POST /api/admin/recompute-access-prog uses.
+    _recompute_access_prog_for_record(target_row, settings.INVOICE_FOLDER)
+    # Diffs need to be against target_row's OWN technique_weight/pallets/pcs — never
+    # recomputed here before this fix, so ΔWgt/ΔPal/ΔPcs on the dashboard stayed at
+    # whatever the target had before the reassignment (usually null).
+    _compute_diffs(target_row)
     target_row.updated_at = datetime.now(timezone.utc)
 
     is_stub = source_row.technique_trip is None
     if is_stub:
         db.delete(source_row)
     else:
-        source_row.invoice_number = None
-        source_row.amount = None
-        source_row.cost_pct = None
-        source_row.alg_weight = None
-        source_row.alg_pallets = None
-        source_row.alg_pcs = None
-        source_row.weight_diff = None
-        source_row.pallet_diff = None
-        source_row.pcs_diff = None
-        source_row.inv_job_number = None
+        # Comprehensive clear (2026-07-22) — previously left access_prog/base_tariff/
+        # fsc_pct/alg_fsc_pct/alg_fsc_cost/cost_calc_detail/match_strategy/
+        # invoice_email_sender/invoice_sent_at/carrier stale on the source after its
+        # invoice moved elsewhere, none of which made sense once the record had no
+        # invoice. Does NOT touch notes/flag_reason — Katie's own annotations,
+        # independent of which invoice happens to be attached.
+        for field in _REASSIGN_SOURCE_CLEAR_FIELDS:
+            setattr(source_row, field, None)
+        source_row.tariff_zone_approximate = False
+        source_row.weight_source_fallback = False
+        source_row.min_charge_uncertain = False
         source_row.updated_at = datetime.now(timezone.utc)
 
     db.commit()
@@ -836,7 +950,9 @@ def get_trip_manifests(record_id: str, db: Session = Depends(get_db)):
         trip = source_row.technique_trip
         if not trip:
             raise HTTPException(status_code=400, detail="This record has no technique_trip to compare siblings for")
-        siblings = db.query(BOLRecord).filter(BOLRecord.technique_trip == trip).all()
+        siblings = db.query(BOLRecord).filter(
+            BOLRecord.technique_trip == trip, BOLRecord.is_dismissed.is_(False),
+        ).all()
         source = source_row
 
     reference = source if _cget(source, "invoice_number") else next(
@@ -885,7 +1001,7 @@ def update_notes(
     body: dict,
     db: Session = Depends(get_db),
 ):
-    """Update the notes field for a record. Called on auto-save from the dashboard."""
+    """Update the notes field for a record. Called from the dashboard's Notes modal (Save button)."""
     notes = body.get("notes") or None
 
     if settings.USE_MOCK_DATA:
@@ -910,6 +1026,17 @@ _INVOICE_FIELDS_TO_NULL = [
     "match_strategy", "weight_diff", "pallet_diff", "pcs_diff", "notes", "flag_reason",
 ]
 _INVOICE_FIELDS_TO_FALSE = ["tariff_zone_approximate", "weight_source_fallback", "min_charge_uncertain"]
+
+# Same idea as _INVOICE_FIELDS_TO_NULL, but scoped to reassign_invoice()'s source-clearing
+# (2026-07-22) rather than the dev-only reset-invoices wipe -- deliberately excludes
+# notes/flag_reason, which are Katie's own manual annotations, not derived from whichever
+# invoice happens to be attached, and shouldn't be wiped just because one moved elsewhere.
+_REASSIGN_SOURCE_CLEAR_FIELDS = [
+    "invoice_number", "invoice_email_sender", "invoice_sent_at", "inv_job_number", "carrier",
+    "alg_weight", "alg_pallets", "alg_pcs",
+    "access_prog", "amount", "cost_pct", "base_tariff", "fsc_pct", "alg_fsc_pct", "alg_fsc_cost",
+    "match_strategy", "weight_diff", "pallet_diff", "pcs_diff", "cost_calc_detail",
+]
 
 
 @app.post("/api/admin/reset-invoices", tags=["Admin"])
@@ -1000,8 +1127,9 @@ def _apply_bol_status(row: "BOLRecord", technique_row: dict) -> None:
     Set bol_number/needs_sid_export from a Technique/ShipperPlus query row's
     load_id/pooled_to_load_id. Type A (no BOL yet, needs_sid_export=True) vs
     Type B (load_id/pooled_to_load_id > 0 — a BOL already exists in Prophecy).
-    Shared by the bulk pull (pull_technique_data) and the per-record BOL check
-    (POST /api/bols/{id}/refresh-bol) so both apply identical logic.
+    Used by the per-record BOL check (POST /api/bols/{id}/refresh-bol). Also used by
+    the daily bulk pull (POST /api/admin/pull) until that route was removed 2026-07-22
+    in favor of the per-invoice automatic matching in _process_invoice_csv()/retry-match.
     """
     load_id = technique_row.get("load_id") or 0
     pooled_id = technique_row.get("pooled_to_load_id") or 0
@@ -1160,10 +1288,11 @@ def _manifest_to_suffix(manifest: str) -> str:
 def _create_technique_record_from_fallback(db: Session, m: dict, weight_data: dict) -> "BOLRecord":
     """
     Create a brand-new BOLRecord for a manifest found only via a wide-window Technique
-    fallback query (see the invoice_only stub fallback in pull_technique_data() and
-    POST /api/bols/{id}/retry-match) — deliberately separate from the main daily pull's
-    per-manifest upsert, which has wipe-on-existing semantics that don't apply here:
-    this only ever fires for a manifest we've never seen before.
+    fallback query (see POST /api/bols/{id}/retry-match, called automatically by the
+    frontend right after a new invoice_only stub is created — see _process_invoice_csv())
+    — deliberately separate from the old daily bulk pull's per-manifest upsert (removed
+    2026-07-22), which had wipe-on-existing semantics that don't apply here: this only
+    ever fires for a manifest we've never seen before.
     """
     row = BOLRecord(status=BOLStatus.PENDING)
     db.add(row)
@@ -1180,250 +1309,6 @@ def _create_technique_record_from_fallback(db: Session, m: dict, weight_data: di
     if proph_pcs:
         row.prophecy_pcs = proph_pcs
     return row
-
-
-@app.post("/api/admin/pull", tags=["Admin"])
-def pull_technique_data(db: Session = Depends(get_db)):
-    """
-    Morning data pull: fetch real Technique manifests from AWP-SQL-PROD and
-    upsert into bol_records. Invoice fields are left null when MOCK_INVOICES=True.
-
-    Pulls the last 20 days of Technique manifests on every call. Existing records
-    (matched on technique_trip + manifest) are refreshed with the latest
-    technique-side data (weight/pallets/pcs, BOL status) but never lose invoice
-    matches, approvals, or flags -- safe to re-run any time. Use
-    POST /api/admin/reset-invoices for a deliberate invoice-data reset.
-
-    Call this once each morning (or via the dashboard Pull Manifests button).
-    Not available in mock mode.
-    """
-    if settings.USE_MOCK_DATA:
-        raise HTTPException(
-            status_code=400,
-            detail="Pull endpoint is disabled in mock mode. Set USE_MOCK_DATA=False in .env.",
-        )
-
-    from backend.data_layer import get_technique_data, get_manifest_weights
-
-    days_back = 20
-
-    # Dedup: the SQL query can return multiple rows for the same manifest when
-    # pooled_to_load_id/load_id/TranType differ pallet-to-pallet — see
-    # _select_canonical_technique_row() for the tie-break rule.
-    manifests = _dedupe_technique_rows(get_technique_data(days_back=days_back))
-
-    manifest_numbers = [m["manifest"] for m in manifests if m.get("manifest")]
-    weights_by_manifest = get_manifest_weights(manifest_numbers) if manifest_numbers else {}
-
-    # A trip with more than one manifest in this pull is ambiguous — Technique doesn't
-    # reliably tell us which manifest is the real billable one (see is_ambiguous_trip
-    # on BOLRecord). Recomputed fresh on every pull, same lifecycle as technique_weight.
-    trip_manifest_counts: dict[str, int] = {}
-    for m in manifests:
-        if m.get("technique_trip"):
-            trip_manifest_counts[m["technique_trip"]] = trip_manifest_counts.get(m["technique_trip"], 0) + 1
-
-    loaded = 0
-    for m in manifests:
-        manifest_num = m.get("manifest")
-        weight_data = weights_by_manifest.get(manifest_num, {})
-
-        # Upsert: match on technique_trip + manifest to avoid duplicates on re-pull
-        existing = (
-            db.query(BOLRecord)
-            .filter(
-                BOLRecord.technique_trip == m["technique_trip"],
-                BOLRecord.manifest == manifest_num,
-            )
-            .first()
-        )
-
-        if existing:
-            # Re-pull only refreshes technique-side fields below (weight/pallets/
-            # pcs, BOL status) -- invoice matches, approvals, and flags are
-            # deliberately left untouched. Safe with a 20-day window where the
-            # same manifest legitimately reappears on every subsequent pull.
-            row = existing
-        else:
-            row = BOLRecord()
-            db.add(row)
-
-        row.technique_trip = m["technique_trip"]
-        row.manifest = manifest_num
-        # Weight, pallets, and PCS come exclusively from Query B (VisualMail) — no fallback to Query A
-        row.technique_weight   = weight_data.get("technique_weight", 0)
-        row.technique_pallets  = weight_data.get("technique_pallets", 0)
-        row.technique_pcs      = weight_data.get("technique_pcs", 0)
-        if not weight_data:
-            _append_note_to(row, _NO_ACTIVE_PALLET_DATA_NOTE)
-        # access_prog is computed at invoice upload time (per-pallet ZIP from ALG CSV) — not at pull time
-
-        row.is_ambiguous_trip = trip_manifest_counts.get(m["technique_trip"], 0) > 1
-
-        # Type A = no load yet (needs SID export to Prophecy to create BOL)
-        # Type B = load_id > 0 (BOL already exists in Prophecy/ShipperPlus; store it)
-        _apply_bol_status(row, m)
-
-        # Re-pull refreshes technique_weight/pallets/pcs above — recompute the
-        # diffs against ALG's invoiced quantities so they don't go stale
-        # relative to the just-refreshed technique-side numbers.
-        _compute_diffs(row)
-
-        # Prophecy pieces from Query A (ShipperPlus join) — save if non-zero
-        proph_pcs = m.get("prophecy_pcs") or 0
-        if proph_pcs:
-            row.prophecy_pcs = proph_pcs
-
-        if existing is None:
-            row.status = BOLStatus.PENDING
-
-        loaded += 1
-
-    db.commit()
-    logger.info("[PULL] Loaded %d records (days_back=%d)", loaded, days_back)
-
-    # Shared by the stub-resolution pass below (_finish_resolving_stub call) — lazy,
-    # not computed until a stub actually resolves (2026-07-20: this was previously
-    # fetched unconditionally on every pull, even when zero stubs existed or none of
-    # them matched anything. get_current_diesel_price() is an external EIA API call
-    # from inside this VPC and measured ~10s+ in live testing — the exact same cost
-    # _process_invoice_csv() already deliberately avoids when an invoice's own CSV has
-    # a usable FSC rate, see its "don't burn time on the EIA fallback lookup" comment.
-    # _finish_resolving_stub() only uses this as a fallback if the record's own invoice
-    # CSV doesn't have one, so most calls never need it at all.)
-    from backend.data_layer import get_tariff_rate as _get_tariff_rate
-    from backend.data_layer import get_current_diesel_price, get_fsc_rate as _get_fsc_rate
-    _diesel_cache: dict = {}
-
-    def _get_diesel_and_fsc():
-        if "diesel_price" not in _diesel_cache:
-            _diesel_cache["diesel_price"] = get_current_diesel_price()
-            _diesel_cache["fsc_pct"] = (
-                _get_fsc_rate(_diesel_cache["diesel_price"]) if _diesel_cache["diesel_price"] is not None else None
-            )
-        return _diesel_cache["diesel_price"], _diesel_cache["fsc_pct"]
-
-    # NOTE: stub re-matching and the wide fallback below intentionally run even when
-    # `loaded == 0` (no new manifests today) — a day with nothing new despatched is
-    # exactly when a stuck invoice_only stub from days ago most needs a chance to
-    # resolve. Returning early here used to skip both unconditionally.
-
-    # --- Re-match existing invoice_only stubs against newly loaded manifests ---
-    stubs = db.query(BOLRecord).filter(BOLRecord.match_strategy == "invoice_only").all()
-    rematched = 0
-    for stub in stubs:
-        job_name_s = stub.inv_job_number or ""
-        if not job_name_s:
-            continue
-
-        technique_recs = db.query(BOLRecord).filter(
-            BOLRecord.technique_trip.isnot(None),
-            BOLRecord.match_strategy != "invoice_only",
-            BOLRecord.invoice_number.is_(None),
-        ).all()
-
-        match_rec = None
-        match_strat = None
-
-        # Strategy 1: trip suffix → job name — score candidates by closeness to the
-        # stub's own ALG-billed quantities instead of taking whichever the query
-        # happened to return first (was previously non-deterministic when a suffix
-        # had multiple committed candidates). These are already-committed records
-        # from this same pull, so their technique_weight/pallets/pcs are already
-        # Query B-sourced — no extra query needed.
-        suffix_candidates = [
-            c for c in technique_recs
-            if c.technique_trip and _trip_to_suffix(c.technique_trip) == job_name_s
-        ]
-        if len(suffix_candidates) == 1:
-            match_rec = suffix_candidates[0]
-            match_strat = "job_name"
-        elif len(suffix_candidates) > 1:
-            match_rec, score = _closest_technique_match(
-                suffix_candidates, float(stub.alg_weight or 0), stub.alg_pallets or 0, stub.alg_pcs or 0,
-            )
-            match_strat = "job_name"
-            if score > _CLOSE_MATCH_THRESHOLD:
-                _append_note_to(
-                    match_rec,
-                    f"Matched via closest-quantity heuristic among {len(suffix_candidates)} "
-                    f"candidates sharing trip suffix '{job_name_s}' during stub re-match "
-                    f"(discrepancy score {score:.2f}) — verify manually.",
-                )
-                logger.warning(
-                    "[PULL RE-MATCH] %s -> closest match among %d candidates on trip suffix '%s' "
-                    "still has a large discrepancy (score=%.3f) - verify manually",
-                    stub.invoice_number, len(suffix_candidates), job_name_s, score,
-                )
-
-        # Strategy 2: BOL number → job name (non-comingle only)
-        if match_rec is None and "Comingle" not in (stub.notes or ""):
-            try:
-                bol_num = int(job_name_s)
-                match_rec = db.query(BOLRecord).filter(
-                    BOLRecord.bol_number == bol_num,
-                    BOLRecord.match_strategy != "invoice_only",
-                ).first()
-                if match_rec:
-                    match_strat = "bol_number"
-            except (ValueError, TypeError):
-                pass
-
-        # Strategy 3: pallets + pieces (last resort, non-comingle only)
-        if match_rec is None and "Comingle" not in (stub.notes or "") and stub.alg_pallets and stub.alg_pcs:
-            candidates = [
-                c for c in technique_recs
-                if c.technique_pallets == stub.alg_pallets and c.technique_pcs == stub.alg_pcs
-            ]
-            if len(candidates) == 1:
-                match_rec = candidates[0]
-                match_strat = "pallets_pieces"
-                logger.warning("[PULL RE-MATCH] Strategy pallets+pieces matched %s to %s — verify manually",
-                               stub.invoice_number, match_rec.technique_trip)
-
-        if match_rec is None:
-            continue
-
-        match_rec.invoice_number = stub.invoice_number
-        match_rec.inv_job_number  = stub.inv_job_number
-        match_rec.amount          = stub.amount
-        match_rec.alg_weight      = stub.alg_weight
-        match_rec.alg_pallets     = stub.alg_pallets
-        match_rec.alg_pcs         = stub.alg_pcs
-        match_rec.match_strategy  = match_strat
-        _diesel_price, _fsc_pct = _get_diesel_and_fsc()
-        _finish_resolving_stub(
-            match_rec, stub.invoice_email_sender, stub.invoice_sent_at, settings.INVOICE_FOLDER,
-            _get_tariff_rate, _diesel_price, _fsc_pct,
-        )
-        _compute_diffs(match_rec)
-        db.delete(stub)
-        rematched += 1
-
-    if rematched:
-        db.commit()
-        logger.info("[PULL] Re-matched %d invoice_only stub(s) to newly loaded manifests", rematched)
-
-    # NOTE (2026-07-20): a bulk wide-window (90-day, briefly 40-day) live Technique
-    # sweep over every remaining invoice_only stub used to run here. Stacked onto this
-    # route's own main-pull live query in the same request, it reliably pushed this
-    # endpoint past API Gateway's hard 30s integration timeout whenever any stub
-    # existed (confirmed live post-deploy: main pull ~15s + wide fallback ~13s+ = at
-    # or past the ceiling) — and no day-count narrowing reliably fixed it, since a
-    # cold Lambda/Aurora start can alone eat most of the 30s before either query even
-    # starts. Moved to _process_invoice_csv() instead: the wide search now runs once,
-    # per newly-unmatched invoice, at upload/poll-folder time — its own request, its
-    # own budget, isolated from the daily pull. See _wide_fallback_technique_search().
-
-    msg = f"Loaded {loaded} manifest(s)."
-    if rematched:
-        msg += f" Re-matched {rematched} invoice stub(s)."
-    return {
-        "records_loaded": loaded,
-        "rematched": rematched,
-        "date": date.today().isoformat(),
-        "message": msg,
-    }
 
 
 @app.post("/api/admin/refetch-bols", tags=["Admin"])
@@ -2259,10 +2144,11 @@ def _finish_resolving_stub(
     Common cleanup after a code path attaches a resolved invoice_only stub's data onto
     a real Technique record OUTSIDE the main upload flow (_apply_invoice_match() already
     does both of these inline, as part of parsing the invoice CSV for the first time).
-    Used by pull_technique_data()'s DB-side stub re-match and wide-window fallback, and
-    by POST /api/bols/{id}/retry-match -- all three previously left invoice_email_sender/
-    invoice_sent_at blank and never computed access_prog/cost_pct, since they only ever
-    copied invoice_number/amount/alg_* onto the resolved record.
+    Used by POST /api/bols/{id}/retry-match (the only caller since the old daily bulk
+    pull's DB-side stub re-match was removed 2026-07-22 along with the rest of that
+    route) -- this used to leave invoice_email_sender/invoice_sent_at blank and never
+    compute access_prog/cost_pct, since it only copied invoice_number/amount/alg_*
+    onto the resolved record.
 
     1. Copies invoice_email_sender/invoice_sent_at from the stub being consumed (rec
        itself never had them -- it's either a brand-new fallback record or an existing
@@ -2427,43 +2313,47 @@ def _flag_if_resolved_match_looks_wrong(
 
 def _wide_fallback_technique_search(
     job_name: str, alg_weight: "float | None", alg_pallets: "int | None", alg_pcs: "int | None",
-    days_back: int = 90,
-) -> "dict | None":
+    days_back: int = 90, query_timeout: "int | None" = 15,
+) -> "tuple[dict | None, list[dict]]":
     """
     Live Technique search across `days_back` days (default 90) for a trip or manifest
     whose suffix matches job_name — the same two-tier trip-then-manifest suffix logic
     as the normal-window match in _process_invoice_csv() (strategies 2/2b), just
-    against a much wider date range. Called from _process_invoice_csv() (2026-07-20)
-    only once an invoice has found nothing at all in the already-pulled DB data —
-    i.e. right before it would otherwise become an invoice_only stub — so a real but
-    not-yet-pulled trip (or one whose despatch date lags the normal 20-day pull
-    window) still matches immediately instead of waiting for a bulk sweep.
+    against a much wider date range.
 
-    This logic used to run as a bulk sweep over every remaining stub inside
-    pull_technique_data() itself; moved here because stacking it onto that route's
-    own live pull reliably exceeded API Gateway's 30s timeout (see the removal note
-    in pull_technique_data()). Run once per newly-unmatched invoice instead, it has
-    this request's own budget to itself.
+    Shared by two callers with different budget constraints (2026-07-22): the
+    on-demand retry-match route (POST /api/bols/{id}/retry-match), which has this
+    request's full ~29s ceiling to itself and passes query_timeout=None, and the
+    frontend's automatic follow-up call to that same route right after an invoice
+    upload creates a stub — also its own isolated request, also uncapped. Nothing
+    calls this function with anything left over in the same request anymore (the
+    upload-time inline call was removed 2026-07-22 — see _process_invoice_csv() —
+    because sharing a request's budget with everything else already done in that
+    request was the actual root cause of invoices that matched instantly on manual
+    retry but not on upload). query_timeout stays parameterized (default 15) rather
+    than deleted outright in case a future caller ever needs to share a budget again.
 
-    Returns the best-matching manifest dict (as returned by get_technique_data()),
-    or None if nothing matches even in the wide window.
+    Returns (best, all_candidates) — best is the winning manifest dict (as returned by
+    get_technique_data(), with technique_weight/pallets/pcs populated), or None if
+    nothing matches even in the wide window. all_candidates is every manifest that
+    shared the search suffix (best included, weights populated on all of them, empty
+    if best is None) — retry_match_invoice() uses this to persist the losing siblings
+    of an ambiguous trip as their own records (2026-07-22), not just the winner, since
+    nothing else populates them now that the old daily bulk pull is gone (see its
+    removal note) — without this, GET /api/bols/{id}/trip-manifests and reassign-invoice
+    would have no sibling data to compare/reassign against.
     """
     from backend.data_layer import get_technique_data, get_manifest_weights
 
-    # 15s query cap here specifically -- this search runs inside an invoice
-    # upload/poll request that's already done other work, so it needs to leave
-    # room in Lambda's 29s wall (8s connect + 15s query = 23s, some margin left).
-    # Not the default for get_technique_data()/get_manifest_weights() in general --
-    # see _get_connection()'s query_timeout docstring.
     try:
         wide_manifests = _dedupe_technique_rows(
-            get_technique_data(days_back=days_back, query_timeout=15)
+            get_technique_data(days_back=days_back, query_timeout=query_timeout)
         )
 
-        # Same "how many manifests does this trip have" count pull_technique_data() computes
-        # for is_ambiguous_trip -- records created via this wide fallback previously never set
-        # it at all (always defaulted False), so a genuinely ambiguous trip found only here
-        # could never show the ~UNVERIFIED badge.
+        # Same "how many manifests does this trip have" count is_ambiguous_trip is based
+        # on everywhere else -- records created via this wide fallback previously never
+        # set it at all (always defaulted False), so a genuinely ambiguous trip found only
+        # here could never show the ~UNVERIFIED badge.
         trip_manifest_counts: dict[str, int] = {}
         for m in wide_manifests:
             if m.get("technique_trip"):
@@ -2479,14 +2369,16 @@ def _wide_fallback_technique_search(
 
         candidates = by_trip_suffix.get(job_name) or by_manifest_suffix.get(job_name) or []
         if not candidates:
-            return None
+            return None, []
         if len(candidates) == 1:
             candidates[0]["_trip_manifest_count"] = trip_manifest_counts.get(candidates[0].get("technique_trip"), 0)
-            return candidates[0]
+            return candidates[0], candidates
 
         # Multiple manifests share this suffix in the wide window — score by closeness
         # to the invoice's own billed quantities instead of taking an arbitrary one.
-        score_weights = get_manifest_weights([c["manifest"] for c in candidates], query_timeout=15)
+        # Weights are populated on every candidate here (not just the winner) so the
+        # caller can persist siblings with real technique_weight/pallets/pcs too.
+        score_weights = get_manifest_weights([c["manifest"] for c in candidates], query_timeout=query_timeout)
         for c in candidates:
             wd = score_weights.get(c["manifest"], {})
             c["technique_weight"]  = wd.get("technique_weight", 0)
@@ -2499,21 +2391,25 @@ def _wide_fallback_technique_search(
                 "still has a large discrepancy (score=%.3f) - verify manually",
                 len(candidates), job_name, score,
             )
-        best["_trip_manifest_count"] = trip_manifest_counts.get(best.get("technique_trip"), 0)
-        return best
+        trip_count = trip_manifest_counts.get(best.get("technique_trip"), 0)
+        for c in candidates:
+            c["_trip_manifest_count"] = trip_count
+        return best, candidates
     except Exception as exc:
         # A hung/slow on-prem query here used to guarantee an ungraceful Lambda kill
         # (bare HTTP 500, no traceback -- confirmed 2026-07-21 via CloudWatch on a real
         # invoice upload) since nothing caught it. Treat any failure the same as "no
-        # match in the wide window either" -- the caller already handles a None return
-        # by falling through to a normal invoice_only stub, which can still resolve on
-        # a later pull's DB-side re-match pass.
+        # match in the wide window either" -- retry_match_invoice() already handles a
+        # None return by reporting "not found" rather than propagating the failure, and
+        # the stub it was called on is left untouched, so a later manual retry (or the
+        # next automatic one, if this was called from the frontend's post-upload retry)
+        # can simply try again.
         logger.warning(
             "[INVOICE WIDE FALLBACK] live Technique search failed for suffix '%s' "
             "(days_back=%d): %s — treating as no match.",
             job_name, days_back, exc,
         )
-        return None
+        return None, []
 
 
 def _apply_invoice_match(
@@ -3035,30 +2931,16 @@ def _process_invoice_csv(
                 logger.warning("[INVOICE] pallets+pieces matched %s to %s — verify manually",
                                invoice_no, matched_rec.technique_trip)
 
-    # 4b. Wide live fallback (2026-07-20): nothing in our already-pulled DB data matched
-    # this invoice at all — before giving up and creating an invoice_only stub, check
-    # live Technique data across a much wider window. Catches a real trip/manifest whose
-    # despatch date just falls outside the daily pull's normal 20-day window (an ALG
-    # invoice batch can lag well over 3 weeks behind despatch). Skipped for Wolf/311
-    # (Job Name is a Prophecy BOL, not a trip/manifest suffix — nothing to search for)
-    # and comingle invoices (no Technique record ever exists for these by design).
-    if (
-        matched_rec is None and job_name
-        and not effective_prophecy_bol
-        and not (cust_job_no or "").upper().startswith("CM")
-        and not settings.USE_MOCK_DATA
-    ):
-        wide_match = _wide_fallback_technique_search(job_name, total_weight, total_pallets, total_pcs)
-        if wide_match is not None:
-            from backend.data_layer import get_manifest_weights
-            weight_data = get_manifest_weights([wide_match["manifest"]]).get(wide_match["manifest"], {})
-            matched_rec = _create_technique_record_from_fallback(db, wide_match, weight_data)
-            match_strategy = "job_name"
-            logger.info(
-                "[INVOICE] %s -> matched via wide (90-day) live fallback on suffix '%s' "
-                "(no match in already-pulled data)",
-                invoice_no, job_name,
-            )
+    # Note (2026-07-22): a live 90-day wide-fallback search used to run inline here
+    # (step 4b) before giving up and creating a stub — removed because sharing this
+    # request's budget with everything already done in it (CSV parsing, and for a
+    # folder/email batch, every prior invoice in the same request) was the actual
+    # root cause of invoices that matched instantly on a manual retry-match click but
+    # not on upload. Every non-instant miss now becomes a stub immediately (below),
+    # and the frontend fires an automatic POST /api/bols/{id}/retry-match — the same
+    # wide search, in its own isolated request with the full budget to itself — right
+    # after the upload/poll response comes back. See _wide_fallback_technique_search()
+    # and retry_match_invoice().
 
     if matched_rec is None:
         is_wolf_stub = bool(effective_prophecy_bol)
@@ -3167,8 +3049,10 @@ def _process_invoice_csv(
             "[INVOICE] %s → no match, stub created (bol=%s, note=%s)",
             invoice_no, stub_bol_number, auto_note,
         )
+        stub_record = _mock_state[stub_id] if settings.USE_MOCK_DATA else stub
         return {
             "matched": is_wolf_stub,
+            "record_id": str(_cget(stub_record, "id")),
             "invoice_number": invoice_no,
             "job_name": job_name,
             "alg_bol_no": alg_bol_no,
@@ -3246,6 +3130,7 @@ def _process_invoice_csv(
     )
     return {
         "matched": True,
+        "record_id": str(_cget(matched_rec, "id")),
         "invoice_number": invoice_no,
         "job_name": job_name,
         "alg_bol_no": alg_bol_no,
@@ -3662,17 +3547,88 @@ def recompute_diffs(db: Session = Depends(get_db)):
     return {"records_checked": checked}
 
 
+def _recompute_access_prog_for_record(rec: "BOLRecord", folder: "str | None") -> str:
+    """
+    Re-locate and re-parse `rec`'s own invoice CSV to recompute access_prog/cost_pct/
+    cost_calc_detail. ALG's per-zone rate/FSC context isn't stored anywhere else — only
+    parsed transiently from the invoice CSV — so there's no way to redo this math without
+    the original file. Extracted 2026-07-22 from recompute_access_prog() (its original,
+    single-purpose caller) to share with reassign_invoice(), which has the exact same
+    problem when an invoice moves to a different manifest: the new manifest's access_prog
+    was never being computed at all, only cost_pct naively recomputed from whatever stale
+    (usually null) access_prog the manifest already had.
+
+    Diesel price is fetched lazily, only if this invoice's own CSV has no FSC rate — same
+    "don't burn time on the EIA fallback lookup" pattern _process_invoice_csv() uses,
+    important here since reassign_invoice() calls this inline in a user-facing request.
+
+    Returns "ok", "no_file" (folder unset/missing, record has no invoice, or its CSV
+    can't be found), or "no_own_data" (file found, but _apply_access_prog_calc() still
+    couldn't compute a cost — e.g. no live pallet data for this manifest). Mutates `rec`
+    in place; caller is responsible for db.commit().
+    """
+    if not rec.invoice_number or not folder or not os.path.isdir(folder):
+        return "no_file"
+    hit = _find_invoice_file(folder, rec.invoice_number, require_csv=True)
+    if hit is None:
+        return "no_file"
+    path, _media_type = hit
+    try:
+        with open(path, "rb") as f:
+            content = f.read()
+    except OSError:
+        return "no_file"
+
+    reader = csv.DictReader(io.StringIO(content.decode("utf-8", errors="replace")))
+    ctx = _parse_alg_csv_context(reader)
+
+    from backend.data_layer import get_tariff_rate as _get_tariff_rate
+    from backend.data_layer import get_current_diesel_price, get_fsc_rate as _get_fsc_rate
+    if ctx["fsc_rate_val"] is not None:
+        _diesel_price = None
+        _fsc_pct = None
+    else:
+        _diesel_price = get_current_diesel_price()
+        _fsc_pct = _get_fsc_rate(_diesel_price) if _diesel_price is not None else None
+
+    # See _finish_resolving_stub()'s identical fix: stored match_strategy can go
+    # stale (silently overwritten pre-2026-07-20), so route on manifest/bol_number
+    # structurally instead of trusting the stored classification. Without this, a
+    # corrupted row here doesn't just skip -- _apply_access_prog_calc() finds no
+    # own pallet data via either path and sets rec.access_prog to None in place,
+    # which the caller's db.commit() would persist, silently wiping a previously-
+    # correct value (not merely a no-op skip).
+    effective_prophecy_bol = str(rec.bol_number) if not rec.manifest and rec.bol_number else None
+    _blended = (
+        round(ctx["alg_freight_total"] / (ctx["total_weight"] / 100.0), 4)
+        if ctx.get("alg_freight_total") and ctx.get("total_weight") else None
+    )
+    _cost_detail: list = []
+    _apply_access_prog_calc(
+        rec, rec.match_strategy, effective_prophecy_bol,
+        ctx["alg_rate_by_zip3"], ctx["fsc_rate_val"], ctx["fsc_cost_val"],
+        _get_tariff_rate, _diesel_price, _fsc_pct,
+        alg_blended_rate=_blended,
+        alg_min_charge_by_zip3=ctx.get("alg_min_charge_by_zip3"),
+        detail=_cost_detail,
+    )
+    if rec.access_prog is None:
+        return "no_own_data"
+    if _cost_detail:
+        rec.cost_calc_detail = json.dumps(_cost_detail)
+    if rec.amount and rec.access_prog:
+        rec.cost_pct = Decimal(str(round(float(rec.amount) / float(rec.access_prog), 6)))
+    return "ok"
+
+
 @app.post("/api/admin/recompute-access-prog", tags=["Admin"])
 def recompute_access_prog(db: Session = Depends(get_db)):
     """
     Backfill Calculated Cost (access_prog) for existing matched records using the
     corrected formula: our own weight/pallets/pieces x ALG's own invoiced per-zone rate.
-    ALG's per-zone rate/FSC context isn't stored anywhere — only parsed transiently from
-    each invoice's CSV on upload — so this re-locates each record's original file
-    (_find_invoice_file, require_csv=True) and re-parses it, then re-runs
-    _apply_access_prog_calc() with a fresh live query for our own pallet data. Records
-    whose original file can no longer be found, or for which we have no own pallet data
-    available, are left untouched and reported separately rather than guessed at.
+    Records whose original file can no longer be found, or for which we have no own
+    pallet data available, are left untouched and reported separately rather than
+    guessed at. See _recompute_access_prog_for_record() for the actual recompute logic.
     """
     if settings.USE_MOCK_DATA:
         raise HTTPException(status_code=400, detail="Not available in mock mode.")
@@ -3681,60 +3637,18 @@ def recompute_access_prog(db: Session = Depends(get_db)):
     if not folder or not os.path.isdir(folder):
         raise HTTPException(status_code=404, detail="INVOICE_FOLDER is not configured or does not exist.")
 
-    from backend.data_layer import get_tariff_rate as _get_tariff_rate
-    from backend.data_layer import get_current_diesel_price, get_fsc_rate as _get_fsc_rate
-    _diesel_price = get_current_diesel_price()
-    _fsc_pct = _get_fsc_rate(_diesel_price) if _diesel_price is not None else None
-
     fixed = 0
     skipped_no_file = 0
     skipped_no_own_data = 0
 
     for rec in db.query(BOLRecord).filter(BOLRecord.invoice_number.isnot(None)).all():
-        hit = _find_invoice_file(folder, rec.invoice_number, require_csv=True)
-        if hit is None:
+        result = _recompute_access_prog_for_record(rec, folder)
+        if result == "no_file":
             skipped_no_file += 1
-            continue
-        path, _media_type = hit
-        try:
-            with open(path, "rb") as f:
-                content = f.read()
-        except OSError:
-            skipped_no_file += 1
-            continue
-
-        reader = csv.DictReader(io.StringIO(content.decode("utf-8", errors="replace")))
-        ctx = _parse_alg_csv_context(reader)
-
-        # See _finish_resolving_stub()'s identical fix: stored match_strategy can go
-        # stale (silently overwritten pre-2026-07-20), so route on manifest/bol_number
-        # structurally instead of trusting the stored classification. Without this, a
-        # corrupted row here doesn't just skip -- _apply_access_prog_calc() finds no
-        # own pallet data via either path and sets rec.access_prog to None in place,
-        # which db.commit() below would persist, silently wiping a previously-correct
-        # value (not merely a no-op skip).
-        effective_prophecy_bol = str(rec.bol_number) if not rec.manifest and rec.bol_number else None
-        _blended = (
-            round(ctx["alg_freight_total"] / (ctx["total_weight"] / 100.0), 4)
-            if ctx.get("alg_freight_total") and ctx.get("total_weight") else None
-        )
-        _cost_detail: list = []
-        _apply_access_prog_calc(
-            rec, rec.match_strategy, effective_prophecy_bol,
-            ctx["alg_rate_by_zip3"], ctx["fsc_rate_val"], ctx["fsc_cost_val"],
-            _get_tariff_rate, _diesel_price, _fsc_pct,
-            alg_blended_rate=_blended,
-            alg_min_charge_by_zip3=ctx.get("alg_min_charge_by_zip3"),
-            detail=_cost_detail,
-        )
-        if rec.access_prog is None:
+        elif result == "no_own_data":
             skipped_no_own_data += 1
-            continue
-        if _cost_detail:
-            rec.cost_calc_detail = json.dumps(_cost_detail)
-        if rec.amount and rec.access_prog:
-            rec.cost_pct = Decimal(str(round(float(rec.amount) / float(rec.access_prog), 6)))
-        fixed += 1
+        else:
+            fixed += 1
 
     db.commit()
     logger.info(
@@ -4099,15 +4013,13 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
 def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     """
     On-demand retry for one stuck invoice_only stub: check a wide (90-day) Technique
-    window immediately instead of waiting for the next "Pull Manifests" click. Reuses
-    _create_technique_record_from_fallback()/_compute_diffs()/_finish_resolving_stub()
-    so this stays in sync with the automatic wide fallback in pull_technique_data() —
-    same search logic, just a single-record, on-demand version. Deliberately kept at
-    90 days rather than the 40-day window pull_technique_data() uses (2026-07-20): this
-    endpoint's live Technique query isn't stacked onto anything else in the same
-    request, so it has the full ~29s ceiling to itself and comfortably fits the 90-day
-    query alone (measured ~13s) — see the wide-fallback comment in pull_technique_data()
-    for why the bulk pull can't afford the same window.
+    window immediately. Shares _wide_fallback_technique_search() with the automatic
+    post-upload retry the frontend now fires right after every new stub is created
+    (see _process_invoice_csv()) — one search implementation instead of two that could
+    silently drift apart. query_timeout=None here (unlike the 15s cap used when this
+    search shares a request's budget with other work): this endpoint's live query isn't
+    stacked onto anything else in the same request, so it has the full ~29s ceiling to
+    itself and comfortably fits the 90-day query alone (measured ~13s).
     """
     if settings.USE_MOCK_DATA:
         raise HTTPException(status_code=400, detail="Retry-match is disabled in mock mode.")
@@ -4122,59 +4034,16 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     if not job_name_s:
         return {"matched": False, "message": "No job name on this invoice to match against."}
 
-    from backend.data_layer import get_technique_data, get_manifest_weights
-
-    manifests = _dedupe_technique_rows(get_technique_data(days_back=90))
-
-    # Same is_ambiguous_trip count pull_technique_data() computes -- retry-match creates
-    # records via _create_technique_record_from_fallback() too, which previously never
-    # set this at all (see the wide-fallback fix above).
-    trip_manifest_counts: dict[str, int] = {}
-    for m in manifests:
-        if m.get("technique_trip"):
-            trip_manifest_counts[m["technique_trip"]] = trip_manifest_counts.get(m["technique_trip"], 0) + 1
-
-    candidates = [m for m in manifests if _trip_to_suffix(m.get("technique_trip") or "") == job_name_s]
-    if not candidates:
-        # Fall back to manifest-suffix matching (issue #65) — Job Name may reflect the
-        # manifest number rather than the trip number; same fallback the main upload-time
-        # cascade now tries in _process_invoice_csv().
-        candidates = [m for m in manifests if _manifest_to_suffix(m.get("manifest") or "") == job_name_s]
-    if not candidates:
+    wide_match, all_candidates = _wide_fallback_technique_search(
+        job_name_s, float(stub.alg_weight or 0), stub.alg_pallets, stub.alg_pcs,
+        query_timeout=None,
+    )
+    if wide_match is None:
         return {"matched": False, "message": "Still not found in Technique (checked last 90 days)."}
 
-    loose_match_note: Optional[str] = None
-    if len(candidates) == 1:
-        match = candidates[0]
-        weight_data = get_manifest_weights([match["manifest"]]).get(match["manifest"], {})
-    else:
-        # Multiple candidates share this suffix — score by closeness to the stub's own
-        # ALG-invoiced quantities, same _closest_technique_match() logic the main
-        # upload-time cascade already uses, instead of blindly taking whichever the
-        # Technique query happened to return first.
-        weight_map = get_manifest_weights([c["manifest"] for c in candidates])
-        for c in candidates:
-            wd = weight_map.get(c["manifest"], {})
-            c["technique_weight"]  = wd.get("technique_weight", 0)
-            c["technique_pallets"] = wd.get("technique_pallets", 0)
-            c["technique_pcs"]     = wd.get("technique_pcs", 0)
-        match, score = _closest_technique_match(
-            candidates, float(stub.alg_weight or 0), stub.alg_pallets or 0, stub.alg_pcs or 0,
-        )
-        weight_data = weight_map.get(match["manifest"], {})
-        if score > _CLOSE_MATCH_THRESHOLD:
-            loose_match_note = (
-                f"Matched via closest-quantity heuristic among {len(candidates)} candidates "
-                f"sharing suffix '{job_name_s}' on retry (discrepancy score {score:.2f}) — verify manually."
-            )
-            logger.warning(
-                "[RETRY-MATCH] %s -> closest match among %d candidates '%s' still has a "
-                "large discrepancy (score=%.3f) - verify manually",
-                stub.invoice_number, len(candidates), job_name_s, score,
-            )
-
-    match["_trip_manifest_count"] = trip_manifest_counts.get(match.get("technique_trip"), 0)
-    row = _create_technique_record_from_fallback(db, match, weight_data)
+    from backend.data_layer import get_manifest_weights
+    weight_data = get_manifest_weights([wide_match["manifest"]]).get(wide_match["manifest"], {})
+    row = _create_technique_record_from_fallback(db, wide_match, weight_data)
     row.invoice_number = stub.invoice_number
     row.inv_job_number  = stub.inv_job_number
     row.amount          = stub.amount
@@ -4182,9 +4051,33 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     row.alg_pallets     = stub.alg_pallets
     row.alg_pcs         = stub.alg_pcs
     row.match_strategy  = "job_name"
-    if loose_match_note:
-        row.notes = f"{row.notes} {loose_match_note}" if row.notes else loose_match_note
     _compute_diffs(row)
+
+    # Persist this trip's other manifests too, going forward (2026-07-22) — nothing
+    # else creates them now that the old daily bulk pull is gone (removed in Phase 4),
+    # so without this, GET /api/bols/{id}/trip-manifests and reassign-invoice would
+    # have no sibling data to compare/reassign against on an ambiguous trip. Technique-
+    # side data only, no invoice — same shape a genuinely un-invoiced manifest gets.
+    siblings = [
+        c for c in all_candidates
+        if c.get("technique_trip") == wide_match.get("technique_trip")
+        and c.get("manifest") != wide_match.get("manifest")
+    ]
+    if siblings:
+        existing_manifests = {
+            m for (m,) in db.query(BOLRecord.manifest)
+            .filter(BOLRecord.technique_trip == wide_match["technique_trip"])
+            .all()
+        }
+        for sib in siblings:
+            if sib.get("manifest") in existing_manifests:
+                continue
+            sib_weight_data = {
+                "technique_weight": sib.get("technique_weight", 0),
+                "technique_pallets": sib.get("technique_pallets", 0),
+                "technique_pcs": sib.get("technique_pcs", 0),
+            }
+            _create_technique_record_from_fallback(db, sib, sib_weight_data)
 
     from backend.data_layer import get_tariff_rate as _get_tariff_rate
     from backend.data_layer import get_current_diesel_price, get_fsc_rate as _get_fsc_rate
@@ -4198,7 +4091,7 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     db.delete(stub)
     db.commit()
     logger.info("[RETRY-MATCH] Resolved stub %s → %s", stub.invoice_number, row.technique_trip)
-    return {"matched": True, "message": f"Matched to {row.technique_trip}."}
+    return {"matched": True, "matched_trip": row.technique_trip, "message": f"Matched to {row.technique_trip}."}
 
 
 @app.get("/api/logs", response_model=list[BOLSummary], tags=["Logs"])
