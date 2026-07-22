@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import useEdgeScroll from '../hooks/useEdgeScroll.js';
 
 const TH = {
   padding: '7px 10px',
@@ -88,6 +89,8 @@ export default function LogSection() {
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
   const [senderFilter, setSenderFilter] = useState('');
+  const scrollRef = useRef(null);
+  useEdgeScroll(scrollRef, !loading && records.length > 0);
 
   async function fetchLogs(sd, ed, sender) {
     setLoading(true);
@@ -221,7 +224,7 @@ export default function LogSection() {
           No records found for the selected date range.
         </div>
       ) : (
-        <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb' }}>
+        <div ref={scrollRef} style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
             <thead>
               <tr>

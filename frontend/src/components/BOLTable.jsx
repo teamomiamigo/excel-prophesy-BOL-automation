@@ -1,8 +1,6 @@
-import { useEffect, useRef } from 'react';
+import { useRef } from 'react';
 import BOLRow from './BOLRow.jsx';
-
-const EDGE_SCROLL_ZONE_PX = 140;
-const EDGE_SCROLL_SPEED_PX = 8;
+import useEdgeScroll from '../hooks/useEdgeScroll.js';
 
 const TH_STYLE = {
   padding: '8px 10px',
@@ -116,9 +114,9 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort 
 }
 
 export default function BOLTable({
-  bols, loading, approvingId, unflaggingId, markingThirdPartyId, markingDoNotPayId, exportingSidId, checkingBolId, retryingMatchId,
+  bols, loading, approvingId, unflaggingId, markingThirdPartyId, markingDoNotPayId, exportingSidId, checkingBolId, retryingMatchId, acknowledgingMismatchId,
   filterText, onFilterChange, selectedIds, onToggleSelect, onToggleSelectAll, sort, onSort,
-  onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onCompareOpen, onDoNotPay, onExportSid, onCheckBol, onRetryMatch,
+  onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onCompareOpen, onAcknowledgeMismatch, onDoNotPay, onExportSid, onCheckBol, onRetryMatch,
 }) {
   const lower = (filterText || '').toLowerCase();
   const matchesBol = b => !filterText || [
@@ -141,54 +139,7 @@ export default function BOLTable({
   const scrollRef = useRef(null);
   const tableRendered = !loading && totalVisible > 0;
 
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-
-    let velocity = 0;
-    let rafId = null;
-
-    const step = () => {
-      if (velocity !== 0) {
-        el.scrollLeft += velocity;
-        rafId = requestAnimationFrame(step);
-      } else {
-        rafId = null;
-      }
-    };
-
-    const handleMouseMove = e => {
-      if (el.scrollWidth <= el.clientWidth) {
-        velocity = 0;
-        return;
-      }
-      const rect = el.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      if (x < EDGE_SCROLL_ZONE_PX) {
-        velocity = -EDGE_SCROLL_SPEED_PX;
-      } else if (x > rect.width - EDGE_SCROLL_ZONE_PX) {
-        velocity = EDGE_SCROLL_SPEED_PX;
-      } else {
-        velocity = 0;
-      }
-      if (velocity !== 0 && rafId === null) {
-        rafId = requestAnimationFrame(step);
-      }
-    };
-
-    const handleMouseLeave = () => {
-      velocity = 0;
-    };
-
-    el.addEventListener('mousemove', handleMouseMove);
-    el.addEventListener('mouseleave', handleMouseLeave);
-
-    return () => {
-      el.removeEventListener('mousemove', handleMouseMove);
-      el.removeEventListener('mouseleave', handleMouseLeave);
-      if (rafId !== null) cancelAnimationFrame(rafId);
-    };
-  }, [tableRendered]);
+  useEdgeScroll(scrollRef, tableRendered);
 
   function rowProps(bol) {
     return {
@@ -201,6 +152,7 @@ export default function BOLTable({
       isExportingSid:      exportingSidId      === bol.id,
       isCheckingBol:       checkingBolId       === bol.id,
       isRetryingMatch:     retryingMatchId     === bol.id,
+      isAcknowledgingMismatch: acknowledgingMismatchId === bol.id,
       isSelected:          selectedIds.has(bol.id),
       onToggleSelect:      () => onToggleSelect(bol.id),
       onApprove:           () => onApprove(bol.id),
@@ -210,6 +162,7 @@ export default function BOLTable({
       onMarkThirdParty:    () => onMarkThirdParty(bol.id),
       onReassignOpen:      onReassignOpen,
       onCompareOpen:       onCompareOpen,
+      onAcknowledgeMismatch: () => onAcknowledgeMismatch(bol.id),
       onDoNotPay:          onDoNotPay,
       onExportSid:         () => onExportSid(bol.id),
       onCheckBol:          () => onCheckBol(bol.id),

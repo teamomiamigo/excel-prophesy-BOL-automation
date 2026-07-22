@@ -11,7 +11,7 @@ const CARD = {
   background: '#fff',
   borderRadius: 10,
   padding: '24px 28px',
-  width: 720,
+  width: 860,
   maxWidth: '95vw',
   maxHeight: '85vh',
   overflowY: 'auto',
@@ -66,12 +66,20 @@ function isAssignable(candidate, referenceId) {
   return candidate.id !== referenceId && !candidate.is_third_party;
 }
 
-export default function CompareManifestsModal({ bol, submitting, onClose, onReassign }) {
+// A candidate that can be dismissed as a bad/duplicate manifest — never the one
+// actually holding the invoice, and never one that already has its own real
+// invoice attached (that's a genuinely separate load, not junk data).
+function isDismissable(candidate, referenceId) {
+  return candidate.id !== referenceId && !candidate.invoice_number;
+}
+
+export default function CompareManifestsModal({ bol, submitting, onClose, onReassign, onDismiss }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState('');
   const [conflictRowId, setConflictRowId] = useState(null);
   const [conflictAction, setConflictAction] = useState(null); // 'merge' | 'replace' | null
+  const [dismissingId, setDismissingId] = useState(null);
 
   useEffect(() => {
     setData(null);
@@ -101,6 +109,18 @@ export default function CompareManifestsModal({ bol, submitting, onClose, onReas
       setConflictAction(null);
     } else {
       onReassign(data.reference_id, candidate.manifest, 'replace');
+    }
+  }
+
+  async function handleDelete(candidate) {
+    setDismissingId(candidate.id);
+    try {
+      const ok = await onDismiss(candidate.id);
+      if (ok) {
+        setData(prev => prev && { ...prev, candidates: prev.candidates.filter(c => c.id !== candidate.id) });
+      }
+    } finally {
+      setDismissingId(null);
     }
   }
 
@@ -160,6 +180,9 @@ export default function CompareManifestsModal({ bol, submitting, onClose, onReas
                   <th style={TH_R}>Weight</th>
                   <th style={TH_R}>Pallets</th>
                   <th style={TH_R}>Pcs</th>
+                  <th style={TH_R}>ΔWgt</th>
+                  <th style={TH_R}>ΔPal</th>
+                  <th style={TH_R}>ΔPcs</th>
                   <th style={TH_R}>Score</th>
                   <th style={TH}>Status</th>
                   <th style={TH}></th>
@@ -169,6 +192,14 @@ export default function CompareManifestsModal({ bol, submitting, onClose, onReas
                 {data.candidates.map(c => {
                   const isReference = c.id === data.reference_id;
                   const assignable = isAssignable(c, data.reference_id) && !!data.reference_id;
+                  const dismissable = isDismissable(c, data.reference_id);
+                  // Diffs match the main dashboard's convention: ALG (invoice) minus our
+                  // own Technique quantities. Only meaningful once an invoice has arrived.
+                  const diffStr = (algVal, techVal) => {
+                    if (algVal == null || techVal == null) return '—';
+                    const d = Math.round(parseFloat(algVal) - parseFloat(techVal));
+                    return d > 0 ? `+${d.toLocaleString('en-US')}` : d.toLocaleString('en-US');
+                  };
                   return (
                     <tr key={c.id} style={{ background: isReference ? '#eff6ff' : undefined, opacity: c.is_third_party ? 0.55 : 1 }}>
                       <td style={TD}>
@@ -182,6 +213,9 @@ export default function CompareManifestsModal({ bol, submitting, onClose, onReas
                       <td style={TD_R}>{numStr(c.technique_weight)}</td>
                       <td style={TD_R}>{numStr(c.technique_pallets)}</td>
                       <td style={TD_R}>{numStr(c.technique_pcs)}</td>
+                      <td style={{ ...TD_R, color: '#6b7280' }}>{diffStr(data.alg_weight, c.technique_weight)}</td>
+                      <td style={{ ...TD_R, color: '#6b7280' }}>{diffStr(data.alg_pallets, c.technique_pallets)}</td>
+                      <td style={{ ...TD_R, color: '#6b7280' }}>{diffStr(data.alg_pcs, c.technique_pcs)}</td>
                       <td style={TD_R}>
                         {c.score != null ? c.score.toFixed(2) : '—'}
                         {c.is_best_fit && !isReference && (
@@ -196,40 +230,52 @@ export default function CompareManifestsModal({ bol, submitting, onClose, onReas
                         {c.invoice_number && !isReference ? ` · has ${c.invoice_number}` : ''}
                       </td>
                       <td style={TD}>
-                        {assignable && (
-                          conflictRowId === c.id ? (
-                            <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                        <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                          {assignable && (
+                            conflictRowId === c.id ? (
+                              <>
+                                <button
+                                  style={{ ...BTN_BASE, background: conflictAction === 'merge' ? '#1e40af' : '#e5e7eb', color: conflictAction === 'merge' ? '#fff' : '#374151' }}
+                                  onClick={() => setConflictAction('merge')}
+                                >
+                                  Merge
+                                </button>
+                                <button
+                                  style={{ ...BTN_BASE, background: conflictAction === 'replace' ? '#dc2626' : '#e5e7eb', color: conflictAction === 'replace' ? '#fff' : '#374151' }}
+                                  onClick={() => setConflictAction('replace')}
+                                >
+                                  Replace
+                                </button>
+                                <button
+                                  style={{ ...BTN_BASE, background: conflictAction ? '#1e40af' : '#9ca3af', color: '#fff', opacity: submitting ? 0.7 : 1 }}
+                                  onClick={() => confirmConflict(c)}
+                                  disabled={!conflictAction || submitting}
+                                >
+                                  {submitting ? '…' : 'Confirm'}
+                                </button>
+                              </>
+                            ) : (
                               <button
-                                style={{ ...BTN_BASE, background: conflictAction === 'merge' ? '#1e40af' : '#e5e7eb', color: conflictAction === 'merge' ? '#fff' : '#374151' }}
-                                onClick={() => setConflictAction('merge')}
+                                style={{ ...BTN_BASE, background: '#eff6ff', color: '#1e40af', border: '1px solid #bfdbfe' }}
+                                onClick={() => startAssign(c)}
+                                disabled={submitting}
+                                title={c.invoice_number ? `Already holds ${c.invoice_number} — choose merge or replace` : 'Move this invoice to this manifest'}
                               >
-                                Merge
+                                Assign here
                               </button>
-                              <button
-                                style={{ ...BTN_BASE, background: conflictAction === 'replace' ? '#dc2626' : '#e5e7eb', color: conflictAction === 'replace' ? '#fff' : '#374151' }}
-                                onClick={() => setConflictAction('replace')}
-                              >
-                                Replace
-                              </button>
-                              <button
-                                style={{ ...BTN_BASE, background: conflictAction ? '#1e40af' : '#9ca3af', color: '#fff', opacity: submitting ? 0.7 : 1 }}
-                                onClick={() => confirmConflict(c)}
-                                disabled={!conflictAction || submitting}
-                              >
-                                {submitting ? '…' : 'Confirm'}
-                              </button>
-                            </div>
-                          ) : (
+                            )
+                          )}
+                          {dismissable && conflictRowId !== c.id && (
                             <button
-                              style={{ ...BTN_BASE, background: '#eff6ff', color: '#1e40af', border: '1px solid #bfdbfe' }}
-                              onClick={() => startAssign(c)}
-                              disabled={submitting}
-                              title={c.invoice_number ? `Already holds ${c.invoice_number} — choose merge or replace` : 'Move this invoice to this manifest'}
+                              style={{ ...BTN_BASE, background: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', opacity: dismissingId === c.id ? 0.7 : 1 }}
+                              onClick={() => handleDelete(c)}
+                              disabled={dismissingId === c.id}
+                              title="Dismiss this manifest as bad/duplicate data — hides it here and from the pending queue"
                             >
-                              Assign here
+                              {dismissingId === c.id ? '…' : '🗑 Delete'}
                             </button>
-                          )
-                        )}
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );

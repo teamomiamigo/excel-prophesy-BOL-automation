@@ -80,7 +80,6 @@ export default function App() {
   const [compareTargetId, setCompareTargetId] = useState(null);
   const [markingDoNotPayId, setMarkingDoNotPayId] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'log'
-  const [pullLoading, setPullLoading] = useState(false);
   const [pollFolderLoading, setPollFolderLoading] = useState(false);
   const [filterText, setFilterText] = useState('');
   const [sort, setSort] = useState({ column: null, direction: 'default' });
@@ -100,6 +99,7 @@ export default function App() {
   const [exportingSidId, setExportingSidId] = useState(null);
   const [checkingBolId, setCheckingBolId] = useState(null);
   const [retryingMatchId, setRetryingMatchId] = useState(null);
+  const [acknowledgingMismatchId, setAcknowledgingMismatchId] = useState(null);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [bulkActionLoading, setBulkActionLoading] = useState(false);
   const [bulkFlagOpen, setBulkFlagOpen] = useState(false);
@@ -329,6 +329,22 @@ export default function App() {
       setError(err.message);
     } finally {
       setRetryingMatchId(null);
+    }
+  }
+
+  async function handleAcknowledgeMismatch(recordId) {
+    setAcknowledgingMismatchId(recordId);
+    try {
+      const res = await fetch(`/api/bols/${recordId}/acknowledge-mismatch`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `Acknowledge failed (${res.status})`);
+      }
+      await fetchPending();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setAcknowledgingMismatchId(null);
     }
   }
 
@@ -832,21 +848,6 @@ export default function App() {
     }
   }
 
-  async function handlePull() {
-    setPullLoading(true);
-    try {
-      const res = await fetch('/api/admin/pull', { method: 'POST' });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || `Pull failed (${res.status})`);
-      setSuccessMessage(data.message || 'Technique data refreshed.');
-      await Promise.all([fetchPending(), fetchApproved()]);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setPullLoading(false);
-    }
-  }
-
   async function handleRefetchBols(manifestNumbers) {
     const res = await fetch('/api/admin/refetch-bols', {
       method: 'POST',
@@ -894,6 +895,25 @@ export default function App() {
       setError(err.message);
     } finally {
       setReassignSubmitting(false);
+    }
+  }
+
+  // Dismiss a bad/duplicate sibling manifest from the Compare modal — returns
+  // true/false rather than throwing, so the modal can update its own candidate
+  // list in place without needing a full trip-manifests refetch. Dismissed
+  // records were never in Pending to begin with (no invoice_number), so no
+  // fetchPending() call is needed here.
+  async function handleDismissSibling(recordId) {
+    try {
+      const res = await fetch(`/api/bols/${recordId}/dismiss`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `Dismiss failed (${res.status})`);
+      }
+      return true;
+    } catch (err) {
+      setError(err.message);
+      return false;
     }
   }
 
@@ -1071,23 +1091,6 @@ export default function App() {
               <span>{pendingBols.length + approvedBols.length} records loaded</span>
               <span style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
                 <button
-                  onClick={handlePull}
-                  disabled={pullLoading}
-                  title="Pull latest manifests from Technique"
-                  style={{
-                    background: pullLoading ? '#e5e7eb' : '#f9fafb',
-                    color: pullLoading ? '#9ca3af' : '#374151',
-                    border: '1px solid #d1d5db',
-                    borderRadius: 5,
-                    padding: '4px 12px',
-                    fontWeight: 600,
-                    fontSize: 12,
-                    cursor: pullLoading ? 'not-allowed' : 'pointer',
-                  }}
-                >
-                  {pullLoading ? 'Pulling…' : '↻ Pull Manifests'}
-                </button>
-                <button
                   onClick={handlePollFolder}
                   disabled={pollFolderLoading}
                   title="Scan invoice folder for new ALG CSVs and process them"
@@ -1261,6 +1264,7 @@ export default function App() {
               exportingSidId={exportingSidId}
               checkingBolId={checkingBolId}
               retryingMatchId={retryingMatchId}
+              acknowledgingMismatchId={acknowledgingMismatchId}
               filterText={filterText}
               onFilterChange={setFilterText}
               selectedIds={selectedIds}
@@ -1275,6 +1279,7 @@ export default function App() {
               onMarkThirdParty={handleMarkThirdParty}
               onReassignOpen={id => setReassignTargetId(id)}
               onCompareOpen={id => setCompareTargetId(id)}
+              onAcknowledgeMismatch={handleAcknowledgeMismatch}
               onDoNotPay={handleDoNotPay}
               onExportSid={handleExportRecordToProphecy}
               onCheckBol={handleCheckBol}
@@ -1364,6 +1369,7 @@ export default function App() {
           submitting={reassignSubmitting}
           onClose={() => setCompareTargetId(null)}
           onReassign={handleReassignInvoice}
+          onDismiss={handleDismissSibling}
         />
       )}
 
