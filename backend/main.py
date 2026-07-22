@@ -885,7 +885,7 @@ def update_notes(
     body: dict,
     db: Session = Depends(get_db),
 ):
-    """Update the notes field for a record. Called on auto-save from the dashboard."""
+    """Update the notes field for a record. Called from the dashboard's Notes modal (Save button)."""
     notes = body.get("notes") or None
 
     if settings.USE_MOCK_DATA:

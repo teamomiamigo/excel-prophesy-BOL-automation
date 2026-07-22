@@ -109,7 +109,7 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort 
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Amount</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Cost %</th>
         <th style={TH_STYLE}>Notes</th>
-        <th style={{ ...TH_STYLE, textAlign: 'center' }}>Actions</th>
+        <th style={{ ...TH_STYLE, textAlign: 'center', borderLeft: '1px solid #333' }}>Actions</th>
       </tr>
     </thead>
   );

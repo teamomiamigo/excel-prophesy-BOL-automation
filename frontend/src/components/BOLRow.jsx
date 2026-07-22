@@ -191,7 +191,29 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
   const [hovered, setHovered] = useState(false);
   const [costHovered, setCostHovered] = useState(false);
   const [costBreakdown, setCostBreakdown] = useState(null); // cached once fetched: null | 'loading' | { _error } | {...}
+  const [editingNotes, setEditingNotes] = useState(false);
+  const [notesDraft, setNotesDraft] = useState('');
   const isFlagged = bol.status === 'flagged';
+
+  function startEditingNotes() {
+    setNotesDraft(bol.notes || '');
+    setEditingNotes(true);
+  }
+
+  function handleNotesBlur() {
+    setEditingNotes(false);
+    const trimmed = notesDraft.trim();
+    if (trimmed !== (bol.notes || '')) {
+      onNotesUpdate(trimmed);
+    }
+  }
+
+  function handleNotesKeyDown(e) {
+    if (e.key === 'Escape') {
+      setNotesDraft(bol.notes || '');
+      e.target.blur();
+    }
+  }
 
   function handleCostEnter() {
     setCostHovered(true);
@@ -365,16 +387,49 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
         {formatCostPct(bol.cost_pct)}
       </td>
 
-      {/* Notes — editable field removed pending redesign; column kept for future use */}
-      <td style={{ ...TD, minWidth: 140 }}>
-        {isFlagged && bol.flag_reason && (
-          <div style={{ color: '#b45309', fontSize: 11 }}>⚑ {bol.flag_reason}</div>
+      {/* Notes — click to edit inline, saves on blur */}
+      <td style={{ ...TD, minWidth: 140, maxWidth: 200, whiteSpace: 'normal' }}>
+        {editingNotes ? (
+          <textarea
+            autoFocus
+            value={notesDraft}
+            onChange={e => setNotesDraft(e.target.value)}
+            onBlur={handleNotesBlur}
+            onKeyDown={handleNotesKeyDown}
+            rows={2}
+            style={{
+              width: '100%',
+              border: '1px solid #93c5fd',
+              borderRadius: 4,
+              padding: '4px 6px',
+              fontSize: 12,
+              fontFamily: 'inherit',
+              resize: 'vertical',
+              outline: 'none',
+            }}
+          />
+        ) : (
+          <div
+            onClick={startEditingNotes}
+            title={bol.notes || 'Click to add a note'}
+            style={{
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              color: bol.notes ? '#374151' : '#d1d5db',
+              fontSize: 12,
+              cursor: 'text',
+              minHeight: 16,
+            }}
+          >
+            {bol.notes || '+ note'}
+          </div>
         )}
       </td>
 
-      {/* Actions — routine zone (Approve/Flag/SID/BOL) + exception zone (3P/Ignore), fixed-size slots so every row has identical column width */}
-      <td style={{ ...TD, textAlign: 'center' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+      {/* Actions — routine zone (Approve/Flag/SID/BOL) + exception zone (3P/Ignore) + Notes, fixed-size slots so every row has identical column width */}
+      <td style={{ ...TD, textAlign: 'center', borderLeft: '1px solid #f3f4f6' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: 8 }}>
           {/* Routine zone: Approve, Flag/Unflag, SID, Refresh BOL — used constantly, always one click */}
           <div style={{ display: 'grid', gridTemplateColumns: '80px 26px 42px 42px', gap: 4, alignItems: 'center' }}>
             {/* Approve */}
@@ -402,7 +457,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
               <button
                 onClick={onUnflag}
                 disabled={isUnflagging}
-                title="Remove flag and return to pending"
+                title={bol.flag_reason ? `Flagged: ${bol.flag_reason}` : 'Remove flag and return to pending'}
                 style={{
                   ...ICON_BTN,
                   color: '#6b7280',
@@ -483,7 +538,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
                   <button
                     onClick={onRetryMatch}
                     disabled={isRetryingMatch}
-                    title="Check Technique again (21-day window) for a trip matching this invoice's job name"
+                    title="Check Technique again (90-day window) for a trip matching this invoice's job name"
                     style={{
                       background: isRetryingMatch ? '#e5e7eb' : '#f9fafb',
                       color: '#374151',
