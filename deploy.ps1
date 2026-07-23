@@ -90,9 +90,24 @@ if ($Frontend) {
     $distId = terraform output -raw cloudfront_distribution_id
     if (-not $bucket -or -not $distId) { Write-Host "Could not read frontend outputs from Terraform." -ForegroundColor Red; exit 1 }
 
+    # Two passes, in this order, so index.html never goes live pointing at an asset
+    # that isn't in S3 yet:
+    #   1. Everything except index.html gets long-lived immutable caching -- safe
+    #      because Vite content-hashes these filenames (e.g. index-ByLbNsR8.js), so a
+    #      new deploy always produces new filenames and never reuses an old cached URL.
+    #   2. index.html itself gets no-cache metadata, so browsers always revalidate with
+    #      the server before using it instead of serving a stale local copy from disk
+    #      indefinitely under RFC 7234 heuristic caching (no Cache-Control header at
+    #      all was previously sent for ANY file, including index.html -- confirmed via
+    #      direct investigation as the actual cause of a "deployed site looks stale"
+    #      report even though CloudFront's own edge cache already had the correct
+    #      content and had already been invalidated).
     Write-Host "Syncing frontend/dist to s3://$bucket ..." -ForegroundColor Green
-    aws s3 sync (Join-Path $root "frontend\dist") "s3://$bucket" --delete
+    aws s3 sync (Join-Path $root "frontend\dist") "s3://$bucket" --delete --cache-control "public, max-age=31536000, immutable" --exclude "index.html"
     if ($LASTEXITCODE -ne 0) { Write-Host "S3 sync failed." -ForegroundColor Red; exit 1 }
+
+    aws s3 cp (Join-Path $root "frontend\dist\index.html") "s3://$bucket/index.html" --cache-control "no-cache, no-store, must-revalidate"
+    if ($LASTEXITCODE -ne 0) { Write-Host "index.html upload failed." -ForegroundColor Red; exit 1 }
 
     Write-Host "Invalidating CloudFront distribution $distId ..." -ForegroundColor Green
     aws cloudfront create-invalidation --distribution-id $distId --paths "/*" | Out-Null

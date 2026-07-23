@@ -1,4 +1,4 @@
-"""IMAP polling for ALG invoice emails (from Tanya at ALG Worldwide)."""
+# IMAP polling for ALG invoice emails
 import email as email_lib
 import imaplib
 import logging
@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 def _decode_str(value) -> str:
-    """Decode an email header value to a plain string."""
+    # decode email header value to plain string
     if value is None:
         return ""
     parts = _decode_header(value)
@@ -29,10 +29,8 @@ def poll_alg_invoice_emails(
     sender_filter: str = "",
     mailbox: str = "INBOX",
 ) -> list[tuple[str, bytes]]:
+    # connect to IMAP via SSL, find unread emails (optionally filtered by sender)  and ext ract .csv attachments, and mark processes as read
     """
-    Connect to IMAP via SSL, find unread emails (optionally filtered by sender),
-    extract .csv attachments, and mark processed emails as read.
-
     Returns list of (filename, csv_bytes) tuples — one entry per attachment.
     A single email may contribute multiple tuples if it has multiple CSVs.
     """

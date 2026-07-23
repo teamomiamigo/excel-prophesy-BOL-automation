@@ -200,9 +200,10 @@ class BOLRecord(Base):
     # this scheme; a pre-existing record stays null until recompute-access-prog
     # backfills it.
     cost_calc_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # True when this manifest's technique_trip had more than one manifest in the most
-    # recent Technique pull. Recomputed fresh on every pull (same lifecycle as
-    # technique_weight itself) — un-flags automatically if the trip resolves to one manifest.
+    # True when this manifest's technique_trip had more than one manifest in the live
+    # Technique search that matched it (set at match time by _wide_fallback_technique_search()
+    # / retry_match_invoice() — no daily pull recomputes this anymore, see CLAUDE.md's
+    # "Ambiguous trips" section).
     is_ambiguous_trip: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Quantity comparisons — Technique vs ALG invoice (populated on upload)
@@ -230,6 +231,20 @@ class BOLRecord(Base):
     no_invoice: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_third_party: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_do_not_pay: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Manually dismissed as a bad/duplicate sibling manifest on an ambiguous trip (added
+    # 2026-07-22) — set via POST /api/bols/{id}/dismiss from CompareManifestsModal.jsx,
+    # never on a record that has an invoice_number. Reversible in principle (nothing is
+    # deleted), but no undo route exists yet since nothing surfaces dismissed records in
+    # the UI to undo from. Excluded from the Compare-modal candidate list and from
+    # reassign-invoice's target lookup.
+    is_dismissed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Clears the ~UNVERIFIED badge for a severe weight/pallet/piece mismatch that has no
+    # ambiguous trip to compare against (added 2026-07-22) — the Compare modal only
+    # applies when is_ambiguous_trip is set (multiple manifests to actually choose
+    # between); a single-manifest mismatch had no available action at all before this.
+    # Set via POST /api/bols/{id}/acknowledge-mismatch. No undo route — same reasoning
+    # as is_dismissed above.
+    mismatch_acknowledged: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     match_strategy: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     sid_exported_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     accounting_exported_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -412,6 +427,8 @@ class BOLSummary(BaseModel):
     no_invoice: bool = False
     is_third_party: bool = False
     is_do_not_pay: bool = False
+    is_dismissed: bool = False
+    mismatch_acknowledged: bool = False
     match_strategy: Optional[str] = None
     sid_exported_at: Optional[datetime] = None
     accounting_exported_at: Optional[datetime] = None

@@ -46,16 +46,32 @@ function _relDiff(diffVal, algVal) {
   return Math.abs(diffVal) / Math.abs(algVal);
 }
 
-function hasSevereQuantityMismatch(bol) {
+export function hasSevereQuantityMismatch(bol) {
   const score = _relDiff(bol.weight_diff, bol.alg_weight)
               + _relDiff(bol.pallet_diff, bol.alg_pallets)
               + _relDiff(bol.pcs_diff, bol.alg_pcs);
   return score > QUANTITY_MISMATCH_THRESHOLD;
 }
 
+// A severe mismatch with no ambiguous trip has nothing for the Compare modal to
+// show (only one manifest exists) — Acknowledge is the only available action,
+// letting Katie clear the badge once she's confirmed the mismatch is expected/
+// explained. Once acknowledged, hasSevereQuantityMismatch stays true (the numbers
+// didn't change) but the badge and this button both stop showing (added 2026-07-22,
+// per direct feedback that a severe-mismatch-only row otherwise offered no action
+// at all — Compare only applies to the genuinely ambiguous-trip case).
+export function isMismatchAcknowledgeEligible(bol) {
+  return !bol.is_third_party
+    && !bol.mismatch_acknowledged
+    && hasSevereQuantityMismatch(bol)
+    && !(!!bol.is_ambiguous_trip && !bol.bol_number);
+}
+
 export function isUnverifiedQuantity(bol) {
   if (bol.is_third_party) return false;
-  return (!!bol.is_ambiguous_trip && !bol.bol_number) || hasSevereQuantityMismatch(bol);
+  const ambiguousUnresolved = !!bol.is_ambiguous_trip && !bol.bol_number;
+  const severeMismatch = hasSevereQuantityMismatch(bol) && !bol.mismatch_acknowledged;
+  return ambiguousUnresolved || severeMismatch;
 }
 
 // ---------------------------------------------------------------------------
@@ -187,11 +203,33 @@ const ICON_BTN = {
 // Actions column: fixed-size empty slot — same footprint as a button, reads as "nothing here"
 const PLACEHOLDER = { width: '100%', height: 26 };
 
-export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isMarkingDoNotPay, isExportingSid, isCheckingBol, isRetryingMatch, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onCompareOpen, onDoNotPay, onExportSid, onCheckBol, onRetryMatch, onToggleSelect }) {
+export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdParty, isMarkingDoNotPay, isExportingSid, isCheckingBol, isRetryingMatch, isAcknowledgingMismatch, isSelected, onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onCompareOpen, onAcknowledgeMismatch, onDoNotPay, onExportSid, onCheckBol, onRetryMatch, onToggleSelect }) {
   const [hovered, setHovered] = useState(false);
   const [costHovered, setCostHovered] = useState(false);
   const [costBreakdown, setCostBreakdown] = useState(null); // cached once fetched: null | 'loading' | { _error } | {...}
+  const [editingNotes, setEditingNotes] = useState(false);
+  const [notesDraft, setNotesDraft] = useState('');
   const isFlagged = bol.status === 'flagged';
+
+  function startEditingNotes() {
+    setNotesDraft(bol.notes || '');
+    setEditingNotes(true);
+  }
+
+  function handleNotesBlur() {
+    setEditingNotes(false);
+    const trimmed = notesDraft.trim();
+    if (trimmed !== (bol.notes || '')) {
+      onNotesUpdate(trimmed);
+    }
+  }
+
+  function handleNotesKeyDown(e) {
+    if (e.key === 'Escape') {
+      setNotesDraft(bol.notes || '');
+      e.target.blur();
+    }
+  }
 
   function handleCostEnter() {
     setCostHovered(true);
@@ -269,15 +307,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
                 : undefined}
             >
               {fmtNum(wgt)}{wgt != null ? P : null}
-              {unverified && bol.is_ambiguous_trip ? (
-                <span
-                  onClick={() => onCompareOpen && onCompareOpen(bol.id)}
-                  title="Click to compare this trip's other manifests against the matched invoice"
-                  style={{ marginLeft: 4, fontSize: 10, background: '#fef3c7', color: '#92400e', borderRadius: 3, padding: '1px 5px', fontWeight: 700, letterSpacing: '0.02em', cursor: 'pointer', textDecoration: 'underline dotted' }}
-                >
-                  ~UNVERIFIED
-                </span>
-              ) : unverified && (
+              {unverified && (
                 <span style={{ marginLeft: 4, fontSize: 10, background: '#fef3c7', color: '#92400e', borderRadius: 3, padding: '1px 5px', fontWeight: 700, letterSpacing: '0.02em' }}>~UNVERIFIED</span>
               )}
             </td>
@@ -365,16 +395,49 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
         {formatCostPct(bol.cost_pct)}
       </td>
 
-      {/* Notes — editable field removed pending redesign; column kept for future use */}
-      <td style={{ ...TD, minWidth: 140 }}>
-        {isFlagged && bol.flag_reason && (
-          <div style={{ color: '#b45309', fontSize: 11 }}>⚑ {bol.flag_reason}</div>
+      {/* Notes — click to edit inline, saves on blur */}
+      <td style={{ ...TD, minWidth: 140, maxWidth: 200, whiteSpace: 'normal' }}>
+        {editingNotes ? (
+          <textarea
+            autoFocus
+            value={notesDraft}
+            onChange={e => setNotesDraft(e.target.value)}
+            onBlur={handleNotesBlur}
+            onKeyDown={handleNotesKeyDown}
+            rows={2}
+            style={{
+              width: '100%',
+              border: '1px solid #93c5fd',
+              borderRadius: 4,
+              padding: '4px 6px',
+              fontSize: 12,
+              fontFamily: 'inherit',
+              resize: 'vertical',
+              outline: 'none',
+            }}
+          />
+        ) : (
+          <div
+            onClick={startEditingNotes}
+            title={bol.notes || 'Click to add a note'}
+            style={{
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              color: bol.notes ? '#374151' : '#d1d5db',
+              fontSize: 12,
+              cursor: 'text',
+              minHeight: 16,
+            }}
+          >
+            {bol.notes || '+ note'}
+          </div>
         )}
       </td>
 
-      {/* Actions — routine zone (Approve/Flag/SID/BOL) + exception zone (3P/Ignore), fixed-size slots so every row has identical column width */}
-      <td style={{ ...TD, textAlign: 'center' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+      {/* Actions — routine zone (Approve/Flag/SID/BOL) + exception zone (3P/Ignore) + Notes, fixed-size slots so every row has identical column width */}
+      <td style={{ ...TD, textAlign: 'center', borderLeft: '1px solid #f3f4f6' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: 8 }}>
           {/* Routine zone: Approve, Flag/Unflag, SID, Refresh BOL — used constantly, always one click */}
           <div style={{ display: 'grid', gridTemplateColumns: '80px 26px 42px 42px', gap: 4, alignItems: 'center' }}>
             {/* Approve */}
@@ -402,7 +465,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
               <button
                 onClick={onUnflag}
                 disabled={isUnflagging}
-                title="Remove flag and return to pending"
+                title={bol.flag_reason ? `Flagged: ${bol.flag_reason}` : 'Remove flag and return to pending'}
                 style={{
                   ...ICON_BTN,
                   color: '#6b7280',
@@ -483,7 +546,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
                   <button
                     onClick={onRetryMatch}
                     disabled={isRetryingMatch}
-                    title="Check Technique again (21-day window) for a trip matching this invoice's job name"
+                    title="Check Technique again (90-day window) for a trip matching this invoice's job name"
                     style={{
                       background: isRetryingMatch ? '#e5e7eb' : '#f9fafb',
                       color: '#374151',
@@ -550,6 +613,55 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
                 style={{ background: 'none', border: 'none', padding: 0, fontSize: 11, color: '#9ca3af', cursor: isMarkingDoNotPay ? 'not-allowed' : 'pointer', textDecoration: 'underline', width: '100%' }}
               >
                 {isMarkingDoNotPay ? '…' : 'Do Not Pay'}
+              </button>
+            ) : (
+              <div style={PLACEHOLDER} />
+            )}
+          </div>
+
+          {/* Compare Manifests (ambiguous trip — multiple manifests, invoice not yet
+              confirmed on the right one) or Acknowledge (severe quantity mismatch with
+              only one manifest — nothing to compare against, just a "confirmed fine"
+              dismissal). Mutually exclusive with each other; independent of the
+              3P/Retry/Do-Not-Pay zone above, so its own slot. */}
+          <div style={{ width: 44 }}>
+            {bol.is_ambiguous_trip && !bol.bol_number && !bol.is_third_party ? (
+              <button
+                onClick={() => onCompareOpen && onCompareOpen(bol.id)}
+                title="Compare this trip's manifests and reassign the invoice if it's on the wrong one"
+                style={{
+                  background: '#fef3c7',
+                  color: '#92400e',
+                  border: '1px solid #fcd34d',
+                  borderRadius: 4,
+                  padding: '4px 0',
+                  width: '100%',
+                  fontSize: 11,
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                }}
+              >
+                ⚖ Compare
+              </button>
+            ) : isMismatchAcknowledgeEligible(bol) ? (
+              <button
+                onClick={onAcknowledgeMismatch}
+                disabled={isAcknowledgingMismatch}
+                title="Confirm this weight/pallet/piece mismatch is expected — clears the ~UNVERIFIED badge"
+                style={{
+                  background: isAcknowledgingMismatch ? '#e5e7eb' : '#f9fafb',
+                  color: '#374151',
+                  border: '1px solid #d1d5db',
+                  borderRadius: 4,
+                  padding: '4px 0',
+                  width: '100%',
+                  fontSize: 11,
+                  fontWeight: 600,
+                  cursor: isAcknowledgingMismatch ? 'not-allowed' : 'pointer',
+                  opacity: isAcknowledgingMismatch ? 0.7 : 1,
+                }}
+              >
+                {isAcknowledgingMismatch ? '…' : '✓ Acknowledge'}
               </button>
             ) : (
               <div style={PLACEHOLDER} />

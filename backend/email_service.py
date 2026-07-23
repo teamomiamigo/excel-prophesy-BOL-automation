@@ -18,15 +18,9 @@ def send_bol_export_email(
     export_date: Optional[date] = None,
     recipients: Optional[list[str]] = None,
 ) -> bool:
-    """
-    Generate the approved-BOL CSV and send it to Mary and Katie.
-
-    Returns True if the email was sent successfully.
-    Returns False (console log only) when SMTP is not configured — correct
-    behavior for the prototype. The caller treats False as a soft failure:
-    the export still succeeds and the response is 200; only the email step
-    is degraded.
-    """
+    # Generate the approved-BOL CSV and send it to Mary and Katie.
+    # Returns True if the email was sent successfully.
+    # Returns False if the email was not sent (e.g., SMTP not configured, or SMTP error).
     d = export_date or date.today()
     recipients = recipients or (settings.EMAIL_TO_MARY + settings.EMAIL_TO_KATIE)
     csv_bytes = generate_csv_bytes(bol_records)
