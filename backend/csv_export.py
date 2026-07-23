@@ -28,7 +28,6 @@ CSV_COLUMNS = [
 
 # Exact 13-column format confirmed from real Prophecy import file:
 # "New Import VM to Prophesy by manifest (10).csv"
-# Column names use underscores — any difference breaks the Prophecy import.
 SID_CSV_COLUMNS = [
     "Order_ID",
     "Dest_ID",
@@ -73,6 +72,7 @@ def _fmt_diff(val) -> str:
 
 
 def generate_csv_bytes(bol_records: list[dict]) -> bytes:
+    #accpet list of BOL dicts and returns CSV bytes matching column order
     """
     Accept a list of BOL dicts and return UTF-8 CSV bytes matching
     the column order of the accounting export.
@@ -107,13 +107,8 @@ def generate_csv_bytes(bol_records: list[dict]) -> bytes:
 
 
 def generate_mock_sid_rows(bol_records: list[dict]) -> list[dict]:
-    """
-    Generate fake SID pallet rows from approved mock BOL records.
-    Used by GET /api/export/prophecy-sid in mock mode.
-
-    Produces one row per pallet (technique_pallets count) using the exact
-    13-column format Prophecy expects. Weight and PCS are distributed evenly.
-    """
+    # generate fake SID pallet rows from approved mock BOL records
+    #one row per pallet using 13-column format prophecy expects
     rows = []
     for rec in bol_records:
         manifest = rec.get("manifest") or "MOCK_MANIFEST"
@@ -145,13 +140,8 @@ def generate_mock_sid_rows(bol_records: list[dict]) -> list[dict]:
 
 
 def generate_sid_csv(pallet_rows: list[dict]) -> bytes:
-    """
-    Format pallet-level rows from get_pallet_data_for_manifests() into the
-    Prophecy SID import CSV. Column order and names must match exactly.
-
-    In live mode, the dict keys from the SQL query must match SID_CSV_COLUMNS.
-    The _SID_QUERY in data_layer.py aliases columns to these exact names.
-    """
+    # format pallet-level rows from get_pallet_data_for_manifests() into SID export
+    # in live mode, SID_QUERY in data_layer.py aliasses columns to these exact names.
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=SID_CSV_COLUMNS, extrasaction="ignore")
     writer.writeheader()

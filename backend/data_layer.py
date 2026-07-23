@@ -2,8 +2,8 @@
 Integration layer for the four real data sources.
 
 When USE_MOCK_DATA=False, these functions connect to live systems.
-This file is the sole integration boundary — no SQL or parsing logic
-lives anywhere else in the codebase.
+This file is the sole integration boundary:
+no SQL or parsing logic lives anywhere else in the codebase.
 
 Connection requirements (install when going live):
     pip install pyodbc sqlalchemy[mssql]
@@ -19,17 +19,12 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Connection helper
-# ---------------------------------------------------------------------------
+# Connection helper function
 
 def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail",
                      query_timeout: Optional[int] = None):
     """
     Return a pyodbc connection to the given SQL Server instance.
-    Uses SQL auth when SQLSERVER_USER/SQLSERVER_PASSWORD are set in .env,
-    otherwise falls back to Windows auth (Trusted_Connection=yes).
-
     Default server is AWP-SQL-PROD's IP, not its hostname: unixODBC's driver
     manager does its own native DNS resolution (like psycopg2/libpq), which
     bypasses Python's socket.getaddrinfo -- the same reason Aurora's
@@ -40,11 +35,9 @@ def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail",
     this connection (pyodbc's Connection.timeout). Left unset (None) by default --
     pyodbc's own default is 0 (no timeout) -- because most callers (the daily
     Technique pull, retry-match, etc.) are the only live call in their request and
-    a heavy join can legitimately run long. Only pass this in where a query is
-    known to be sharing a request's time budget with other work -- see
-    _wide_fallback_technique_search()'s callers in main.py, the one call site this
-    was actually built for (fixed 2026-07-22 after a global 15s default broke the
-    main Technique pull, which needs more than that).
+    a heavy join can legitimately run long. 
+    Only pass this in where a query is known to be sharing a request's time budget with other work -- see _wide_fallback_technique_search()'s callers in main.py, 
+    the one call site this was actually built for (fixed 2026-07-22 after a global 15s default broke the main Technique pull, which needs more than that).
     """
     import pyodbc
     from backend.config import settings
@@ -71,22 +64,16 @@ def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail",
     # fast, catchable connection failure on a slow/unreachable AWP-SQL-PROD.
     conn = pyodbc.connect(conn_str, timeout=8)
     # Query-level timeout, distinct from the connect() timeout above: pyodbc applies
-    # Connection.timeout to every cursor.execute() made on this connection. Without
-    # it, a slow/hung linked-server query (once connected) can block indefinitely,
-    # past Lambda's 29s hard wall, with no traceback -- confirmed 2026-07-21 via
-    # CloudWatch on a real invoice upload (Z557856) that hard-timed-out this way
-    # inside _wide_fallback_technique_search(). Only set it when the caller opts in
-    # (see query_timeout above) -- see that param's docstring for why this isn't a
-    # blanket default.
+    # Connection.timeout to every cursor.execute() made on this connection. 
+    # Without it, a slow/hung linked-server query (once connected) can block indefinitely,
+    # past Lambda's 29s hard wall, with no traceback 
+    #  Only set it when the caller opts in (see query_timeout above)
     if query_timeout is not None:
         conn.timeout = query_timeout
     return conn
 
 
-# ---------------------------------------------------------------------------
 # Query 1: Morning pull — trips and manifests for the last N days
-# ---------------------------------------------------------------------------
-
 # Full query as provided. Filters for ALG/LSC/ENRU/CHOICE destinations.
 # Joins across linked servers: TECH (Live_Orders), SegGroup, SQLAPPS3 (ShipperPlus).
 # Returns one row per manifest with trip, pieces, Prophecy pieces, customer, etc.
@@ -232,12 +219,10 @@ def get_technique_data(days_back: int = 1, query_timeout: Optional[int] = None) 
         raise
 
 
-# ---------------------------------------------------------------------------
 # Query 2: Weight, pieces, pallets per manifest (batch)
-# ---------------------------------------------------------------------------
 
-# Original query is per-pallet (one row per pallet). We aggregate here so the
-# caller gets one row per manifest: total weight, total pieces, pallet count.
+# Original query is per-pallet (one row per pallet). 
+# We aggregate here so the caller gets one row per manifest: total weight, total pieces, pallet count.
 # The WHERE clause accepts multiple manifest numbers via IN (?,...).
 _MANIFEST_WEIGHT_QUERY = """
 SELECT
@@ -257,7 +242,6 @@ def get_manifest_weights(manifest_numbers: list[str], query_timeout: Optional[in
     """
     Run Query 2 (aggregated) to get weight, pieces, and pallet count for a
     batch of manifests in a single round-trip.
-
     Returns a dict keyed by ManifestNumber:
         {
           "TEC_M_0228920": {
@@ -267,10 +251,8 @@ def get_manifest_weights(manifest_numbers: list[str], query_timeout: Optional[in
           },
           ...
         }
-
     Weight comes from VisualMail.dbo.Pallet.Weight (rounded to 0 decimals).
     This is the only source of weight — it is NOT in get_technique_data().
-
     query_timeout: see get_technique_data() -- forwarded to _get_connection() as-is.
     """
     if not manifest_numbers:
@@ -302,11 +284,9 @@ def get_manifest_weights(manifest_numbers: list[str], query_timeout: Optional[in
         raise
 
 
-# ---------------------------------------------------------------------------
 # Prophecy / ShipperPlus (future — load_id from Query 1 is the link)
-# ---------------------------------------------------------------------------
-
 # The only route to ShipperPlus_Segerdahl — see module docstring.
+
 _PROPHECY_BOL_QUERY = """
 SELECT
     COALESCE(NULLIF(s.pooled_to_load_id, 0), s.load_id) AS bol_number,
@@ -406,28 +386,17 @@ def get_prophecy_pallet_data(bol_number: int) -> list[dict]:
         return []
 
 
-# ---------------------------------------------------------------------------
 # Tariff / Access rates  (seeded from CSV via backend/seed_rates.py)
-# ---------------------------------------------------------------------------
 
 # Result cache for get_current_diesel_price() — the EIA price is weekly, so an
-# hour-long cache per warm container is far fresher than needed. Crucially this
-# also caches FAILURE: when the network path to api.eia.gov is down (e.g. the
-# broken-DNS episode), the ~20s hang is paid once per container, not once per
-# invoice file.
+# hour-long cache per warm container is far fresher than needed. 
+# Crucially this also caches FAILURE: when the network path to api.eia.gov is down it hangs
 _DIESEL_CACHE: dict = {"value": None, "at": 0.0}
 _DIESEL_CACHE_TTL_SECONDS = 3600.0
 
 
 def get_current_diesel_price() -> Optional[float]:
-    """
-    Fetch the most recent weekly US on-highway diesel retail price from the EIA API.
-    Series: EMD_EPD2D_PTE_NUS_DPG (EIA Weekly Retail On-Highway Diesel Prices, US avg).
-
-    Returns the price in $/gal, or None if EIA_API_KEY is not set or the call fails.
-    The price is used to look up the FSC band in fuel_surcharge_rates via get_fsc_rate().
-    Cached (including failures) for an hour per process — see _DIESEL_CACHE.
-    """
+    # Fetch the most recent weekly US on-highway diesel retail price from the EIA API
     import json
     import time
     import urllib.request
@@ -471,15 +440,9 @@ def get_current_diesel_price() -> Optional[float]:
 
 
 def get_fsc_rate(fuel_price_per_gallon: float) -> Optional[Decimal]:
-    """
-    Look up the ALG Worldwide FSC for the given diesel price.
-
-    fsc_amount in the DB is already the decimal multiplier (e.g., 0.365 = 36.5% surcharge).
-    The Excel source stores 0.365 for the 36.5% band — NOT 36.5.
-
-    Apply to base tariff: access_prog = base_tariff × (1 + fsc_pct)
-    Confirmed June 22 meeting: FSC is a % of base freight, sourced from EIA weekly diesel.
-    """
+    # look up the ALG Worldwide Fuel Surcharge (FSC) rate for the given diesel price
+    # fsc is already in DB as decimal multiplier from the excel invoices
+    # comes from a weekly diesel price that they calculate from the EIA API (see get_current_diesel_price())
     from backend.database import SessionLocal
     from backend.models import FuelSurchargeRate
 
@@ -505,18 +468,8 @@ def get_fsc_rate(fuel_price_per_gallon: float) -> Optional[Decimal]:
 
 
 def get_alg_tariff_rate(dest_id: str) -> Optional[dict]:
-    """
-    Exact-match lookup against ALG's own per-destination rate table (alg_tariff_rates,
-    seeded from a Prophecy/ShipperPlus dbo.tariff_details export — see AlgTariffRate's
-    docstring). dest_id is the exact Locations.AccountNumber-format code our own pallet
-    data already carries (e.g. "SCF606") — no zip3 derivation, no nearest-zone tolerance,
-    since this table's own destination codes are confirmed identical to that format.
-
-    Preferred over get_tariff_rate() (the older zip3-keyed card) whenever a rate is found
-    here — see CLAUDE.md's access_prog calculation section for the full priority order.
-
-    Returns {"rate1": Decimal, "mc1": Decimal} or None if this exact dest_id isn't in the table.
-    """
+    # exact-match lookup against ALG's own per-destination rate table (alg_tariff_rates),
+    # coming from a Prophecy/ShipperPlus dbo.tariff_details export (see AlgTariffRate's docstring)
     from backend.database import SessionLocal
     from backend.models import AlgTariffRate
 
@@ -541,6 +494,10 @@ _MIN_CHARGE_PLAUSIBLE_RANGE = (0.01, 500.0)
 
 
 def reconcile_alg_tariff_rates(entries: list[tuple[str, float, "Optional[float]"]]) -> list[dict]:
+    # self updating counterpart to get alg_rate_tariff_rate ()
+    # rate1 always trusted and appplied with observed_mc1 only applied if within plausible range
+    # one sesssion for a whole batch, not per pallet - runs on every invoice upload/recompute
+    # returns empty if nothing changed
     """
     Self-updating counterpart to get_alg_tariff_rate(): given (dest_id, rate1, observed_mc1)
     tuples gathered from one invoice's own directly-billed zones (built in

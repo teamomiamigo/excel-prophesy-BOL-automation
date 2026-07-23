@@ -43,9 +43,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-# ---------------------------------------------------------------------------
 # Startup / shutdown
-# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -53,13 +51,8 @@ async def lifespan(app: FastAPI):
         try:
             Base.metadata.create_all(bind=engine)
         except IntegrityError as exc:
-            # SQLAlchemy's create_all() checks "does this Postgres ENUM type
-            # exist" and creates it in two separate, non-atomic steps. Under
-            # Lambda's concurrent cold starts, two instances can both see
-            # "not yet created" and race to CREATE TYPE — the loser hits this
-            # UniqueViolation even though the schema is now in the desired
-            # state. Safe to swallow only for that specific "already exists"
-            # case; anything else is a real migration failure.
+            # SQLAlchemy's create_all() checks 
+            # "does this Postgres ENUM type exist" and creates it in two separate, non-atomic steps.
             if "already exists" not in str(exc.orig):
                 raise
             logger.info("DB schema already created by a concurrent cold start; continuing.")
@@ -70,14 +63,11 @@ async def lifespan(app: FastAPI):
         with engine.connect() as _enum_conn:
             _enum_conn.execute(text("ALTER TYPE actiontype ADD VALUE IF NOT EXISTS 'DO_NOT_PAY'"))
             _enum_conn.commit()
-        # RULE: when a column is removed from an ORM model (backend/models.py),
-        # its ADD COLUMN IF NOT EXISTS line below must be changed to a
+        # RULE: when a column is removed from an ORM model (backend/models.py), its ADD COLUMN IF NOT EXISTS line below must be changed to a
         # DROP COLUMN IF EXISTS line in the SAME commit — never just left in
-        # place. A Python-side SQLAlchemy `default=` is never a real Postgres
-        # DEFAULT; an orphaned NOT NULL column with no DB-level default
-        # rejects every future INSERT that omits it. This bit us on
-        # 2026-07-16 (is_ignored removed from the model in #69/2026-07-15, but
-        # left as ADD COLUMN IF NOT EXISTS here — the column already existed
+        # place. 
+        # A Python-side SQLAlchemy `default=` is never a real Postgres DEFAULT; an orphaned NOT NULL column with no DB-level default
+        # rejects every future INSERT that omits it. This bit us on 2026-07-16 (is_ignored removed from the model in #69/2026-07-15, but left as ADD COLUMN IF NOT EXISTS here — the column already existed
         # live, so IF NOT EXISTS silently made this line a permanent no-op).
         with engine.connect() as _conn:
             _conn.execute(text("ALTER TABLE bol_records ADD COLUMN IF NOT EXISTS base_tariff NUMERIC(10,2)"))
@@ -111,10 +101,7 @@ async def lifespan(app: FastAPI):
     logger.info("SG360 BOL API shutting down.")
 
 
-# ---------------------------------------------------------------------------
 # App
-# ---------------------------------------------------------------------------
-
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
@@ -122,10 +109,7 @@ app = FastAPI(
 )
 
 
-# ---------------------------------------------------------------------------
 # Middleware
-# ---------------------------------------------------------------------------
-
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.perf_counter()
@@ -151,15 +135,13 @@ async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": detail})
 
 
-# ---------------------------------------------------------------------------
-# Mock state (in-memory; mutations survive process lifetime, reset on restart)
-# ---------------------------------------------------------------------------
 
+# Mock state (in-memory; mutations survive process lifetime, reset on restart)
 _mock_state: dict[str, dict] = {r["id"]: dict(r) for r in MOCK_BOLS}
 
 
 def _find_mock(record_id: str) -> dict:
-    """Lookup by UUID, invoice_number, or bol_number."""
+    # lookup by UUID, invoice_number, or bol_number
     if record_id in _mock_state:
         return _mock_state[record_id]
     for rec in _mock_state.values():
@@ -177,10 +159,8 @@ def _record_to_summary(r: dict) -> dict:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
+# Routes
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 def health_check(db: Session = Depends(get_db)):
     db_ok = True
@@ -211,16 +191,10 @@ def list_pending_bols(db: Session = Depends(get_db)):
         db.query(BOLRecord)
         .filter(
             BOLRecord.status != BOLStatus.APPROVED,
-            # Excludes sibling-manifest stubs (2026-07-22): retry_match_invoice() now
-            # persists a trip's other manifests too when it resolves an ambiguous match
-            # (see "Ambiguous trips" in CLAUDE.md) so Compare/reassign has real data to
-            # work with — but those siblings have no invoice and aren't Katie's to review
-            # individually; they'd just be redundant rows she'd have to dismiss one by
-            # one. The trip's actual invoiced record (which does have invoice_number)
+            # Excludes sibling-manifest stubs (see "Ambiguous trips" in CLAUDE.md) 
+            # The trip's actual invoiced record (which does have invoice_number)
             # still shows, badged ~UNVERIFIED, with the Compare button as the one place
             # to see/act on its siblings. Nothing else creates an invoice-less record
-            # post-Phase-4 (the old daily bulk pull's "Awaiting Invoice" pre-population
-            # is gone), so this filter only ever excludes exactly these stubs.
             BOLRecord.invoice_number.isnot(None),
         )
         .order_by(
@@ -237,11 +211,7 @@ def list_approved_bols(
     export_date: Optional[date] = None,
     db: Session = Depends(get_db),
 ):
-    """
-    Approved records not yet marked as sent to accounting (accounting_exported_at IS NULL).
-    Pass export_date=YYYY-MM-DD to retrieve records approved on a specific date instead
-    (used for historical CSV exports).
-    """
+    # Approved records not yet marked as sent to accounting (accounting_exported_at IS NULL).
     if settings.USE_MOCK_DATA:
         return [_record_to_summary(r) for r in _mock_state.values()
                 if r["status"] == "approved" and r.get("accounting_exported_at") is None]
@@ -271,10 +241,7 @@ def list_approved_bols(
 
 @app.post("/api/bols/mark-accounting-sent", tags=["BOLs"])
 def mark_accounting_sent(body: dict, db: Session = Depends(get_db)):
-    """
-    Mark a list of records as sent to accounting by setting accounting_exported_at = now().
-    Called after Katie confirms she has sent the email from Outlook.
-    """
+    # Mark a list of records as sent to accounting by setting accounting_exported_at = now().
     record_ids: list[str] = body.get("record_ids", [])
     if not record_ids:
         raise HTTPException(status_code=400, detail="record_ids is required")
@@ -307,10 +274,7 @@ def approve_bol(
     body: ApproveRequest = ApproveRequest(),
     db: Session = Depends(get_db),
 ):
-    """
-    Approve a record. Idempotent — approving an already-approved record
-    returns 200 without writing a duplicate history entry.
-    """
+    # Approve a record. Idempotent — approving an already-approved record is a no-op.
     if settings.USE_MOCK_DATA:
         rec = _find_mock(record_id)
         if rec["status"] == "approved":
@@ -352,18 +316,7 @@ def unapprove_bol(
     clear_accounting_export: bool = False,
     db: Session = Depends(get_db),
 ):
-    """
-    Revert an approved record back to pending review.
-
-    clear_accounting_export=True (added 2026-07-22, used by the Log tab's "Revert to
-    Pending" button) additionally clears accounting_exported_at and logs a
-    distinguishable reason on the ApprovalHistory row -- for the "accidentally fully
-    approved this and it already went to accounting" case, as opposed to an ordinary
-    same-day undo via ApprovedSection.jsx (which never has an accounting_exported_at
-    to clear yet). sid_exported_at is deliberately never touched by either path -- a
-    real Prophecy SID really was downloaded at some point, and reverting approval
-    doesn't undo that fact.
-    """
+    # revert an approved record back to pending
     if settings.USE_MOCK_DATA:
         rec = _find_mock(record_id)
         rec["status"] = "pending"
@@ -404,7 +357,7 @@ def flag_bol(
     body: FlagRequest,
     db: Session = Depends(get_db),
 ):
-    """Flag a record with a reason. Flagged records are excluded from exports."""
+    # flag a record with reasoning, flagged records excluded from exports
     if settings.USE_MOCK_DATA:
         rec = _find_mock(record_id)
         rec["status"] = "flagged"
@@ -442,7 +395,7 @@ def unflag_bol(
     record_id: str,
     db: Session = Depends(get_db),
 ):
-    """Return a flagged record to pending review, clearing the flag reason."""
+    # returns flagged record to pending review, clearing the flag reason
     if settings.USE_MOCK_DATA:
         rec = _find_mock(record_id)
         if rec["status"] != "flagged":
@@ -480,13 +433,8 @@ def mark_third_party(
     record_id: str,
     db: Session = Depends(get_db),
 ):
-    """Mark a record as third-party (customer pays freight directly).
-    Covers two populations: pre-invoice Technique records (no amount/BOL yet),
-    and invoice-only stubs that never matched any Technique/Prophecy record at
-    all (no technique_trip, no BOL — the invoice may still carry an amount, since
-    ALG billed something we just can't identify). Blocked once a record has BOTH
-    a real technique_trip AND an amount (a normal matched/invoiced Corp record),
-    or once a BOL number exists (already tied to a real Prophecy load). Idempotent."""
+    # Mark a record as third-party (customer pays freight directly).
+    # covers two populations: pre-invoice Technique records (no amount/BOL yet) and invoice-only stubs w/o a current match no technique no BOL
     if settings.USE_MOCK_DATA:
         rec = _find_mock(record_id)
         if rec.get("bol_number") is not None or (rec.get("technique_trip") is not None and rec.get("amount") is not None):
@@ -523,7 +471,7 @@ def unmark_third_party(
     record_id: str,
     db: Session = Depends(get_db),
 ):
-    """Revert a third-party record back to the normal pending queue."""
+    # revert 3-party record back to normal pending queue
     if settings.USE_MOCK_DATA:
         rec = _find_mock(record_id)
         rec["is_third_party"] = False
@@ -542,18 +490,8 @@ def unmark_third_party(
 
 @app.post("/api/bols/{record_id}/dismiss", response_model=BOLSummary, tags=["BOLs"])
 def dismiss_sibling(record_id: str, db: Session = Depends(get_db)):
-    """
-    Dismiss a bad/duplicate sibling manifest on an ambiguous trip — for the case
-    CompareManifestsModal.jsx exists to handle: Technique split a trip into manifests
-    that don't actually both need an invoice (human error making the manifest, a stray
-    duplicate, etc.). Only ever called from that modal's "Delete" button, on a candidate
-    that isn't the one holding the actual invoice.
-
-    Reversible in principle (nothing is deleted, just hidden), but there's no undo route
-    yet since nothing in the UI surfaces a dismissed record to undo from — added
-    2026-07-22 alongside sibling-manifest persistence (see "Ambiguous trips" in
-    CLAUDE.md); add one if that changes.
-    """
+# dismiss bad/sibling manifest on ambiguous trip (no invoice, just hide it from the queue)
+# reversible in principle (nothing deleted, just hidden)
     if settings.USE_MOCK_DATA:
         raise HTTPException(status_code=400, detail="Dismiss is disabled in mock mode.")
 
@@ -574,16 +512,8 @@ def dismiss_sibling(record_id: str, db: Session = Depends(get_db)):
 
 @app.post("/api/bols/{record_id}/acknowledge-mismatch", response_model=BOLSummary, tags=["BOLs"])
 def acknowledge_mismatch(record_id: str, db: Session = Depends(get_db)):
-    """
-    Clear the ~UNVERIFIED badge for a severe weight/pallet/piece mismatch that has no
-    ambiguous trip to compare against — the Compare modal only applies when
-    is_ambiguous_trip is set (multiple manifests to actually choose between); a
-    single-manifest mismatch had no available action at all before this (added
-    2026-07-22, direct user feedback after the Compare-button work). Unlike dismiss,
-    no guard on invoice presence — this doesn't hide or change any data, just
-    acknowledges the discrepancy is expected/explained. No undo route — same reasoning
-    as dismiss.
-    """
+    # clear unverified badge for a severe weight/pallet/piece mismatch that has no ambiguous trip to compare against
+    # compare modal only applies when ambigious trip situation is given
     if settings.USE_MOCK_DATA:
         rec = _find_mock(record_id)
         rec["mismatch_acknowledged"] = True
