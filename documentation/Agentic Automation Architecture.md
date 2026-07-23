@@ -1,4 +1,4 @@
-*created 2026-07-01*
+*created 2026-07-01, situational details updated 2026-07-22 — the design itself remains unimplemented (`backend/agents/` is empty on disk); no `.py` files, tables, or routes described below exist yet*
 
 ---
 
@@ -18,7 +18,7 @@ These come directly from constraints already baked into this app — the archite
 
 - **Human-in-the-loop by default.** Katie already reviews and approves/flags every record; agents extend that pattern rather than bypassing it. An agent never mutates a `BOLRecord`, sends an external email, or triggers an export on its own — it produces a **Proposal** that a human accepts, edits, or rejects.
 - **Reuse the data layer, don't bypass it.** Agents call the same `data_layer.py` functions and ORM models the rest of the app uses. No agent gets a raw SQL connection or an independent credential.
-- **Read-only against production sources, same as today.** `AWP-SQL-PROD`, `SQLAPPS3`, `SG360-TECH-PRD1` stay SELECT-only. Nothing in this design adds a new write path into company systems — the only new writes are to this app's own PostgreSQL database, exactly as `SECURITY.md` already scopes it.
+- **Read-only against production sources, same as today.** `AWP-SQL-PROD` and its `SQLAPPS3` linked server stay SELECT-only (a separate direct connection to `SG360-TECH-PRD1` was attempted at one point but removed 2026-07-20 — that server never actually hosted the ShipperPlus data it was thought to; it's not a live source and shouldn't be treated as one going forward). Nothing in this design adds a new write path into company systems — the only new writes are to this app's own PostgreSQL database, exactly as `SECURITY.md` already scopes it.
 - **Everything auditable.** Every agent run and every human disposition of its output is a row in the database, extending the existing `approval_history` precedent — not a log line that scrolls away.
 - **Mock-mode parity.** Agents must run against `mock_data.py` under `USE_MOCK_DATA=True` exactly like every other route, so they're demoable and developable without touching real systems or spending on LLM calls against production data.
 - **Additive extension.** Adding a new automated task should mean writing one new file and registering it — never editing an orchestrator/engine file. This is the direct answer to "flexible and scalable as new tasks are integrated later."
@@ -35,7 +35,7 @@ These come directly from constraints already baked into this app — the archite
 | **Tool** | A typed, narrow wrapper around one existing backend capability (`get_tariff_rate`, a read-only ORM query, `send_export_email`). Agents never get broader access than the tool grants. | `data_layer.py` functions themselves — this just adds a schema'd wrapper an LLM tool-call loop can invoke. |
 | **Run** | One execution instance of a Task. Persisted: status, inputs, outputs, tokens/cost, timestamps, linked `BOLRecord`(s). | Same shape as a row in `approval_history`, one level up. |
 | **Proposal** | The output of any Task that would change state. Requires explicit human accept / edit / reject before anything happens. Read-only analytical output skips this — it's just displayed. | Mirrors the existing Flag workflow: a flag is entered, then it sits until someone resolves it. |
-| **Trigger** | What starts a Run — a cron schedule, a DB-state condition ("invoice stub unmatched for 2+ days"), or a manual button in the dashboard. | The existing "Pull Manifests" / "Poll Email" buttons are manual triggers already; this generalizes the concept. |
+| **Trigger** | What starts a Run — a cron schedule, a DB-state condition ("invoice stub unmatched for 2+ days"), or a manual button in the dashboard. | The existing "⤓ Pull Invoices" / "🔍 Retry" buttons are manual triggers already; this generalizes the concept. (The old "Pull Manifests" button this originally referenced was removed 2026-07-22 — manifest discovery is now automatic and per-invoice, not a separate manual step.) |
 
 ---
 
@@ -177,7 +177,7 @@ New dashboard tab: **Agent Activity**, sitting alongside Pending / Approved / Th
 
 | Task | Trigger | What it proposes | Why this one |
 |---|---|---|---|
-| `propose-invoice-match` | Event: invoice-only stub exists with no Technique match | Best-candidate trip/manifest match with a confidence score, using signals beyond the current exact Job-Name match in `_process_invoice_csv()` (date proximity, weight/pallet similarity) | Highest current manual burden — stubs currently sit unmatched until someone manually reassigns via `reassign-invoice` |
+| `propose-invoice-match` | Event: invoice-only stub still unmatched after the automatic wide-fallback search has already run | Best-candidate trip/manifest match with a confidence score, using signals beyond exact Job-Name/quantity matching (date proximity, fuzzier weight/pallet similarity) | Reframed 2026-07-22: most of the original manual burden this cited is already gone — a deterministic wide-fallback search (`_wide_fallback_technique_search()`) now fires automatically on every new stub and resolves most matches without any human action. What's left for an LLM agent to add is genuinely harder: stubs that survive *that* automatic search and still need a fuzzier, lower-confidence guess than the deterministic cascade is willing to make on its own |
 | `draft-flag-reason` | Event: record's `cost_pct` is orange/red and still unflagged after the pull that surfaced it | A candidate flag reason, grounded in the variance and similar historical flags | Removes the blank-page problem of writing a flag reason from scratch |
 | `chase-missing-invoice` | Cron: nightly, records N business days old with no ALG invoice | A drafted follow-up email to Tanya/Phil — **queued, never sent** without explicit Accept, since this is external-facing | Currently no automated nudge exists; someone has to notice the gap manually |
 | `poll-health-monitor` | Cron: after each scheduled email/folder poll | A dashboard banner (not a Proposal — it's informational) if poll results look anomalous (e.g. zero results N days running) | Silent failures in `email_parser.py` / folder polling are currently only visible in logs |
@@ -249,7 +249,7 @@ New routes (in main.py, or split into backend/agents_routes.py once it grows):
   POST /api/agents/proposals/{id}/accept
   POST /api/agents/proposals/{id}/edit
   POST /api/agents/proposals/{id}/reject
-  POST /api/agents/tasks/{task_id}/run  — manual trigger, mirrors the existing "Pull Manifests" button pattern
+  POST /api/agents/tasks/{task_id}/run  — manual trigger, mirrors the existing "⤓ Pull Invoices" / "🔍 Retry" button pattern
 ```
 
 New tables added via the existing inline `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migration block in `main.py`'s lifespan — no Alembic introduced.

@@ -2,7 +2,7 @@
 
 > Status update on the AWS deployment: what's live, how it was built, and what's needed next. Mixed audience (leadership / security / DevOps) — skip to the section relevant to you.
 
-*Last reviewed: 2026-07-20.*
+*Last reviewed: 2026-07-22.*
 
 ---
 
@@ -27,7 +27,9 @@ The pieces:
 - **Loading the dashboard** → CloudFront serves cached static files straight from S3. Fast, no backend involved.
 - **Clicking anything (approve, upload, pull data, etc.)** → CloudFront forwards `/api/*` to API Gateway → API Gateway invokes Lambda → Lambda runs the same FastAPI backend code that runs locally → depending on the action, it talks to Aurora (app data), the on-prem SQL Server (live Technique/Prophecy data), Secrets Manager (credentials), or S3 (invoice files).
 
-One Lambda instance is currently kept permanently warm (provisioned concurrency) rather than purely on-demand — a cold start plus a live on-prem SQL query together were pushing past a hard 30-second platform timeout on the pull endpoint. That fixed the timeout but means this now runs continuously instead of purely on-demand; see Section 3 for lower-cost alternatives worth evaluating.
+One Lambda instance is currently kept permanently warm (provisioned concurrency) rather than purely on-demand — a cold start plus a live on-prem SQL query together were pushing past a hard 30-second platform timeout. That was originally diagnosed against the daily bulk "pull manifests" endpoint, which has since been removed entirely (2026-07-22) in favor of discovering manifest data per-invoice instead — but the same cold-start-plus-live-query risk still applies to the endpoints that replaced it (invoice retry-match, per-record BOL refresh), so provisioned concurrency is still doing real work, just for a different set of routes than originally. That fixed the timeout but means this now runs continuously instead of purely on-demand; see Section 3 for lower-cost alternatives worth evaluating.
+
+A related fix (2026-07-21): the on-prem SQL connection itself now has an 8-second connect timeout and an opt-in per-query timeout, instead of relying on pyodbc's 30-second default — a slow/unreachable on-prem connection during a live invoice search could otherwise guarantee an ungraceful Lambda kill, since 30s alone exceeds the Lambda's own 29-second hard timeout.
 
 ---
 
@@ -35,7 +37,7 @@ One Lambda instance is currently kept permanently warm (provisioned concurrency)
 
 **Deploy process** — one script, `deploy.ps1`, two independent halves:
 - **Backend** (code changes): build a new container image → push to ECR → run `terraform plan` → **stop**. A person reviews the plan and runs `terraform apply` themselves — a deliberate pause, since infrastructure changes always get a human look before landing.
-- **Frontend** (UI changes): build the React app → sync to S3 → invalidate CloudFront's cache. Fully automatic — this only replaces static files and is trivially safe to redo.
+- **Frontend** (UI changes): build the React app → sync to S3 (in two passes — hashed assets first with a long, immutable cache lifetime, then `index.html` last with caching disabled entirely, added 2026-07-22 so a page load never gets a stale `index.html` pointing at assets that no longer exist) → invalidate CloudFront's cache. Fully automatic — this only replaces static files and is trivially safe to redo.
 
 There is no CI/CD pipeline today — every deploy is run manually, from the author's own machine.
 
