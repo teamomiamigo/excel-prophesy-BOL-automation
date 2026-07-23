@@ -1,0 +1,97 @@
+name: Uptime check
+
+on:
+  schedule:
+    # Every 30 minutes, UTC. Independent of deploys/commits — this is a live
+    # monitor of whatever is currently running behind the API Gateway URL below.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+
+env:
+  # Live API Gateway URL (from `terraform output api_invoke_url` in terraform/main/).
+  # Update this if the API Gateway endpoint is ever recreated with a new URL.
+  HEALTH_URL: "https://5tjrkpdcr3.execute-api.us-east-1.amazonaws.com/health"
+
+jobs:
+  uptime-check:
+    name: Ping deployed /health
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check health endpoint
+        id: check
+        run: |
+          set -uo pipefail
+
+          http_response=$(curl -sS --max-time 15 -w '\n%{http_code}' "$HEALTH_URL" 2>&1)
+          curl_exit=$?
+
+          if [ $curl_exit -ne 0 ]; then
+            echo "::error::curl failed to reach $HEALTH_URL (exit $curl_exit): $http_response"
+            echo "failure_reason=curl exit $curl_exit: $http_response" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          http_code=$(echo "$http_response" | tail -1)
+          body=$(echo "$http_response" | sed '$d')
+          echo "HTTP $http_code"
+          echo "$body"
+
+          if [ "$http_code" != "200" ]; then
+            echo "::error::Health check returned HTTP $http_code"
+            echo "failure_reason=HTTP $http_code: $body" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          status=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+          db_online=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('db_online',''))" 2>/dev/null || echo "")
+
+          if [ "$status" != "ok" ]; then
+            echo "::error::status field was '$status', expected 'ok'"
+            echo "failure_reason=status=$status (body: $body)" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # This is the check that matters most: the July 16 production outage
+          # was a stale Aurora secret with the HTTP layer still answering fine —
+          # a plain 200 check would have missed it entirely.
+          if [ "$db_online" != "True" ]; then
+            echo "::error::db_online was '$db_online', expected True — database may be unreachable"
+            echo "failure_reason=db_online=$db_online (body: $body)" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "Health check passed: $body"
+
+      - name: Ensure "uptime" label exists
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create uptime --repo "${{ github.repository }}" \
+            --description "Live app health check failures" --color B60205 --force
+
+      - name: Open or update tracking issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REASON: ${{ steps.check.outputs.failure_reason }}
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          existing=$(gh issue list --repo "$repo" --label uptime --state open --json number --jq '.[0].number // empty')
+
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          body="Uptime check failed at $(date -u +"%Y-%m-%dT%H:%M:%SZ") UTC.
+
+          URL checked: ${HEALTH_URL}
+          Reason: ${REASON:-see workflow run logs}
+          Run: ${run_url}"
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$repo" --body "$body"
+          else
+            gh issue create --repo "$repo" --title "Live app health check failing" --label uptime --body "$body"
+          fi
