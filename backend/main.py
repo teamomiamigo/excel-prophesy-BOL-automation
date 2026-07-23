@@ -51,20 +51,14 @@ def _call_with_timeout(func, seconds, *args, **kwargs):
     # instead; the orphaned thread keeps running until its own doomed connection
     # attempt eventually gives up on its own, which is fine -- we only need the
     # calling thread, and therefore this request, bounded.
-    print(f"[DIAG] _call_with_timeout: submitting {func.__name__}, seconds={seconds}", flush=True)
     pool = ThreadPoolExecutor(max_workers=1)
     future = pool.submit(func, *args, **kwargs)
-    print(f"[DIAG] _call_with_timeout: submitted, calling future.result(timeout={max(1, seconds)})", flush=True)
     try:
-        result = future.result(timeout=max(1, seconds))
-        print(f"[DIAG] _call_with_timeout: future.result() returned normally", flush=True)
-        return result
+        return future.result(timeout=max(1, seconds))
     except FutureTimeoutError:
-        print(f"[DIAG] _call_with_timeout: future.result() RAISED FutureTimeoutError as expected", flush=True)
         raise _HardTimeout(f"exceeded {seconds}s hard deadline") from None
     finally:
         pool.shutdown(wait=False)
-        print(f"[DIAG] _call_with_timeout: shutdown(wait=False) returned", flush=True)
 
 from backend.config import settings
 from backend.database import get_db, engine
@@ -2349,7 +2343,6 @@ def _wide_fallback_technique_search(
     """
     from backend.data_layer import get_technique_data, get_manifest_weights
 
-    print(f"[DIAG] _wide_fallback_technique_search: start, job_name={job_name}", flush=True)
     start = time.monotonic()
     try:
         raw_manifests = _call_with_timeout(

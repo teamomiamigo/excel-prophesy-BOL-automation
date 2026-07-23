@@ -43,8 +43,6 @@ def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail",
     import pyodbc
     from backend.config import settings
 
-    print(f"[DIAG] _get_connection: start, server={server}", flush=True)
-
     # Raw TCP pre-check, before ever handing off to pyodbc.connect(). Confirmed live
     # 2026-07-23: when AWP-SQL-PROD is genuinely unreachable, pyodbc.connect()'s own
     # `timeout=8` below does NOT reliably fire -- the whole Lambda hangs for the full
@@ -55,14 +53,11 @@ def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail",
     # with it). socket.create_connection() uses CPython's own select()-based blocking
     # I/O, which does release the GIL and has always honored its timeout reliably in
     # testing here -- so this fails fast even in exactly the case where pyodbc doesn't.
-    print(f"[DIAG] _get_connection: socket precheck starting", flush=True)
     try:
         with socket.create_connection((server, 1433), timeout=5):
             pass
     except OSError as exc:
-        print(f"[DIAG] _get_connection: socket precheck FAILED: {exc!r}", flush=True)
         raise ConnectionError(f"AWP-SQL-PROD ({server}:1433) unreachable: {exc}") from exc
-    print(f"[DIAG] _get_connection: socket precheck passed", flush=True)
 
     # tcp: prefix + explicit port forces the TCP/IP Sockets network library --
     # without it the driver's own protocol order can intermittently pick Named
@@ -90,9 +85,7 @@ def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail",
     # 29s (terraform/main/lambda.tf), so a 30s connect timeout guarantees an
     # ungraceful Lambda kill (bare HTTP 500, nothing caught/logged) instead of a
     # fast, catchable connection failure on a slow/unreachable AWP-SQL-PROD.
-    print(f"[DIAG] _get_connection: about to call pyodbc.connect", flush=True)
     conn = pyodbc.connect(conn_str, timeout=8)
-    print(f"[DIAG] _get_connection: pyodbc.connect returned", flush=True)
     # Query-level timeout, distinct from the connect() timeout above: pyodbc applies
     # Connection.timeout to every cursor.execute() made on this connection. 
     # Without it, a slow/hung linked-server query (once connected) can block indefinitely,
