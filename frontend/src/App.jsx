@@ -30,6 +30,13 @@ async function runWithConcurrency(items, limit, fn) {
 
 const AUTO_RETRY_CONCURRENCY = 3;
 
+// A "timed_out" retry-match response (2026-07-23) means the live Technique search
+// didn't finish within its deadline -- NOT that the trip was confirmed absent. Direct
+// measurement found get_technique_data()'s own latency varying 17.5s-26.3s+ even with
+// no concurrency, so a single timeout is expected occasionally and is worth another
+// attempt rather than being recorded as a permanent miss. 1 initial + 2 retries.
+const AUTO_RETRY_MAX_ATTEMPTS = 3;
+
 // Reconciles a batch's initial "unmatched" list against the automatic retry-match
 // pass that runs right after upload/poll (see autoRetryNewStubs) — without this, the
 // Invoice Upload/Poll Results summary keeps reporting a record as unmatched even
@@ -362,13 +369,19 @@ export default function App() {
     const results = new Map();
     if (!recordIds.length) return results;
     await runWithConcurrency(recordIds, AUTO_RETRY_CONCURRENCY, async id => {
-      try {
-        const res = await fetch(`/api/bols/${id}/retry-match`, { method: 'POST' });
-        const data = await res.json().catch(() => ({}));
-        results.set(id, { matched: !!data.matched, trip: data.matched_trip, message: data.message });
-      } catch (err) {
-        results.set(id, { matched: false, message: err.message });
+      let data = {};
+      for (let attempt = 1; attempt <= AUTO_RETRY_MAX_ATTEMPTS; attempt++) {
+        try {
+          const res = await fetch(`/api/bols/${id}/retry-match`, { method: 'POST' });
+          data = await res.json().catch(() => ({}));
+        } catch (err) {
+          data = { matched: false, message: err.message };
+        }
+        // Only a timeout is worth another attempt -- a confirmed non-match (timed_out
+        // false) or a real match should stop immediately.
+        if (!data.timed_out || attempt === AUTO_RETRY_MAX_ATTEMPTS) break;
       }
+      results.set(id, { matched: !!data.matched, trip: data.matched_trip, message: data.message, timedOut: !!data.timed_out });
     });
     await fetchPending();
     return results;

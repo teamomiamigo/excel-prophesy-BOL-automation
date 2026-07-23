@@ -28,12 +28,18 @@ resource "aws_iam_role_policy_attachment" "lambda_vpc_access" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
-# Scoped to exactly the one secret the Lambda needs — not a blanket
-# secretsmanager:* grant across the account.
+# Scoped to exactly the two secrets the Lambda needs — not a blanket
+# secretsmanager:* grant across the account. The RDS-managed secret lets
+# config.py rebuild DATABASE_URL fresh from Aurora's own auto-rotated
+# password at every cold start, instead of a manually-synced copy going
+# stale on rotation (see lambda.tf's RDS_MASTER_SECRET_ARN env var).
 data "aws_iam_policy_document" "lambda_secrets_access" {
   statement {
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = ["arn:aws:secretsmanager:us-east-1:610614956027:secret:sg360-bol-live-credentials-qR83EV"]
+    actions = ["secretsmanager:GetSecretValue"]
+    resources = [
+      "arn:aws:secretsmanager:us-east-1:610614956027:secret:sg360-bol-live-credentials-qR83EV",
+      aws_rds_cluster.app[0].master_user_secret[0].secret_arn,
+    ]
   }
 }
 

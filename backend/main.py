@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -25,6 +26,45 @@ from sqlalchemy.orm import Session
 # eats Lambda's whole 29s budget and surfaces as an opaque 500 (which is exactly
 # what the S3 PDF route did while this VPC's DNS was broken).
 _S3_FAST_FAIL = BotoConfig(connect_timeout=2, read_timeout=5, retries={"max_attempts": 1})
+
+
+class _HardTimeout(Exception):
+    """Raised by _call_with_timeout() when the wrapped call runs past its deadline."""
+
+
+def _call_with_timeout(func, seconds, *args, **kwargs):
+    # pyodbc's own connect/query timeout parameters aren't reliably honored when
+    # AWP-SQL-PROD is genuinely unreachable (confirmed live 2026-07-23: retry-match
+    # hung the full 29s Lambda ceiling with zero driver activity logged, instead of
+    # pyodbc's 8s connect timeout firing). A signal.alarm-based deadline was tried
+    # first but doesn't work here: Starlette/FastAPI dispatch sync path functions
+    # (this one included) to a worker thread, and signal.alarm only works on the
+    # main thread -- confirmed live the same day ("signal only works in main thread
+    # of the main interpreter"), which made every call fail instantly and silently
+    # degrade to "no match" without ever attempting the live query. A thread-based
+    # bounded wait works from any thread -- BUT NOT as a `with ThreadPoolExecutor()`
+    # context manager: __exit__ calls shutdown(wait=True), which blocks until the
+    # background thread's call actually finishes, silently reintroducing the exact
+    # same unbounded hang after future.result()'s own timeout already fired
+    # (confirmed live 2026-07-23 -- still a full 29s Lambda kill, zero log output,
+    # even with the timeout in place). shutdown(wait=False) below returns immediately
+    # instead; the orphaned thread keeps running until its own doomed connection
+    # attempt eventually gives up on its own, which is fine -- we only need the
+    # calling thread, and therefore this request, bounded.
+    print(f"[DIAG] _call_with_timeout: submitting {func.__name__}, seconds={seconds}", flush=True)
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(func, *args, **kwargs)
+    print(f"[DIAG] _call_with_timeout: submitted, calling future.result(timeout={max(1, seconds)})", flush=True)
+    try:
+        result = future.result(timeout=max(1, seconds))
+        print(f"[DIAG] _call_with_timeout: future.result() returned normally", flush=True)
+        return result
+    except FutureTimeoutError:
+        print(f"[DIAG] _call_with_timeout: future.result() RAISED FutureTimeoutError as expected", flush=True)
+        raise _HardTimeout(f"exceeded {seconds}s hard deadline") from None
+    finally:
+        pool.shutdown(wait=False)
+        print(f"[DIAG] _call_with_timeout: shutdown(wait=False) returned", flush=True)
 
 from backend.config import settings
 from backend.database import get_db, engine
@@ -2244,10 +2284,25 @@ def _flag_if_resolved_match_looks_wrong(
             matched_rec.notes = f"{matched_rec.notes} {note}" if matched_rec.notes else note
 
 
+# get_technique_data(days_back=90) alone is documented at 15-23s, but direct repeated
+# measurement on 2026-07-23 found real latency ranging 17.5s-26.3s+ even with zero
+# concurrency -- any fixed deadline in that range will occasionally hard-kill a call that
+# would otherwise have found a real match, which _call_with_timeout() then silently
+# reported as "not found in Technique" (confirmed the same day against real invoices whose
+# trip was independently verified present). The deadline only exists to avoid an
+# ungraceful Lambda kill (bare HTTP 500, no traceback -- confirmed 2026-07-21) when a
+# connection is genuinely hung past Lambda's 29s hard ceiling; that risk doesn't exist in
+# local dev, so there's no reason to also clip healthy-but-slow queries there. Effectively
+# unbounded locally (matched_out/retry-match's own request has no external ceiling); tight
+# only under Lambda, detected via AWS_SECRET_NAME the same way config.py already does.
+_RUNNING_ON_LAMBDA = bool(os.environ.get("AWS_SECRET_NAME"))
+_WIDE_FALLBACK_DEADLINE = 25 if _RUNNING_ON_LAMBDA else 300  # seconds
+
+
 def _wide_fallback_technique_search(
     job_name: str, alg_weight: "float | None", alg_pallets: "int | None", alg_pcs: "int | None",
     days_back: int = 90, query_timeout: "int | None" = 15,
-) -> "tuple[dict | None, list[dict]]":
+) -> "tuple[dict | None, list[dict], bool]":
     """
     Live Technique search across `days_back` days (default 90) for a trip or manifest
     whose suffix matches job_name — the same two-tier trip-then-manifest suffix logic
@@ -2266,22 +2321,42 @@ def _wide_fallback_technique_search(
     retry but not on upload). query_timeout stays parameterized (default 15) rather
     than deleted outright in case a future caller ever needs to share a budget again.
 
-    Returns (best, all_candidates) — best is the winning manifest dict (as returned by
-    get_technique_data(), with technique_weight/pallets/pcs populated), or None if
-    nothing matches even in the wide window. all_candidates is every manifest that
-    shared the search suffix (best included, weights populated on all of them, empty
-    if best is None) — retry_match_invoice() uses this to persist the losing siblings
-    of an ambiguous trip as their own records (2026-07-22), not just the winner, since
-    nothing else populates them now that the old daily bulk pull is gone (see its
-    removal note) — without this, GET /api/bols/{id}/trip-manifests and reassign-invoice
-    would have no sibling data to compare/reassign against.
+    Returns (best, all_candidates, timed_out) — best is the winning manifest dict (as
+    returned by get_technique_data(), with technique_weight/pallets/pcs populated), or
+    None if nothing matches even in the wide window. all_candidates is every manifest
+    that shared the search suffix (best included, weights populated on all of them,
+    empty if best is None) — retry_match_invoice() uses this to persist the losing
+    siblings of an ambiguous trip as their own records (2026-07-22), not just the
+    winner, since nothing else populates them now that the old daily bulk pull is gone
+    (see its removal note) — without this, GET /api/bols/{id}/trip-manifests and
+    reassign-invoice would have no sibling data to compare/reassign against.
+
+    timed_out (2026-07-23) distinguishes "the search ran to completion and genuinely
+    found nothing" (timed_out=False, best=None) from "the search itself didn't finish"
+    (timed_out=True, best=None) -- direct measurement the same day found
+    get_technique_data(days_back=90)'s own latency ranging 17.5s-26.3s across repeated
+    calls with no concurrency involved, so any fixed deadline will occasionally clip a
+    call that would otherwise have found a real match. Before this, both cases returned
+    the identical (None, []) and retry_match_invoice() reported both as a permanent
+    "not found" -- indistinguishable from a real miss, and never retried automatically.
+
+    Wall-clock deadline (2026-07-23): wraps each live call via _call_with_timeout()
+    against _WIDE_FALLBACK_DEADLINE, tracked from this function's own start --
+    independent of query_timeout above, which pyodbc doesn't reliably honor when
+    AWP-SQL-PROD is genuinely unreachable. Guarantees this function degrades to "no
+    match" well before Lambda's 29s ceiling instead of an ungraceful kill with no
+    response at all.
     """
     from backend.data_layer import get_technique_data, get_manifest_weights
 
+    print(f"[DIAG] _wide_fallback_technique_search: start, job_name={job_name}", flush=True)
+    start = time.monotonic()
     try:
-        wide_manifests = _dedupe_technique_rows(
-            get_technique_data(days_back=days_back, query_timeout=query_timeout)
+        raw_manifests = _call_with_timeout(
+            get_technique_data, _WIDE_FALLBACK_DEADLINE - (time.monotonic() - start),
+            days_back=days_back, query_timeout=query_timeout,
         )
+        wide_manifests = _dedupe_technique_rows(raw_manifests)
 
         # Same "how many manifests does this trip have" count is_ambiguous_trip is based
         # on everywhere else -- records created via this wide fallback previously never
@@ -2302,47 +2377,61 @@ def _wide_fallback_technique_search(
 
         candidates = by_trip_suffix.get(job_name) or by_manifest_suffix.get(job_name) or []
         if not candidates:
-            return None, []
+            return None, [], False
         if len(candidates) == 1:
             candidates[0]["_trip_manifest_count"] = trip_manifest_counts.get(candidates[0].get("technique_trip"), 0)
-            return candidates[0], candidates
+            return candidates[0], candidates, False
 
         # Multiple manifests share this suffix in the wide window — score by closeness
         # to the invoice's own billed quantities instead of taking an arbitrary one.
         # Weights are populated on every candidate here (not just the winner) so the
         # caller can persist siblings with real technique_weight/pallets/pcs too.
-        score_weights = get_manifest_weights([c["manifest"] for c in candidates], query_timeout=query_timeout)
-        for c in candidates:
-            wd = score_weights.get(c["manifest"], {})
-            c["technique_weight"]  = wd.get("technique_weight", 0)
-            c["technique_pallets"] = wd.get("technique_pallets", 0)
-            c["technique_pcs"]     = wd.get("technique_pcs", 0)
-        best, score = _closest_technique_match(candidates, float(alg_weight or 0), alg_pallets or 0, alg_pcs or 0)
-        if score > _CLOSE_MATCH_THRESHOLD:
+        # Only attempt this second live round-trip if real time is left in the shared
+        # deadline -- two live calls chaining back-to-back is exactly the scenario that
+        # can exceed Lambda's 29s ceiling even when each individual call behaves.
+        remaining = _WIDE_FALLBACK_DEADLINE - (time.monotonic() - start)
+        if remaining < 3:
             logger.warning(
-                "[INVOICE WIDE FALLBACK] closest match among %d candidates on suffix '%s' "
-                "still has a large discrepancy (score=%.3f) - verify manually",
-                len(candidates), job_name, score,
+                "[INVOICE WIDE FALLBACK] only %.1fs left in the deadline after the first "
+                "live query -- skipping the scoring round-trip for suffix '%s' and picking "
+                "a candidate without it",
+                remaining, job_name,
             )
+            best = next((c for c in candidates if c.get("bol_number")), candidates[0])
+        else:
+            score_weights = _call_with_timeout(
+                get_manifest_weights, remaining,
+                [c["manifest"] for c in candidates], query_timeout=query_timeout,
+            )
+            for c in candidates:
+                wd = score_weights.get(c["manifest"], {})
+                c["technique_weight"]  = wd.get("technique_weight", 0)
+                c["technique_pallets"] = wd.get("technique_pallets", 0)
+                c["technique_pcs"]     = wd.get("technique_pcs", 0)
+            best, score = _closest_technique_match(candidates, float(alg_weight or 0), alg_pallets or 0, alg_pcs or 0)
+            if score > _CLOSE_MATCH_THRESHOLD:
+                logger.warning(
+                    "[INVOICE WIDE FALLBACK] closest match among %d candidates on suffix '%s' "
+                    "still has a large discrepancy (score=%.3f) - verify manually",
+                    len(candidates), job_name, score,
+                )
         trip_count = trip_manifest_counts.get(best.get("technique_trip"), 0)
         for c in candidates:
             c["_trip_manifest_count"] = trip_count
-        return best, candidates
+        return best, candidates, False
     except Exception as exc:
         # A hung/slow on-prem query here used to guarantee an ungraceful Lambda kill
         # (bare HTTP 500, no traceback -- confirmed 2026-07-21 via CloudWatch on a real
-        # invoice upload) since nothing caught it. Treat any failure the same as "no
-        # match in the wide window either" -- retry_match_invoice() already handles a
-        # None return by reporting "not found" rather than propagating the failure, and
-        # the stub it was called on is left untouched, so a later manual retry (or the
-        # next automatic one, if this was called from the frontend's post-upload retry)
-        # can simply try again.
+        # invoice upload) since nothing caught it. The stub it was called on is left
+        # untouched either way, so a retry can simply try again -- but this is a search
+        # that DIDN'T complete, not one that completed and found nothing (timed_out=True
+        # distinguishes the two as of 2026-07-23; see docstring).
         logger.warning(
             "[INVOICE WIDE FALLBACK] live Technique search failed for suffix '%s' "
-            "(days_back=%d): %s — treating as no match.",
+            "(days_back=%d): %s — treating as timed out, not a confirmed non-match.",
             job_name, days_back, exc,
         )
-        return None, []
+        return None, [], True
 
 
 def _apply_invoice_match(
@@ -4078,12 +4167,21 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     if not job_name_s:
         return {"matched": False, "message": "No job name on this invoice to match against."}
 
-    wide_match, all_candidates = _wide_fallback_technique_search(
+    wide_match, all_candidates, timed_out = _wide_fallback_technique_search(
         job_name_s, float(stub.alg_weight or 0), stub.alg_pallets, stub.alg_pcs,
         query_timeout=None,
     )
     if wide_match is None:
-        return {"matched": False, "message": "Still not found in Technique (checked last 90 days)."}
+        if timed_out:
+            # The search didn't finish within its deadline -- distinct from a confirmed
+            # miss (see _wide_fallback_technique_search()'s docstring, 2026-07-23): the
+            # trip may well exist, we just don't know yet. Retryable, not a final answer.
+            return {
+                "matched": False,
+                "timed_out": True,
+                "message": "Technique search timed out before finishing -- please retry.",
+            }
+        return {"matched": False, "timed_out": False, "message": "Still not found in Technique (checked last 90 days)."}
 
     from backend.data_layer import get_manifest_weights
     weight_data = get_manifest_weights([wide_match["manifest"]]).get(wide_match["manifest"], {})

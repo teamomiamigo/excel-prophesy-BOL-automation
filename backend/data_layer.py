@@ -39,12 +39,40 @@ def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail",
     Only pass this in where a query is known to be sharing a request's time budget with other work -- see _wide_fallback_technique_search()'s callers in main.py, 
     the one call site this was actually built for (fixed 2026-07-22 after a global 15s default broke the main Technique pull, which needs more than that).
     """
+    import socket
     import pyodbc
     from backend.config import settings
+
+    print(f"[DIAG] _get_connection: start, server={server}", flush=True)
+
+    # Raw TCP pre-check, before ever handing off to pyodbc.connect(). Confirmed live
+    # 2026-07-23: when AWP-SQL-PROD is genuinely unreachable, pyodbc.connect()'s own
+    # `timeout=8` below does NOT reliably fire -- the whole Lambda hangs for the full
+    # 29s with zero driver-level activity logged, even when the call is dispatched to
+    # a separate Python thread with its own independent timeout (that hangs too, past
+    # its own bound -- consistent with the ODBC driver's blocking call not releasing
+    # the GIL, which would freeze every other Python thread in the process right along
+    # with it). socket.create_connection() uses CPython's own select()-based blocking
+    # I/O, which does release the GIL and has always honored its timeout reliably in
+    # testing here -- so this fails fast even in exactly the case where pyodbc doesn't.
+    print(f"[DIAG] _get_connection: socket precheck starting", flush=True)
+    try:
+        with socket.create_connection((server, 1433), timeout=5):
+            pass
+    except OSError as exc:
+        print(f"[DIAG] _get_connection: socket precheck FAILED: {exc!r}", flush=True)
+        raise ConnectionError(f"AWP-SQL-PROD ({server}:1433) unreachable: {exc}") from exc
+    print(f"[DIAG] _get_connection: socket precheck passed", flush=True)
+
+    # tcp: prefix + explicit port forces the TCP/IP Sockets network library --
+    # without it the driver's own protocol order can intermittently pick Named
+    # Pipes instead (confirmed live 2026-07-23: 08001 "Named Pipes Provider"
+    # failures on some calls, immediately after other calls succeeded, with the
+    # raw TCP path to this same host:port unaffected throughout).
     if settings.SQLSERVER_USER and settings.SQLSERVER_PASSWORD:
         conn_str = (
             f"DRIVER={{{settings.SQLSERVER_ODBC_DRIVER}}};"
-            f"SERVER={server};"
+            f"SERVER=tcp:{server},1433;"
             f"DATABASE={database};"
             f"UID={settings.SQLSERVER_USER};"
             f"PWD={settings.SQLSERVER_PASSWORD};"
@@ -53,7 +81,7 @@ def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail",
     else:
         conn_str = (
             f"DRIVER={{{settings.SQLSERVER_ODBC_DRIVER}}};"
-            f"SERVER={server};"
+            f"SERVER=tcp:{server},1433;"
             f"DATABASE={database};"
             f"Trusted_Connection=yes;"
             f"Encrypt=yes;TrustServerCertificate=yes;"
@@ -62,7 +90,9 @@ def _get_connection(server: str = "172.17.23.172", database: str = "VisualMail",
     # 29s (terraform/main/lambda.tf), so a 30s connect timeout guarantees an
     # ungraceful Lambda kill (bare HTTP 500, nothing caught/logged) instead of a
     # fast, catchable connection failure on a slow/unreachable AWP-SQL-PROD.
+    print(f"[DIAG] _get_connection: about to call pyodbc.connect", flush=True)
     conn = pyodbc.connect(conn_str, timeout=8)
+    print(f"[DIAG] _get_connection: pyodbc.connect returned", flush=True)
     # Query-level timeout, distinct from the connect() timeout above: pyodbc applies
     # Connection.timeout to every cursor.execute() made on this connection. 
     # Without it, a slow/hung linked-server query (once connected) can block indefinitely,
