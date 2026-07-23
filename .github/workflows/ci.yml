@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+
+jobs:
+  backend-smoke:
+    name: Backend smoke test (mock mode)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install unixODBC headers (pyodbc build dependency)
+        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
+
+      - name: Install backend dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Start app in mock mode and check /health
+        env:
+          USE_MOCK_DATA: "True"
+        run: |
+          set -euo pipefail
+          python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --log-level warning &
+          UVICORN_PID=$!
+          trap 'kill $UVICORN_PID 2>/dev/null || true' EXIT
+
+          echo "Waiting for the app to come up..."
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/health -o /tmp/health.json; then
+              echo "App responded after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+          if [ ! -s /tmp/health.json ]; then
+            echo "::error::App never responded on /health within 30s"
+            exit 1
+          fi
+
+          cat /tmp/health.json
+          python -c "
+          import json, sys
+          data = json.load(open('/tmp/health.json'))
+          assert data.get('status') == 'ok', f'unexpected status: {data}'
+          assert data.get('mock_mode') is True, f'expected mock_mode true: {data}'
+          print('Health check passed:', data)
+          "
+
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify build output
+        run: test -f dist/index.html
+
+  security-scan:
+    name: Security scan (secrets, dependency CVEs, SAST)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # --- Secret scanning ---
+      # continue-on-error: bake-in period only — see the plan's rollout section.
+      # Remove once findings are triaged/allowlisted and this should be a real gate.
+      - name: Install gitleaks
+        continue-on-error: true
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+
+      - name: Scan for secrets (gitleaks)
+        continue-on-error: true
+        run: gitleaks dir . --config .gitleaks.toml --redact --no-banner
+
+      # --- Dependency vulnerability scanning ---
+      - name: Python dependency audit (pip-audit)
+        continue-on-error: true
+        run: |
+          pip install pip-audit
+          pip-audit -r backend/requirements.txt
+
+      - name: JS dependency audit (npm audit)
+        continue-on-error: true
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+      # --- SAST ---
+      - name: Static analysis (semgrep)
+        continue-on-error: true
+        run: |
+          pip install semgrep
+          semgrep scan --config p/python --config p/default --metrics=off .
