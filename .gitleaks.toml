@@ -1,0 +1,21 @@
+title = "SG360 BOL Automation gitleaks config"
+
+[extend]
+useDefault = true
+
+# Known non-secret literals in backend/config.py: a local-dev-only DB URL default
+# (never used against any real database) and static IPs used to work around broken
+# VPC DNS resolution (see the comment block at the top of that file). Neither is a
+# credential — allowlisted so CI doesn't flag them on every run.
+[[allowlists]]
+description = "Non-secret defaults in backend/config.py (dev DB URL, static VPC DNS IPs)"
+paths = [
+  '''backend/config\.py''',
+]
+regexes = [
+  '''postgresql://sg360_user:localpass@localhost:5432/sg360_bol''',
+  '''172\.31\.20\.236''',
+  '''172\.31\.11\.70''',
+  '''172\.17\.23\.172''',
+  '''52\.216\.36\.234''',
+]
