@@ -1,4 +1,4 @@
-export default function SummaryBar({ awaitingInvoice, readyToReview, readyToReviewTypeA, readyToReviewTypeB, approvedToday }) {
+export default function SummaryBar({ awaitingInvoice, readyToReview, readyToReviewTypeA, readyToReviewTypeB, approvedToday, aiReviewed }) {
   const cards = [
     { label: 'Awaiting Invoice', value: awaitingInvoice, color: '#6b7280', bg: '#f9fafb' },
     {
@@ -10,6 +10,9 @@ export default function SummaryBar({ awaitingInvoice, readyToReview, readyToRevi
     },
     { label: 'Approved Today', value: approvedToday, color: '#2D6A4F', bg: '#f0fdf4' },
   ];
+  if (aiReviewed != null) {
+    cards.push({ label: 'AI-Reviewed', value: aiReviewed, color: '#6366f1', bg: '#eef2ff' });
+  }
 
   return (
     <div style={{ display: 'flex', gap: 16, marginBottom: 20 }}>

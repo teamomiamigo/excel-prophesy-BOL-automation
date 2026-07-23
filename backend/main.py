@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import secrets
 import tempfile
 import time
 import uuid
@@ -33,11 +34,14 @@ from backend.models import (
     BOLSummary, FlagRequest, ApproveRequest,
     ExportRequest, ExportResponse, HealthResponse,
     ManifestCandidate, TripManifestsResponse,
+    AgentRun, AgentProposal, AgentRunStatus, ProposalAction, ProposalStatus,
+    AgentProposalSummary, RejectProposalRequest, AcceptBatchRequest,
     TariffRate, AlgTariffRate, FuelSurchargeRate,
 )
 from backend.mock_data import MOCK_BOLS
-from backend.email_service import send_bol_export_email
+from backend.email_service import send_bol_export_email, send_agent_summary_email
 from backend.csv_export import get_csv_filename, get_sid_filename, generate_sid_csv, generate_mock_sid_rows
+from backend.agents.pipeline import run_agent_pipeline
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -139,6 +143,11 @@ async def global_exception_handler(request: Request, exc: Exception):
 # Mock state (in-memory; mutations survive process lifetime, reset on restart)
 _mock_state: dict[str, dict] = {r["id"]: dict(r) for r in MOCK_BOLS}
 
+# AI agent layer (backend/agents/) — same lifecycle as _mock_state: empty at
+# startup, populated only when "Run AI Agent" is clicked, reset on restart.
+_mock_agent_runs: dict[str, dict] = {}
+_mock_agent_proposals: dict[str, dict] = {}
+
 
 def _find_mock(record_id: str) -> dict:
     # lookup by UUID, invoice_number, or bol_number
@@ -150,6 +159,12 @@ def _find_mock(record_id: str) -> dict:
         if rec["bol_number"] is not None and str(rec["bol_number"]) == record_id:
             return rec
     raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
+
+
+def _find_mock_proposal(proposal_id: str) -> dict:
+    if proposal_id in _mock_agent_proposals:
+        return _mock_agent_proposals[proposal_id]
+    raise HTTPException(status_code=404, detail=f"Proposal '{proposal_id}' not found")
 
 
 def _record_to_summary(r: dict) -> dict:
@@ -4331,6 +4346,390 @@ def export_approved_bols(
             f"Email {'sent to Mary and Katie' if email_sent else 'not sent — SMTP not configured, check logs'}."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# AI agent layer — draft-only, human-in-the-loop (backend/agents/)
+#
+# The agent never mutates a BOLRecord itself. POST /api/agents/run only
+# classifies pending records and drafts reasoning into AgentProposal rows;
+# every actual mutation happens in _accept_proposal() below, which calls the
+# exact same approve_bol()/flag_bol() functions a manual dashboard click uses
+# — never a parallel mutation path. Rejecting a proposal has zero effect on
+# the underlying record.
+# ---------------------------------------------------------------------------
+
+def _fmt_money(val) -> str:
+    if val is None:
+        return "N/A"
+    return f"${float(val):,.2f}"
+
+
+def _pending_records_for_agent(db: Session) -> list[dict]:
+    """All currently-pending records, BOLSummary-shaped dicts either way —
+    the pipeline/classifier only ever deal in plain dicts, mock or live.
+
+    Live-mode filter mirrors GET /api/bols (see "Ambiguous trips" in
+    CLAUDE.md): excludes invoice-less sibling-manifest stubs so the agent
+    never drafts a proposal for a record Katie's own dashboard hides from
+    her too — those stubs have no cost_pct yet anyway and would just be
+    skipped, but querying them at all is wasted work and a state the agent's
+    view of "pending" should match the human's exactly."""
+    if settings.USE_MOCK_DATA:
+        return [_record_to_summary(r) for r in _mock_state.values() if r["status"] == "pending"]
+    rows = (
+        db.query(BOLRecord)
+        .filter(
+            BOLRecord.status == BOLStatus.PENDING,
+            BOLRecord.invoice_number.isnot(None),
+        )
+        .all()
+    )
+    return [BOLSummary.model_validate(row).model_dump() for row in rows]
+
+
+def _accept_proposal(proposal_id: str, reviewed_by: str, db: Session):
+    """
+    The single mutation path for accepting an AI proposal — used by the
+    per-proposal accept route, the batch-accept route, and the one-click
+    email link's POST route. Calls approve_bol()/flag_bol() directly (their
+    mutation logic lives inline in those route functions, not a separate
+    helper) so an accepted proposal produces a byte-identical BOLRecord
+    mutation and ApprovalHistory row to a manual dashboard click.
+
+    Idempotent: accepting an already-reviewed proposal is a no-op, mirroring
+    approve_bol()'s own idempotency contract.
+    """
+    if settings.USE_MOCK_DATA:
+        proposal = _find_mock_proposal(proposal_id)
+        if proposal["status"] != "pending":
+            return proposal
+        record_id = proposal["bol_record_id"]
+        action = proposal["recommended_action"]
+        reasoning = proposal["reasoning"]
+    else:
+        proposal = db.query(AgentProposal).filter(AgentProposal.id == proposal_id).first()
+        if not proposal:
+            raise HTTPException(status_code=404, detail=f"Proposal '{proposal_id}' not found")
+        if proposal.status != ProposalStatus.PENDING:
+            return proposal
+        record_id = str(proposal.bol_record_id)
+        action = proposal.recommended_action.value
+        reasoning = proposal.reasoning
+
+    if action == "approve":
+        approve_bol(record_id, ApproveRequest(approved_by=f"ai-agent (accepted by {reviewed_by})"), db)
+    else:
+        flag_bol(record_id, FlagRequest(reason=reasoning), db)
+
+    reviewed_at = datetime.now(timezone.utc)
+    if settings.USE_MOCK_DATA:
+        proposal["status"] = "accepted"
+        proposal["reviewed_by"] = reviewed_by
+        proposal["reviewed_at"] = reviewed_at
+    else:
+        proposal.status = ProposalStatus.ACCEPTED
+        proposal.reviewed_by = reviewed_by
+        proposal.reviewed_at = reviewed_at
+        db.commit()
+        db.refresh(proposal)
+    return proposal
+
+
+def _get_agent_run_or_404(run_id: str, token: str, db: Session):
+    if settings.USE_MOCK_DATA:
+        run = _mock_agent_runs.get(run_id)
+        run_token = run.get("email_action_token") if run else None
+    else:
+        run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+        run_token = run.email_action_token if run else None
+    # Same 404 regardless of which part mismatched — don't reveal which.
+    if not run or not token or run_token != token:
+        raise HTTPException(status_code=404, detail="Run not found or link is invalid/expired.")
+    return run
+
+
+def _pending_recommended_approvals_for_run(run_id: str, db: Session) -> list:
+    if settings.USE_MOCK_DATA:
+        return [
+            p for p in _mock_agent_proposals.values()
+            if p["run_id"] == run_id and p["recommended_action"] == "approve" and p["status"] == "pending"
+        ]
+    return (
+        db.query(AgentProposal)
+        .filter(
+            AgentProposal.run_id == run_id,
+            AgentProposal.recommended_action == ProposalAction.APPROVE,
+            AgentProposal.status == ProposalStatus.PENDING,
+        )
+        .all()
+    )
+
+
+@app.post("/api/agents/run", tags=["Agents"])
+def run_ai_agent(db: Session = Depends(get_db)):
+    """
+    One-click AI agent trigger: pulls any new invoice CSVs (same logic as
+    "Pull Invoices"), classifies every currently-pending record, drafts
+    reasoning for anything that isn't a clean approve, persists the
+    recommendations as reviewable proposals, and emails Katie one summary
+    with a one-click "approve all recommended" link.
+
+    Fully synchronous — no BackgroundTasks/queue, matching this app's own
+    scale (one reviewer, small daily volume).
+    """
+    run_started_at = datetime.now(timezone.utc)
+
+    try:
+        poll_result = poll_invoice_folder(db)
+    except HTTPException as exc:
+        # No folder configured/reachable in this environment — the agent can
+        # still classify whatever is already pending; it just found nothing new.
+        poll_result = {"found": 0, "processed": [], "message": str(exc.detail)}
+
+    pending = _pending_records_for_agent(db)
+    pipeline_result = run_agent_pipeline(pending)
+    drafted = pipeline_result["proposals"]
+
+    run_id = str(uuid.uuid4())
+    email_token = secrets.token_urlsafe(24)
+    finished_at = datetime.now(timezone.utc)
+
+    if settings.USE_MOCK_DATA:
+        _mock_agent_runs[run_id] = {
+            "id": run_id,
+            "status": "succeeded",
+            "started_at": run_started_at,
+            "finished_at": finished_at,
+            "invoices_found": poll_result.get("found", 0),
+            "invoices_processed": len(poll_result.get("processed", [])),
+            "records_classified": len(pending),
+            "proposals_created": len(drafted),
+            "email_sent": False,
+            "email_action_token": email_token,
+            "error": None,
+        }
+        stored_proposals = []
+        for p in drafted:
+            proposal_id = str(uuid.uuid4())
+            record = {
+                "id": proposal_id,
+                "run_id": run_id,
+                "bol_record_id": p["bol_record_id"],
+                "recommended_action": p["recommended_action"],
+                "confidence": p["confidence"],
+                "reasoning": p["reasoning"],
+                "reasoning_source": p["reasoning_source"],
+                "signal_summary": json.dumps(p["signal_summary"], default=str),
+                "invoice_number": p["invoice_number"],
+                "technique_trip": p["technique_trip"],
+                "manifest": p["manifest"],
+                "amount": p["amount"],
+                "cost_pct": p["cost_pct"],
+                "status": "pending",
+                "reviewed_by": None,
+                "reviewed_at": None,
+                "reject_reason": None,
+                "created_at": finished_at,
+            }
+            _mock_agent_proposals[proposal_id] = record
+            stored_proposals.append(record)
+    else:
+        run_row = AgentRun(
+            id=uuid.UUID(run_id),
+            status=AgentRunStatus.SUCCEEDED,
+            started_at=run_started_at,
+            finished_at=finished_at,
+            invoices_found=poll_result.get("found", 0),
+            invoices_processed=len(poll_result.get("processed", [])),
+            records_classified=len(pending),
+            proposals_created=len(drafted),
+            email_sent=False,
+            email_action_token=email_token,
+        )
+        db.add(run_row)
+        db.flush()
+        proposal_rows = []
+        for p in drafted:
+            proposal_row = AgentProposal(
+                run_id=run_row.id,
+                bol_record_id=uuid.UUID(str(p["bol_record_id"])),
+                recommended_action=ProposalAction(p["recommended_action"]),
+                confidence=Decimal(str(p["confidence"])),
+                reasoning=p["reasoning"],
+                reasoning_source=p["reasoning_source"],
+                signal_summary=json.dumps(p["signal_summary"], default=str),
+                invoice_number=p["invoice_number"],
+                technique_trip=p["technique_trip"],
+                manifest=p["manifest"],
+                amount=p["amount"],
+                cost_pct=p["cost_pct"],
+            )
+            db.add(proposal_row)
+            proposal_rows.append(proposal_row)
+        db.commit()
+        stored_proposals = [AgentProposalSummary.model_validate(pr).model_dump() for pr in proposal_rows]
+
+    email_sent = send_agent_summary_email(
+        stored_proposals, poll_result, {"id": run_id, "email_action_token": email_token},
+    )
+
+    if settings.USE_MOCK_DATA:
+        _mock_agent_runs[run_id]["email_sent"] = email_sent
+    else:
+        run_row.email_sent = email_sent
+        db.commit()
+
+    approve_count = sum(1 for p in drafted if p["recommended_action"] == "approve")
+    review_count = sum(1 for p in drafted if p["recommended_action"] == "needs_review")
+    flag_count = sum(1 for p in drafted if p["recommended_action"] == "flag")
+
+    return {
+        "run_id": run_id,
+        "invoices_found": poll_result.get("found", 0),
+        "invoices_processed": len(poll_result.get("processed", [])),
+        "records_classified": len(pending),
+        "proposals_created": len(drafted),
+        "recommended_approve": approve_count,
+        "recommended_needs_review": review_count,
+        "recommended_flag": flag_count,
+        "skipped_no_cost_data": pipeline_result["skipped_count"],
+        "email_sent": email_sent,
+        "message": (
+            f"Classified {len(pending)} pending record(s): {approve_count} recommend-approve, "
+            f"{review_count} needs-review, {flag_count} recommend-flag. "
+            + ("Summary email sent to Katie." if email_sent
+               else "Email not configured — check server logs for the batch-approve link.")
+        ),
+    }
+
+
+@app.get("/api/agents/proposals", response_model=list[AgentProposalSummary], tags=["Agents"])
+def list_agent_proposals(status: Optional[str] = None, db: Session = Depends(get_db)):
+    """Proposals for the Agent Activity tab. Optional ?status=pending|accepted|rejected."""
+    if settings.USE_MOCK_DATA:
+        records = list(_mock_agent_proposals.values())
+        if status:
+            records = [r for r in records if r["status"] == status]
+        return sorted(records, key=lambda r: r["created_at"], reverse=True)
+
+    query = db.query(AgentProposal)
+    if status:
+        try:
+            query = query.filter(AgentProposal.status == ProposalStatus(status))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid status '{status}'")
+    return query.order_by(AgentProposal.created_at.desc()).all()
+
+
+@app.post("/api/agents/proposals/{proposal_id}/accept", response_model=AgentProposalSummary, tags=["Agents"])
+def accept_agent_proposal(proposal_id: str, db: Session = Depends(get_db)):
+    return _accept_proposal(proposal_id, reviewed_by="coordinator", db=db)
+
+
+@app.post("/api/agents/proposals/{proposal_id}/reject", response_model=AgentProposalSummary, tags=["Agents"])
+def reject_agent_proposal(
+    proposal_id: str,
+    body: RejectProposalRequest = RejectProposalRequest(),
+    db: Session = Depends(get_db),
+):
+    """Reject a proposal — zero effect on the underlying record. No reason required."""
+    if settings.USE_MOCK_DATA:
+        proposal = _find_mock_proposal(proposal_id)
+        if proposal["status"] == "pending":
+            proposal["status"] = "rejected"
+            proposal["reviewed_by"] = "coordinator"
+            proposal["reviewed_at"] = datetime.now(timezone.utc)
+            proposal["reject_reason"] = body.reason
+        return proposal
+
+    proposal = db.query(AgentProposal).filter(AgentProposal.id == proposal_id).first()
+    if not proposal:
+        raise HTTPException(status_code=404, detail=f"Proposal '{proposal_id}' not found")
+    if proposal.status == ProposalStatus.PENDING:
+        proposal.status = ProposalStatus.REJECTED
+        proposal.reviewed_by = "coordinator"
+        proposal.reviewed_at = datetime.now(timezone.utc)
+        proposal.reject_reason = body.reason
+        db.commit()
+        db.refresh(proposal)
+    return proposal
+
+
+@app.post("/api/agents/proposals/accept-batch", tags=["Agents"])
+def accept_agent_proposals_batch(body: AcceptBatchRequest, db: Session = Depends(get_db)):
+    for pid in body.proposal_ids:
+        _accept_proposal(pid, reviewed_by="coordinator", db=db)
+    return {"accepted": len(body.proposal_ids)}
+
+
+@app.get("/api/agents/email-batch-approve", tags=["Agents"])
+def email_batch_approve_confirm(run_id: str, token: str, db: Session = Depends(get_db)):
+    """
+    Read-only confirmation page for the one-click "approve all recommended"
+    email link. A bare GET — all any link-prefetcher like O365 Safe Links
+    ever does — can never mutate anything; only the POST from this page's
+    own form does (see below). Degrades gracefully to "nothing pending"
+    rather than erroring if visited again after everything's been actioned.
+    """
+    _get_agent_run_or_404(run_id, token, db)
+    pending_approvals = _pending_recommended_approvals_for_run(run_id, db)
+    count = len(pending_approvals)
+
+    if count == 0:
+        body_html = "<p>No pending AI-recommended approvals remain for this run — nothing left to do.</p>"
+    else:
+        def _row(p):
+            invoice = p["invoice_number"] if settings.USE_MOCK_DATA else p.invoice_number
+            trip = p["technique_trip"] if settings.USE_MOCK_DATA else p.technique_trip
+            amount = p["amount"] if settings.USE_MOCK_DATA else p.amount
+            return f"<li>{invoice or trip or 'record'} — {_fmt_money(amount)}</li>"
+
+        rows = "".join(_row(p) for p in pending_approvals)
+        body_html = f"""
+        <p>{count} record(s) were recommended for approval by the AI agent and are still pending:</p>
+        <ul>{rows}</ul>
+        <form method="POST" action="/api/agents/email-batch-approve">
+          <input type="hidden" name="run_id" value="{run_id}">
+          <input type="hidden" name="token" value="{token}">
+          <button type="submit" style="background:#2D6A4F;color:#fff;border:none;border-radius:6px;padding:10px 18px;font-size:14px;cursor:pointer;">
+            Approve all {count} recommended
+          </button>
+        </form>
+        """
+
+    html = (
+        "<html><body style='font-family: -apple-system, sans-serif; max-width: 640px; margin: 40px auto; color:#111;'>"
+        f"<h2>SG360 BOL — AI Agent Recommendations</h2>{body_html}</body></html>"
+    )
+    return Response(content=html, media_type="text/html")
+
+
+@app.post("/api/agents/email-batch-approve", tags=["Agents"])
+def email_batch_approve_submit(
+    run_id: str = Form(...),
+    token: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """
+    The only mutating route in this pair — reached only via an explicit human
+    click on the GET route's confirmation page. Approves every still-pending
+    recommend-approve proposal on this run through _accept_proposal(), the
+    same path a manual dashboard Accept click uses.
+    """
+    _get_agent_run_or_404(run_id, token, db)
+    pending_approvals = _pending_recommended_approvals_for_run(run_id, db)
+    accepted = 0
+    for p in pending_approvals:
+        pid = p["id"] if settings.USE_MOCK_DATA else str(p.id)
+        _accept_proposal(pid, reviewed_by="katie (via email link)", db=db)
+        accepted += 1
+
+    html = (
+        "<html><body style='font-family: -apple-system, sans-serif; max-width: 640px; margin: 40px auto; color:#111;'>"
+        f"<h2>Done</h2><p>{accepted} record(s) approved.</p></body></html>"
+    )
+    return Response(content=html, media_type="text/html")
 
 
 # ---------------------------------------------------------------------------

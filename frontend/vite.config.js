@@ -4,11 +4,13 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [react()],
   server: {
-    port: 3000,
+    // Bumped from the default 3000/8000 — this worktree's demo instance runs
+    // alongside another session already using the default ports.
+    port: 3020,
     host: true,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:8020',
         changeOrigin: true,
       },
     },
