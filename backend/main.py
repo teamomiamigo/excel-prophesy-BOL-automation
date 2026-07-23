@@ -4367,10 +4367,24 @@ def _fmt_money(val) -> str:
 
 def _pending_records_for_agent(db: Session) -> list[dict]:
     """All currently-pending records, BOLSummary-shaped dicts either way —
-    the pipeline/classifier only ever deal in plain dicts, mock or live."""
+    the pipeline/classifier only ever deal in plain dicts, mock or live.
+
+    Live-mode filter mirrors GET /api/bols (see "Ambiguous trips" in
+    CLAUDE.md): excludes invoice-less sibling-manifest stubs so the agent
+    never drafts a proposal for a record Katie's own dashboard hides from
+    her too — those stubs have no cost_pct yet anyway and would just be
+    skipped, but querying them at all is wasted work and a state the agent's
+    view of "pending" should match the human's exactly."""
     if settings.USE_MOCK_DATA:
         return [_record_to_summary(r) for r in _mock_state.values() if r["status"] == "pending"]
-    rows = db.query(BOLRecord).filter(BOLRecord.status == BOLStatus.PENDING).all()
+    rows = (
+        db.query(BOLRecord)
+        .filter(
+            BOLRecord.status == BOLStatus.PENDING,
+            BOLRecord.invoice_number.isnot(None),
+        )
+        .all()
+    )
     return [BOLSummary.model_validate(row).model_dump() for row in rows]
 
 

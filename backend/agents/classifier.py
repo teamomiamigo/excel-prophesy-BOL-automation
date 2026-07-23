@@ -70,6 +70,7 @@ def classify_record(bol: dict) -> dict:
         "weight_source_fallback": bool(bol.get("weight_source_fallback")),
         "min_charge_uncertain": bool(bol.get("min_charge_uncertain")),
         "is_ambiguous_trip": bool(bol.get("is_ambiguous_trip")),
+        "mismatch_acknowledged": bool(bol.get("mismatch_acknowledged")),
         "bol_number": bol.get("bol_number"),
     }
 
@@ -92,7 +93,13 @@ def classify_record(bol: dict) -> dict:
         or bol.get("min_charge_uncertain")
     )
     ambiguous_trip = bool(bol.get("is_ambiguous_trip")) and not bol.get("bol_number")
-    severe_mismatch = mismatch_score > _QUANTITY_MISMATCH_THRESHOLD
+    # Mirrors BOLRow.jsx::isUnverifiedQuantity() — once Katie's acknowledged a
+    # severe mismatch (POST /api/bols/{id}/acknowledge-mismatch), the dashboard
+    # stops badging it and the agent shouldn't re-flag what she's already cleared.
+    severe_mismatch = (
+        mismatch_score > _QUANTITY_MISMATCH_THRESHOLD
+        and not bol.get("mismatch_acknowledged")
+    )
 
     # Priority order below matches how these same signals already read on the
     # dashboard: a red cost_pct is the clearest, highest-priority problem;
