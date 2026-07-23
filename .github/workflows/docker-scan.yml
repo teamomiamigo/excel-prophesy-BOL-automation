@@ -1,0 +1,48 @@
+name: Docker image scan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "backend/**"
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "backend/**"
+  schedule:
+    # Weekly, independent of code changes — catches new CVEs landing against
+    # an image whose Dockerfile/deps haven't changed.
+    - cron: "0 13 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: docker-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docker-scan:
+    name: Build image and scan for CVEs (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t sg360-bol:ci .
+
+      # Bake-in period: soft-fail while findings are triaged — see the plan's
+      # rollout section. Flip exit-code to 1 (or remove continue-on-error)
+      # once accepted CVEs are added to .trivyignore.
+      - name: Scan image (Trivy)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: "sg360-bol:ci"
+          severity: "HIGH,CRITICAL"
+          ignore-unfixed: true
+          exit-code: "1"
+          format: "table"
