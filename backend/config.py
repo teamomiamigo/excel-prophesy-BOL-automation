@@ -87,6 +87,17 @@ class Settings(BaseSettings):
     INVOICE_FOLDER: str = ""  # Absolute path to watch folder; empty = disabled
     INVOICE_S3_BUCKET: str = ""  # S3 bucket for uploaded invoice PDFs; empty = disabled (mock mode, or not yet provisioned)
 
+    # AI agent layer (backend/agents/) — direct Anthropic API, not Bedrock.
+    # Empty key = classify.py's deterministic template fallback only, no API call
+    # attempted (see backend/agents/llm.py) — safe default for a machine with no key set.
+    ANTHROPIC_API_KEY: str = ""
+    ANTHROPIC_MODEL: str = "claude-haiku-4-5"
+    # Base URL the one-click "approve all recommended" email link is built from
+    # (settings.APP_BASE_URL + "/api/agents/email-batch-approve?..."). Must be a
+    # reachable URL for whoever clicks the email — localhost for the demo, the
+    # real deployed URL once this runs against production.
+    APP_BASE_URL: str = "http://localhost:8000"
+
     APP_NAME: str = "SG360 BOL Reconciliation"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = True
