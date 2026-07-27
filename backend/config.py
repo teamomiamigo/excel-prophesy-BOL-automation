@@ -74,8 +74,16 @@ class Settings(BaseSettings):
     SMTP_USER: str = ""
     SMTP_PASSWORD: str = ""
     EMAIL_FROM: str = "logistics@sg360.com"
+    # Deliberately left declared but unused rather than deleted (same pattern as
+    # TECH_PRD1_* below) — Settings inherits pydantic-settings' extra='forbid', so if
+    # the live sg360-bol-live-credentials AWS secret still sets these two keys,
+    # removing the fields would crash the next Lambda cold start the same way the
+    # 2026-07-16 Aurora master-password outage did. Superseded by EMAIL_TO_ACCOUNTING.
     EMAIL_TO_MARY: list[str] = ["mary@sg360.com"]
     EMAIL_TO_KATIE: list[str] = ["katie@sg360.com"]
+    EMAIL_TO_ACCOUNTING: list[str] = [
+        "marym@sg360.com", "katieb@sg360.com", "invoices-frt@sg360.com", "soniaf@sg360.com",
+    ]
     EMAIL_SUBJECT_PREFIX: str = "BOL Approvals —"
 
     # IMAP polling — same O365 account as SMTP

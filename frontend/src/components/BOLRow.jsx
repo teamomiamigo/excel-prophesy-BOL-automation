@@ -74,6 +74,17 @@ export function isUnverifiedQuantity(bol) {
   return ambiguousUnresolved || severeMismatch;
 }
 
+// A flagged record needs to be unflagged before it can be approved (approving used
+// to silently un-flag it in the same call — see the backend guard in approve_bol).
+// A record with no bol_number hasn't had its Prophecy load created yet, so there's
+// nothing real to send to accounting -- except third-party records, which
+// structurally never get one (no real Prophecy load for a customer-pays-direct
+// shipment) and are approved through this same button via "Move All to Log".
+// Shared with App.jsx's bulk-approve so eligibility can't drift.
+export function isApproveEligible(bol) {
+  return bol.status !== 'flagged' && (!!bol.bol_number || bol.is_third_party);
+}
+
 // ---------------------------------------------------------------------------
 // Cost % variance logic — primary metric (amount / access_prog) — reverted 2026-07-21
 // (was access_prog/amount 2026-07-16 to 2026-07-21). Color logic below is
@@ -210,6 +221,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
   const [editingNotes, setEditingNotes] = useState(false);
   const [notesDraft, setNotesDraft] = useState('');
   const isFlagged = bol.status === 'flagged';
+  const approveEligible = isApproveEligible(bol);
 
   function startEditingNotes() {
     setNotesDraft(bol.notes || '');
@@ -443,8 +455,12 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
             {/* Approve */}
             <button
               onClick={onApprove}
-              disabled={isApproving}
-              title="Approve this record"
+              disabled={isApproving || !approveEligible}
+              title={
+                !approveEligible
+                  ? (isFlagged ? 'Unflag this record before approving' : 'No BOL number yet — create the Prophecy load first')
+                  : 'Approve this record'
+              }
               style={{
                 background: isApproving ? '#d1fae5' : '#2D6A4F',
                 color: isApproving ? '#065f46' : '#fff',
@@ -454,8 +470,8 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
                 width: '100%',
                 fontSize: 12,
                 fontWeight: 600,
-                opacity: isApproving ? 0.7 : 1,
-                cursor: isApproving ? 'not-allowed' : 'pointer',
+                opacity: isApproving ? 0.7 : (approveEligible ? 1 : 0.5),
+                cursor: (isApproving || !approveEligible) ? 'not-allowed' : 'pointer',
               }}
             >
               {isApproving ? '…' : '✓ Approve'}

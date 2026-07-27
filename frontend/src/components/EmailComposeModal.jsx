@@ -1,5 +1,9 @@
 import { useState } from 'react';
 
+// Same distribution list as backend/config.py's EMAIL_TO_ACCOUNTING — always all
+// four together, every send. Kept editable below; this is just the starting point.
+const DEFAULT_RECIPIENTS = ['marym@sg360.com', 'katieb@sg360.com', 'invoices-frt@sg360.com', 'soniaf@sg360.com'];
+
 function fmtMoney(val) {
   if (val == null) return '—';
   return `$${parseFloat(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -10,7 +14,7 @@ function amountCell(r) {
 }
 
 export default function EmailComposeModal({ records, senderLabel, onClose, onMarkSent }) {
-  const [toField, setToField] = useState('');
+  const [toField, setToField] = useState(DEFAULT_RECIPIENTS.join(', '));
   const [subjectField, setSubjectField] = useState(`SG360 BOL Invoices — ${senderLabel}`);
   const [copied, setCopied] = useState(false);
   const [markingLoading, setMarkingLoading] = useState(false);
@@ -151,7 +155,7 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
             <input
               value={toField}
               onChange={e => setToField(e.target.value)}
-              placeholder="mary@sg360.com, katie@sg360.com"
+              placeholder={DEFAULT_RECIPIENTS.join(', ')}
               style={{ flex: 1, padding: '6px 10px', border: '1px solid #d1d5db', borderRadius: 5, fontSize: 13 }}
             />
           </div>

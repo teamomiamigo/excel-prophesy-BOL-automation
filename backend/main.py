@@ -313,6 +313,14 @@ def approve_bol(
         rec = _find_mock(record_id)
         if rec["status"] == "approved":
             return _record_to_summary(rec)
+        if rec["status"] == "flagged":
+            raise HTTPException(status_code=400, detail="Cannot approve a flagged record — unflag it first.")
+        # Third-party records structurally never get a bol_number (no real Prophecy
+        # load exists for a customer-pays-direct shipment) but still need to reach
+        # approved status via this same endpoint — see ThirdPartySection.jsx's
+        # "Move All to Log" button (App.jsx's handleMoveThirdPartyToLog).
+        if not rec.get("bol_number") and not rec.get("is_third_party"):
+            raise HTTPException(status_code=400, detail="Cannot approve a record with no BOL number.")
         rec["status"] = "approved"
         rec["approved_at"] = datetime.now(timezone.utc)
         rec["approved_by"] = body.approved_by
@@ -325,6 +333,14 @@ def approve_bol(
         raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
     if row.status == BOLStatus.APPROVED:
         return row
+    if row.status == BOLStatus.FLAGGED:
+        raise HTTPException(status_code=400, detail="Cannot approve a flagged record — unflag it first.")
+    # Third-party records structurally never get a bol_number (no real Prophecy load
+    # exists for a customer-pays-direct shipment) but still need to reach approved
+    # status via this same endpoint — see ThirdPartySection.jsx's "Move All to Log"
+    # button (App.jsx's handleMoveThirdPartyToLog).
+    if row.bol_number is None and not row.is_third_party:
+        raise HTTPException(status_code=400, detail="Cannot approve a record with no BOL number.")
     row.status = BOLStatus.APPROVED
     row.approved_at = datetime.now(timezone.utc)
     row.approved_by = body.approved_by
@@ -688,16 +704,14 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
         return None
 
     def _clear_invoice_fields(rec: dict):
-        rec["invoice_number"] = None
-        rec["amount"] = None
-        rec["cost_pct"] = None
-        rec["alg_weight"] = None
-        rec["alg_pallets"] = None
-        rec["alg_pcs"] = None
-        rec["weight_diff"] = None
-        rec["pallet_diff"] = None
-        rec["pcs_diff"] = None
-        rec["inv_job_number"] = None
+        # Field list mirrors _REASSIGN_SOURCE_CLEAR_FIELDS (the live-DB path below) for
+        # mock/live parity -- both now run this for every source, including a bare
+        # invoice-only stub with no technique_trip (2026-07-23, see is_stub removal below).
+        for field in _REASSIGN_SOURCE_CLEAR_FIELDS:
+            rec[field] = None
+        rec["tariff_zone_approximate"] = False
+        rec["weight_source_fallback"] = False
+        rec["min_charge_uncertain"] = False
         rec["updated_at"] = datetime.now(timezone.utc)
 
     def _merge_invoice_numbers_util(existing, new):
@@ -748,6 +762,17 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
                 target_rec["alg_pallets"] = src_alg_pallets
                 target_rec["alg_pcs"] = src_alg_pcs
         elif action == "replace":
+            if target_inv:
+                # Preserve what's about to be discarded (2026-07-23) -- replace
+                # previously overwrote the target's own prior invoice with nothing
+                # kept anywhere. notes/flag_reason are Katie's own annotations, so
+                # this appends rather than replacing them.
+                old_note = (
+                    f"[Reassign] Replaced previous invoice {target_inv} "
+                    f"(${float(target_rec.get('amount') or 0):.2f}, wt {target_rec.get('alg_weight') or 0}, "
+                    f"pal {target_rec.get('alg_pallets') or 0}, pcs {target_rec.get('alg_pcs') or 0}) with {src_inv}."
+                )
+                target_rec["notes"] = f"{target_rec.get('notes')} {old_note}" if target_rec.get("notes") else old_note
             target_rec["invoice_number"] = src_inv
             target_rec["amount"] = src_amount
             target_rec["alg_weight"] = src_alg_weight
@@ -760,12 +785,10 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
             )
         target_rec["updated_at"] = datetime.now(timezone.utc)
 
-        # Clear invoice from source; delete stub if invoice-only
-        is_stub = source.get("technique_trip") is None
-        if is_stub:
-            del _mock_state[source["id"]]
-        else:
-            _clear_invoice_fields(source)
+        # Clear invoice from source -- never deleted, even for a bare invoice-only
+        # stub with no technique_trip (2026-07-23): it survives as an empty/
+        # invoice-less record instead, matching the live-mode behavior below.
+        _clear_invoice_fields(source)
 
         return {"success": True, "action": action, "target_trip": target_trip}
 
@@ -852,6 +875,17 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
             target_row.invoice_email_sender = src_invoice_email_sender
             target_row.invoice_sent_at = src_invoice_sent_at
     elif action == "replace":
+        if target_inv:
+            # Preserve what's about to be discarded (2026-07-23) -- replace previously
+            # overwrote the target's own prior invoice with nothing kept anywhere.
+            # notes/flag_reason are Katie's own annotations, so this appends rather
+            # than replacing them.
+            old_note = (
+                f"[Reassign] Replaced previous invoice {target_inv} "
+                f"(${target_amount or 0:.2f}, wt {target_row.alg_weight or 0}, "
+                f"pal {target_row.alg_pallets or 0}, pcs {target_row.alg_pcs or 0}) with {src_inv}."
+            )
+            target_row.notes = f"{target_row.notes} {old_note}" if target_row.notes else old_note
         target_row.invoice_number = src_inv
         target_row.amount = src_amount
         target_row.alg_weight = src_alg_weight
@@ -874,22 +908,18 @@ def reassign_invoice(record_id: str, body: dict, db: Session = Depends(get_db)):
     _compute_diffs(target_row)
     target_row.updated_at = datetime.now(timezone.utc)
 
-    is_stub = source_row.technique_trip is None
-    if is_stub:
-        db.delete(source_row)
-    else:
-        # Comprehensive clear (2026-07-22) — previously left access_prog/base_tariff/
-        # fsc_pct/alg_fsc_pct/alg_fsc_cost/cost_calc_detail/match_strategy/
-        # invoice_email_sender/invoice_sent_at/carrier stale on the source after its
-        # invoice moved elsewhere, none of which made sense once the record had no
-        # invoice. Does NOT touch notes/flag_reason — Katie's own annotations,
-        # independent of which invoice happens to be attached.
-        for field in _REASSIGN_SOURCE_CLEAR_FIELDS:
-            setattr(source_row, field, None)
-        source_row.tariff_zone_approximate = False
-        source_row.weight_source_fallback = False
-        source_row.min_charge_uncertain = False
-        source_row.updated_at = datetime.now(timezone.utc)
+    # Comprehensive clear (2026-07-22, extended 2026-07-23 to also cover a bare
+    # invoice-only stub with no technique_trip -- previously deleted outright via
+    # db.delete(); now survives as an empty/invoice-less record instead, same as
+    # any other source, rather than disappearing from the database entirely. Does
+    # NOT touch notes/flag_reason — Katie's own annotations, independent of which
+    # invoice happens to be attached.
+    for field in _REASSIGN_SOURCE_CLEAR_FIELDS:
+        setattr(source_row, field, None)
+    source_row.tariff_zone_approximate = False
+    source_row.weight_source_fallback = False
+    source_row.min_charge_uncertain = False
+    source_row.updated_at = datetime.now(timezone.utc)
 
     db.commit()
     return {"success": True, "action": action, "target_trip": target_trip}
@@ -4408,7 +4438,7 @@ def export_approved_bols(
             detail=f"No approved records found for {target.isoformat()}. Approve at least one record before exporting.",
         )
 
-    recipients = body.email_recipients or (settings.EMAIL_TO_MARY + settings.EMAIL_TO_KATIE)
+    recipients = body.email_recipients or settings.EMAIL_TO_ACCOUNTING
     email_sent = send_bol_export_email(approved, target, recipients)
 
     return ExportResponse(

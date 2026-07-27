@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import SummaryBar from './components/SummaryBar.jsx';
 import BOLTable from './components/BOLTable.jsx';
-import { isDoNotPayEligible, isThirdPartyEligible } from './components/BOLRow.jsx';
+import { isDoNotPayEligible, isThirdPartyEligible, isApproveEligible } from './components/BOLRow.jsx';
 import ThirdPartySection from './components/ThirdPartySection.jsx';
 import ApprovedSection from './components/ApprovedSection.jsx';
 import FlagModal from './components/FlagModal.jsx';
@@ -399,15 +399,17 @@ export default function App() {
   }
 
   async function handleBulkApprove() {
-    const targets = selectedRecords(); // no eligibility restriction — matches per-row Approve
-    if (!targets.length) return;
+    const all = selectedRecords();
+    if (!all.length) return;
+    const targets = all.filter(isApproveEligible); // matches per-row Approve's own gating
+    const skipped = all.length - targets.length;
     setBulkActionLoading(true);
     try {
       const results = await Promise.allSettled(
         targets.map(b => fetch(`/api/bols/${b.id}/approve`, { method: 'POST' }))
       );
       const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
-      setBulkResults({ action: 'approved', succeeded, total: targets.length, skipped: 0 });
+      setBulkResults({ action: 'approved', succeeded, total: all.length, skipped });
       await Promise.all([fetchPending(), fetchApproved()]);
       clearSelection();
     } catch (err) {

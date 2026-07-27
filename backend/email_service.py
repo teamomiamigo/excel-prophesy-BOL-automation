@@ -18,11 +18,11 @@ def send_bol_export_email(
     export_date: Optional[date] = None,
     recipients: Optional[list[str]] = None,
 ) -> bool:
-    # Generate the approved-BOL CSV and send it to Mary and Katie.
+    # Generate the approved-BOL CSV and send it to the accounting/logistics distribution.
     # Returns True if the email was sent successfully.
     # Returns False if the email was not sent (e.g., SMTP not configured, or SMTP error).
     d = export_date or date.today()
-    recipients = recipients or (settings.EMAIL_TO_MARY + settings.EMAIL_TO_KATIE)
+    recipients = recipients or settings.EMAIL_TO_ACCOUNTING
     csv_bytes = generate_csv_bytes(bol_records)
     filename = get_csv_filename(d)
     subject = f"{settings.EMAIL_SUBJECT_PREFIX} {d.strftime('%B %d, %Y')}"
