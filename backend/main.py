@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -1363,6 +1364,9 @@ def refetch_bols_for_manifests(body: dict, db: Session = Depends(get_db)):
 # Invoice CSV processing — shared by upload endpoint and email poller
 # ---------------------------------------------------------------------------
 
+_INVOICE_FOLDER_TIME_RE = re.compile(r"(\d{1,2})-?(\d{2})(AM|PM)", re.IGNORECASE)
+
+
 def _parse_invoice_folder_name(name: str) -> "tuple[str, datetime] | None":
     """
     Parse a subfolder name like 'Tania 6-25-2026  4-16PM' into
@@ -1373,7 +1377,13 @@ def _parse_invoice_folder_name(name: str) -> "tuple[str, datetime] | None":
     6-25-2026 4-16PM") work the same as single-word ones:
         [:-2] sender name   e.g. 'Tania'
         [-2]  date          e.g. '6-25-2026'  (M-D-YYYY)
-        [-1]  time          e.g. '4-16PM'     (H-MMAM/PM)
+        [-1]  time          e.g. '4-16PM' or '156PM'  (H-MMAM/PM or HMMAM/PM)
+
+    Real sender folders don't reliably include the dash before minutes (e.g.
+    "156PM" instead of "1-56PM") -- _INVOICE_FOLDER_TIME_RE accepts both via an
+    optional dash; regex backtracking on the greedy \\d{1,2} hour group resolves
+    "156PM" as 1:56 (not 15:6), since a 2-digit hour would leave only one digit
+    for the required 2-digit minute group.
     """
     parts = [p for p in name.split() if p]
     if len(parts) < 3:
@@ -1385,11 +1395,15 @@ def _parse_invoice_folder_name(name: str) -> "tuple[str, datetime] | None":
         dt_date = datetime.strptime(date_part, "%m-%d-%Y")
     except ValueError:
         return None
-    # Parse time: '4-16PM' or '11-30AM'
+    # Parse time: '4-16PM', '11-30AM', or the no-dash '156PM'/'1230PM'
+    m = _INVOICE_FOLDER_TIME_RE.fullmatch(time_part.strip())
+    if not m:
+        return None
     try:
-        ampm = time_part[-2:].upper()
-        hm = time_part[:-2].split("-")
-        hour, minute = int(hm[0]), int(hm[1])
+        hour, minute = int(m.group(1)), int(m.group(2))
+        ampm = m.group(3).upper()
+        if not (1 <= hour <= 12) or not (0 <= minute <= 59):
+            return None
         if ampm == "PM" and hour != 12:
             hour += 12
         elif ampm == "AM" and hour == 12:

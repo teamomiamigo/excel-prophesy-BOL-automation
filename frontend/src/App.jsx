@@ -90,6 +90,7 @@ export default function App() {
   const [pollFolderLoading, setPollFolderLoading] = useState(false);
   const [filterText, setFilterText] = useState('');
   const [sort, setSort] = useState({ column: null, direction: 'default' });
+  const [groupOrder, setGroupOrder] = useState('desc'); // 'desc' = newest sender-batch first (default); 'asc' = oldest first
   const folderInputRef = useRef(null);
 
   // React's JSX attribute mapping doesn't reliably set the `webkitdirectory`
@@ -165,6 +166,10 @@ export default function App() {
       if (prev.direction === 'asc') return { column, direction: 'desc' };
       return { column: null, direction: 'default' };
     });
+  }
+
+  function toggleGroupOrder() {
+    setGroupOrder(prev => (prev === 'desc' ? 'asc' : 'desc'));
   }
 
   // -------------------------------------------------------------------------
@@ -1287,6 +1292,8 @@ export default function App() {
               onToggleSelectAll={toggleSelectAll}
               sort={sort}
               onSort={handleSort}
+              groupOrder={groupOrder}
+              onToggleGroupOrder={toggleGroupOrder}
               onApprove={handleApprove}
               onFlagOpen={setFlagTarget}
               onUnflag={handleUnflag}

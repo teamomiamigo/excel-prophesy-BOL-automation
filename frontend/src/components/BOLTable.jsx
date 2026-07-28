@@ -1,6 +1,10 @@
 import { useRef } from 'react';
 import BOLRow from './BOLRow.jsx';
 import useEdgeScroll from '../hooks/useEdgeScroll.js';
+import { groupBySender, sortGroupsByRecency } from '../utils/groupBySender.js';
+
+// 1 checkbox column (rowSpan 2) + 20 data columns in the second header row below.
+const TOTAL_COLUMNS = 21;
 
 const TH_STYLE = {
   padding: '8px 10px',
@@ -53,22 +57,21 @@ function makeComparator(accessor, direction, isNumeric) {
   };
 }
 
-function defaultComparator(a, b) {
-  const av = a.invoice_sent_at, bv = b.invoice_sent_at;
-  const aNull = av == null, bNull = bv == null;
-  if (aNull && bNull) return 0;
-  if (aNull) return 1;
-  if (bNull) return -1;
-  return new Date(av) - new Date(bv); // oldest invoice first (Phase 7, 2026-07-22) — was newest first
-}
-
+// No active column sort -> null, meaning "leave this group's records in their
+// incoming order" (whatever GET /api/bols already returned). Superseded the old
+// whole-list invoice_sent_at default sort (Phase 7, commit 0ea0a03, 2026-07-22) --
+// group order is now handled separately, by sender (see groupOrder below).
 function getComparator(sort) {
-  if (!sort.column) return defaultComparator;
+  if (!sort.column) return null;
   const { get, numeric } = SORT_ACCESSORS[sort.column];
   return makeComparator(get, sort.direction, numeric);
 }
 
-function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort }) {
+function groupOrderIndicator(groupOrder) {
+  return <span style={{ marginLeft: 4 }}>{groupOrder === 'asc' ? '▲' : '▼'}</span>;
+}
+
+function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort, groupOrder, onToggleGroupOrder }) {
   return (
     <thead>
       <tr>
@@ -101,7 +104,13 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort 
         <th style={{ ...TH_STYLE, textAlign: 'right', borderLeft: '1px solid #333' }}>ΔWgt</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>ΔPal</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>ΔPCS</th>
-        <th style={TH_STYLE}>Invoice Sender</th>
+        <th
+          style={sortableThStyle}
+          onClick={onToggleGroupOrder}
+          title={`Sender batches grouped ${groupOrder === 'asc' ? 'oldest' : 'newest'}-first — click to reverse`}
+        >
+          Invoice Sender{groupOrderIndicator(groupOrder)}
+        </th>
         <th style={sortableThStyle} onClick={() => onSort('invoice')} title="Sort by Invoice #">Invoice #{sortIndicator(sort, 'invoice')}</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Calc Cost</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Amount</th>
@@ -115,7 +124,7 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort 
 
 export default function BOLTable({
   bols, loading, approvingId, unflaggingId, markingThirdPartyId, markingDoNotPayId, exportingSidId, checkingBolId, retryingMatchId, acknowledgingMismatchId,
-  filterText, onFilterChange, selectedIds, onToggleSelect, onToggleSelectAll, sort, onSort,
+  filterText, onFilterChange, selectedIds, onToggleSelect, onToggleSelectAll, sort, onSort, groupOrder, onToggleGroupOrder,
   onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onCompareOpen, onAcknowledgeMismatch, onDoNotPay, onExportSid, onCheckBol, onRetryMatch,
 }) {
   const lower = (filterText || '').toLowerCase();
@@ -125,13 +134,23 @@ export default function BOLTable({
     b.invoice_email_sender,
   ].some(v => (v || '').toLowerCase().includes(lower));
 
-  // One flat table, no category grouping — sorted by Trip/Manifest/BOL/Invoice # (click a
-  // header to cycle asc/desc/default), or by invoice_sent_at ascending — oldest invoice
-  // first (default, nulls last; flipped from newest-first 2026-07-22, Phase 7).
-  const visibleBols = bols
-    .filter(matchesBol)
-    .slice()
-    .sort(getComparator(sort));
+  // Sender is the highest form of organization: records are grouped into contiguous
+  // per-invoice_email_sender blocks (groupBySender), and groups themselves are ordered
+  // by recency (sortGroupsByRecency, outer sort, newest-first by default — groupOrder,
+  // replacing Phase 7's whole-list oldest-first default, commit 0ea0a03 2026-07-22).
+  // Clicking a column header (Trip/Manifest/BOL/Invoice #) only reorders records WITHIN
+  // each group (intraGroupComparator, inner sort) — a record can never leave its
+  // sender's block regardless of column-sort state. Technique-matched and
+  // Prophecy-BOL-matched records group identically since invoice_email_sender is set
+  // the same way regardless of match_strategy.
+  const filteredBols = bols.filter(matchesBol);
+  const orderedGroups = sortGroupsByRecency(groupBySender(filteredBols), groupOrder);
+  const intraGroupComparator = getComparator(sort);
+  const visibleGroups = orderedGroups.map(g => ({
+    ...g,
+    records: intraGroupComparator ? g.records.slice().sort(intraGroupComparator) : g.records,
+  }));
+  const visibleBols = visibleGroups.flatMap(g => g.records);
   const totalVisible = visibleBols.length;
   const visibleIds = visibleBols.map(b => b.id);
   const allSelected = visibleIds.length > 0 && visibleIds.every(id => selectedIds.has(id));
@@ -144,7 +163,6 @@ export default function BOLTable({
 
   function rowProps(bol) {
     return {
-      key: bol.id,
       bol,
       isApproving:         approvingId         === bol.id,
       isUnflagging:        unflaggingId        === bol.id,
@@ -234,10 +252,33 @@ export default function BOLTable({
               onToggleSelectAll={() => onToggleSelectAll(visibleIds)}
               sort={sort}
               onSort={onSort}
+              groupOrder={groupOrder}
+              onToggleGroupOrder={onToggleGroupOrder}
             />
-            <tbody>
-              {visibleBols.map(bol => <BOLRow {...rowProps(bol)} />)}
-            </tbody>
+            {visibleGroups.map((group, idx) => (
+              <tbody key={group.key}>
+                <tr>
+                  <td
+                    colSpan={TOTAL_COLUMNS}
+                    style={{
+                      padding: '5px 10px',
+                      fontSize: 11,
+                      fontWeight: 700,
+                      color: '#374151',
+                      background: idx === 0 ? '#f0fdf4' : '#f3f4f6',
+                      borderBottom: '1px solid #e5e7eb',
+                      borderTop: idx === 0 ? 'none' : '2px solid #e5e7eb',
+                    }}
+                  >
+                    {group.label}
+                    <span style={{ fontWeight: 400, color: '#6b7280', marginLeft: 8 }}>
+                      · {group.records.length} record{group.records.length === 1 ? '' : 's'}
+                    </span>
+                  </td>
+                </tr>
+                {group.records.map(bol => <BOLRow key={bol.id} {...rowProps(bol)} />)}
+              </tbody>
+            ))}
           </table>
         </div>
       )}

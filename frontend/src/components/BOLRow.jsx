@@ -120,10 +120,59 @@ function fmtDiff(val) {
   return n > 0 ? `+${n.toLocaleString('en-US')}` : n.toLocaleString('en-US');
 }
 
+// Detects destinations that received more than one pallet row on this load, and how
+// much that costs: today's calc floors each row's minimum charge independently, so two
+// small pallets to the same destination can each hit the same minimum charge rather
+// than it applying once to the combined shipment (confirmed by hand against real live
+// records -- this pattern alone explained ~100% of the cost gap on two separate BOLs).
+// This is diagnostic only: it does NOT change access_prog/cost_calc_detail, just
+// explains where a gap against ALG's actual amount likely came from.
+const MAX_DUPLICATE_LINES = 5;
+
+function analyzeDuplicateDestinations(pallets) {
+  const byDest = {};
+  for (const p of pallets) {
+    if (!p.dest_id) continue;
+    if (!byDest[p.dest_id]) byDest[p.dest_id] = [];
+    byDest[p.dest_id].push(p);
+  }
+  // fsc_pct is constant for the whole invoice -- derive the multiplier from any one
+  // row instead of threading fsc_pct through this component separately.
+  const sample = pallets.find(p => p.base);
+  const fscMultiplier = sample ? sample.with_fsc / sample.base : 1;
+
+  const dupes = Object.entries(byDest)
+    .filter(([, rows]) => rows.length > 1)
+    .map(([destId, rows]) => {
+      const totalWeight = rows.reduce((sum, r) => sum + (r.weight || 0), 0);
+      const currentBase = rows.reduce((sum, r) => sum + (r.base || 0), 0);
+      const rate = rows[0].rate_used;
+      const mc1 = rows[0].mc1_used;
+      const combinedBase = rate != null && mc1 != null
+        ? Math.max(Math.round((rate * totalWeight / 100) * 100) / 100, mc1)
+        : null;
+      const excessBase = combinedBase != null ? currentBase - combinedBase : null;
+      return {
+        destId,
+        zip3: rows[0].zip3,
+        rows,
+        mc1,
+        excessWithFsc: excessBase != null ? excessBase * fscMultiplier : null,
+      };
+    })
+    .filter(d => d.excessWithFsc != null && d.excessWithFsc > 0.005)
+    .sort((a, b) => b.excessWithFsc - a.excessWithFsc);
+
+  const totalExcessWithFsc = dupes.reduce((sum, d) => sum + d.excessWithFsc, 0);
+  return { dupes, totalExcessWithFsc };
+}
+
 // Cost summary popover (GET /api/bols/{id}/cost-breakdown) — shown on hover over the
 // Calc Cost cell. Deliberately a rollup, not a per-pallet table: a real invoice can carry
 // 100+ line items, and Katie only needs to know whether this number is trustworthy and
-// why, not which specific pallet did what.
+// why, not which specific pallet did what. The duplicate-destination section below is
+// the one exception carrying real per-pallet detail, since it's the single biggest
+// explainer of "why doesn't this match what ALG billed" seen so far.
 function CostBreakdownPopover({ data }) {
   if (data === 'loading') {
     return (
@@ -146,9 +195,12 @@ function CostBreakdownPopover({ data }) {
   const uncertainMin = pallets.filter(p => p.mc1_source && p.mc1_source !== 'alg_tariff_rates').length;
   const floored = pallets.filter(p => p.floored).length;
   const clean = noRate === 0 && approxRate === 0 && uncertainMin === 0;
+  const { dupes, totalExcessWithFsc } = analyzeDuplicateDestinations(pallets);
+  const shownDupes = dupes.slice(0, MAX_DUPLICATE_LINES);
+  const hiddenDupeCount = dupes.length - shownDupes.length;
 
   return (
-    <div style={POPOVER_STYLE}>
+    <div style={{ ...POPOVER_STYLE, width: dupes.length > 0 ? 340 : 300 }}>
       <div style={{ fontWeight: 700, marginBottom: 4 }}>
         Cost check — {total} pallet{total === 1 ? '' : 's'}
       </div>
@@ -163,6 +215,27 @@ function CostBreakdownPopover({ data }) {
       )}
       {floored > 0 && (
         <div style={{ color: '#6b7280', marginTop: 4 }}>{floored} pallet{floored === 1 ? '' : 's'} hit a minimum-charge floor.</div>
+      )}
+      {dupes.length > 0 && (
+        <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid #e5e7eb' }}>
+          <div style={{ fontWeight: 700, color: '#b45309' }}>
+            ⚠ What happened: {dupes.length} destination{dupes.length === 1 ? '' : 's'} received more than one pallet
+            record and got billed a separate minimum charge for each — ≈${totalExcessWithFsc.toFixed(2)} of this
+            load's cost comes from that.
+          </div>
+          <ul style={{ margin: '4px 0 0', paddingLeft: 16, color: '#57534e' }}>
+            {shownDupes.map(d => (
+              <li key={d.destId} style={{ marginBottom: 3 }}>
+                <strong>{d.destId}</strong> (zip {d.zip3}) — {d.rows.length} pallets
+                ({d.rows.map(r => `${r.weight}lb`).join(' + ')}), ${d.mc1?.toFixed(2)} minimum each
+                → excess ≈ ${d.excessWithFsc.toFixed(2)}
+              </li>
+            ))}
+          </ul>
+          {hiddenDupeCount > 0 && (
+            <div style={{ color: '#9ca3af', marginTop: 2 }}>+ {hiddenDupeCount} more destination{hiddenDupeCount === 1 ? '' : 's'} with the same pattern</div>
+          )}
+        </div>
       )}
     </div>
   );
