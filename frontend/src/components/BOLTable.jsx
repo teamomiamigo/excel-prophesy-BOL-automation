@@ -1,10 +1,8 @@
 import { useRef } from 'react';
 import BOLRow from './BOLRow.jsx';
+import InvoiceSenderFixBanner from './InvoiceSenderFixBanner.jsx';
 import useEdgeScroll from '../hooks/useEdgeScroll.js';
 import { groupBySender, sortGroupsByRecency } from '../utils/groupBySender.js';
-
-// 1 checkbox column (rowSpan 2) + 20 data columns in the second header row below.
-const TOTAL_COLUMNS = 21;
 
 const TH_STYLE = {
   padding: '8px 10px',
@@ -71,7 +69,7 @@ function groupOrderIndicator(groupOrder) {
   return <span style={{ marginLeft: 4 }}>{groupOrder === 'asc' ? '▲' : '▼'}</span>;
 }
 
-function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort, groupOrder, onToggleGroupOrder }) {
+function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort }) {
   return (
     <thead>
       <tr>
@@ -81,14 +79,14 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort,
             checked={allSelected}
             ref={el => { if (el) el.indeterminate = !allSelected && someSelected; }}
             onChange={onToggleSelectAll}
-            title="Select all visible rows"
+            title="Select all rows in this batch"
           />
         </th>
         <th colSpan={4} style={TH_STYLE} />
         <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '2px solid #404040' }}>SG360</th>
         <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '1px solid #404040' }}>Invoice (ALG)</th>
         <th colSpan={3} style={{ ...TH_GROUP, borderLeft: '1px solid #404040' }}>Diff</th>
-        <th colSpan={4} style={TH_STYLE} />
+        <th colSpan={6} style={TH_STYLE} />
       </tr>
       <tr>
         <th style={sortableThStyle} onClick={() => onSort('trip')} title="Sort by Trip #">Trip{sortIndicator(sort, 'trip')}</th>
@@ -104,13 +102,6 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort,
         <th style={{ ...TH_STYLE, textAlign: 'right', borderLeft: '1px solid #333' }}>ΔWgt</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>ΔPal</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>ΔPCS</th>
-        <th
-          style={sortableThStyle}
-          onClick={onToggleGroupOrder}
-          title={`Sender batches grouped ${groupOrder === 'asc' ? 'oldest' : 'newest'}-first — click to reverse`}
-        >
-          Invoice Sender{groupOrderIndicator(groupOrder)}
-        </th>
         <th style={sortableThStyle} onClick={() => onSort('invoice')} title="Sort by Invoice #">Invoice #{sortIndicator(sort, 'invoice')}</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Calc Cost</th>
         <th style={{ ...TH_STYLE, textAlign: 'right' }}>Amount</th>
@@ -125,6 +116,7 @@ function TableHead({ allSelected, someSelected, onToggleSelectAll, sort, onSort,
 export default function BOLTable({
   bols, loading, approvingId, unflaggingId, markingThirdPartyId, markingDoNotPayId, exportingSidId, checkingBolId, retryingMatchId, acknowledgingMismatchId,
   filterText, onFilterChange, selectedIds, onToggleSelect, onToggleSelectAll, sort, onSort, groupOrder, onToggleGroupOrder,
+  fixSenderSubmitting, onFixInvoiceSender,
   onApprove, onFlagOpen, onUnflag, onNotesUpdate, onMarkThirdParty, onReassignOpen, onCompareOpen, onAcknowledgeMismatch, onDoNotPay, onExportSid, onCheckBol, onRetryMatch,
 }) {
   const lower = (filterText || '').toLowerCase();
@@ -198,6 +190,35 @@ export default function BOLTable({
           Flagged ({bols.filter(b => b.status === 'flagged').length})
         </h2>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <label
+            style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: '#374151', cursor: 'pointer' }}
+            title="Select all visible rows, across every sender batch"
+          >
+            <input
+              type="checkbox"
+              checked={allSelected}
+              ref={el => { if (el) el.indeterminate = !allSelected && someSelected; }}
+              onChange={() => onToggleSelectAll(visibleIds)}
+            />
+            Select all
+          </label>
+          <button
+            onClick={onToggleGroupOrder}
+            title={`Sender batches grouped ${groupOrder === 'asc' ? 'oldest' : 'newest'}-first — click to reverse`}
+            style={{
+              background: '#fff',
+              color: '#374151',
+              border: '1px solid #d1d5db',
+              borderRadius: 4,
+              padding: '5px 10px',
+              fontSize: 12,
+              fontWeight: 600,
+              cursor: 'pointer',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            Sort: {groupOrder === 'asc' ? 'Oldest first' : 'Newest first'}{groupOrderIndicator(groupOrder)}
+          </button>
           <input
             placeholder="Filter by trip, manifest, invoice #, job #, BOL, or sender…"
             value={filterText}
@@ -244,42 +265,66 @@ export default function BOLTable({
           {filterText ? `No records match "${filterText}"` : 'No pending records — all caught up!'}
         </div>
       ) : (
-        <div ref={scrollRef} style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #e5e7eb', marginBottom: 12 }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
-            <TableHead
-              allSelected={allSelected}
-              someSelected={someSelected}
-              onToggleSelectAll={() => onToggleSelectAll(visibleIds)}
-              sort={sort}
-              onSort={onSort}
-              groupOrder={groupOrder}
-              onToggleGroupOrder={onToggleGroupOrder}
-            />
-            {visibleGroups.map((group, idx) => (
-              <tbody key={group.key}>
-                <tr>
-                  <td
-                    colSpan={TOTAL_COLUMNS}
-                    style={{
-                      padding: '5px 10px',
-                      fontSize: 11,
-                      fontWeight: 700,
-                      color: '#374151',
-                      background: idx === 0 ? '#f0fdf4' : '#f3f4f6',
-                      borderBottom: '1px solid #e5e7eb',
-                      borderTop: idx === 0 ? 'none' : '2px solid #e5e7eb',
-                    }}
-                  >
-                    {group.label}
-                    <span style={{ fontWeight: 400, color: '#6b7280', marginLeft: 8 }}>
-                      · {group.records.length} record{group.records.length === 1 ? '' : 's'}
-                    </span>
-                  </td>
-                </tr>
-                {group.records.map(bol => <BOLRow key={bol.id} {...rowProps(bol)} />)}
-              </tbody>
-            ))}
-          </table>
+        <div ref={scrollRef} style={{ overflowX: 'auto' }}>
+          {visibleGroups.map((group, idx) => {
+            const groupIds = group.records.map(b => b.id);
+            const groupAllSelected = groupIds.length > 0 && groupIds.every(id => selectedIds.has(id));
+            const groupSomeSelected = groupIds.some(id => selectedIds.has(id));
+            const needsCorrection = group.key !== '__unassigned__' && !group.sentAt;
+            return (
+              <details
+                key={group.key}
+                open
+                style={{ marginBottom: 12 }}
+              >
+                {/* min-width: 100% (not width: 100%) so a table narrower than the
+                    viewport still fills it, but a wide table (many columns) can
+                    still exceed the viewport and drive real horizontal scroll on
+                    the shared scrollRef container below — a plain width: 100%
+                    forced every group's table to shrink-to-fit instead, and
+                    `overflow: hidden` on this box (removed) was clipping away
+                    whatever didn't fit rather than letting it scroll. */}
+                <summary
+                  style={{
+                    cursor: 'pointer',
+                    padding: '6px 10px',
+                    fontSize: 11,
+                    fontWeight: 700,
+                    color: '#374151',
+                    background: idx === 0 ? '#f0fdf4' : '#f3f4f6',
+                    border: '1px solid #e5e7eb',
+                    borderBottom: 'none',
+                    borderRadius: '8px 8px 0 0',
+                  }}
+                >
+                  {group.label}
+                  <span style={{ fontWeight: 400, color: '#6b7280', marginLeft: 8 }}>
+                    · {group.records.length} record{group.records.length === 1 ? '' : 's'}
+                  </span>
+                </summary>
+                {needsCorrection && (
+                  <InvoiceSenderFixBanner
+                    rawSender={group.key}
+                    recordCount={group.records.length}
+                    submitting={fixSenderSubmitting}
+                    onSubmit={onFixInvoiceSender}
+                  />
+                )}
+                <table style={{ minWidth: '100%', borderCollapse: 'collapse', background: '#fff', border: '1px solid #e5e7eb', borderTop: 'none' }}>
+                  <TableHead
+                    allSelected={groupAllSelected}
+                    someSelected={groupSomeSelected}
+                    onToggleSelectAll={() => onToggleSelectAll(groupIds)}
+                    sort={sort}
+                    onSort={onSort}
+                  />
+                  <tbody>
+                    {group.records.map(bol => <BOLRow key={bol.id} {...rowProps(bol)} />)}
+                  </tbody>
+                </table>
+              </details>
+            );
+          })}
         </div>
       )}
     </section>

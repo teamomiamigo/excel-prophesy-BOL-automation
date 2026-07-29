@@ -429,9 +429,6 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
       </td>
 
       {/* Invoice info */}
-      <td style={{ ...TD, color: '#6b7280', fontSize: 12, whiteSpace: 'nowrap' }}>
-        {bol.invoice_email_sender || <span style={{ color: '#d1d5db' }}>—</span>}
-      </td>
       <td style={{ ...TD, fontWeight: 600 }}>
         {bol.invoice_number
           ? <span style={{ display: 'flex', flexWrap: 'wrap', gap: 4, alignItems: 'center' }}>

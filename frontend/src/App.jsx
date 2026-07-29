@@ -91,6 +91,7 @@ export default function App() {
   const [filterText, setFilterText] = useState('');
   const [sort, setSort] = useState({ column: null, direction: 'default' });
   const [groupOrder, setGroupOrder] = useState('desc'); // 'desc' = newest sender-batch first (default); 'asc' = oldest first
+  const [fixSenderSubmitting, setFixSenderSubmitting] = useState(false);
   const folderInputRef = useRef(null);
 
   // React's JSX attribute mapping doesn't reliably set the `webkitdirectory`
@@ -918,6 +919,28 @@ export default function App() {
     }
   }
 
+  // Manual correction for a sender batch whose folder name failed to parse into a
+  // date (BOLTable.jsx's InvoiceSenderFixBanner) — moves every record sharing the
+  // raw sender string onto the corrected, parseable one.
+  async function handleFixInvoiceSender(rawSender, correctedFolderName) {
+    setFixSenderSubmitting(true);
+    try {
+      const res = await fetch('/api/invoices/fix-sender', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw_sender: rawSender, corrected_folder_name: correctedFolderName }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Correction failed (${res.status})`);
+      setSuccessMessage(`Corrected ${data.updated} record(s) to "${data.invoice_email_sender}".`);
+      await Promise.all([fetchPending(), fetchApproved()]);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setFixSenderSubmitting(false);
+    }
+  }
+
   // Dismiss a bad/duplicate sibling manifest from the Compare modal — returns
   // true/false rather than throwing, so the modal can update its own candidate
   // list in place without needing a full trip-manifests refetch. Dismissed
@@ -1294,6 +1317,8 @@ export default function App() {
               onSort={handleSort}
               groupOrder={groupOrder}
               onToggleGroupOrder={toggleGroupOrder}
+              fixSenderSubmitting={fixSenderSubmitting}
+              onFixInvoiceSender={handleFixInvoiceSender}
               onApprove={handleApprove}
               onFlagOpen={setFlagTarget}
               onUnflag={handleUnflag}

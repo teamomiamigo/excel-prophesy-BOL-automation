@@ -20,15 +20,8 @@ from backend.database import Base
 # ---------------------------------------------------------------------------
 
 class TariffRate(Base):
-    """
-    Drop-ship tariff rates from SG360_Romeoville Letters-Flats Tariff CSV.
-    One row per USPS Sectional Center Facility (SCF).
-    Seeded via: python -m backend.seed_rates
-
-    Lookup key: ep_zip3 (3-digit SCF zone, e.g. "060").
-    The mapping from Technique destination codes (ENRU, ALG, etc.) to
-    ep_zip3 must be confirmed with Katie — not resolved automatically.
-    """
+    """drop-ship tariff rates, one row per USPS SCF. seeded via `python -m backend.seed_rates`.
+    lookup key: ep_zip3 (3-digit SCF zone); last-resort fallback below alg_tariff_rates"""
     __tablename__ = "tariff_rates"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -46,18 +39,9 @@ class TariffRate(Base):
 
 
 class AlgTariffRate(Base):
-    """
-    ALG Worldwide's own per-destination rate table (tariff_id ALG5_2026), sourced directly
-    from Prophecy/ShipperPlus's dbo.tariff_details (SQLAPPS3.ShipperPlus_Segerdahl) via a
-    one-time export (this dev environment has no live route to that server) — see
-    ALG5_2026_tariff_rates.csv. Keyed by the exact destination code (Locations.AccountNumber
-    format, e.g. "SCF606"), confirmed identical to what our own pallet data already carries
-    as Dest_ID/destination_id — an exact match here needs no zip3 slicing or nearest-zone
-    tolerance, unlike the older zip3-keyed TariffRate card (which is kept only as a fallback
-    for any destination code not found here; found 2026-07-15 to be missing ~64% of the zones
-    a real invoice actually bills, vs. 0% missing against this table).
-    Seeded via: python -m backend.seed_rates
-    """
+    """ALG's own per-destination rate table (tariff_id ALG5_2026), one-time exported from
+    ShipperPlus. keyed by the exact destination code (e.g. "SCF606") -- exact match, no zip3
+    slicing needed, unlike the older TariffRate card. seeded via `python -m backend.seed_rates`"""
     __tablename__ = "alg_tariff_rates"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -68,16 +52,8 @@ class AlgTariffRate(Base):
 
 
 class FuelSurchargeRate(Base):
-    """
-    ALG Worldwide Fuel Surcharge Matrix (FSC).
-    135 fuel-price bands from $1.30–$8.04/gal → FSC amount.
-    Seeded via: python -m backend.seed_rates
-
-    Lookup: find the row where fuel_price_min <= current_price <= fuel_price_max.
-    FSC unit: percentage of base freight (e.g., 36.5 = 36.5% surcharge on base tariff).
-    Applied as: access_prog = base_tariff × (1 + fsc_amount/100).
-    EIA diesel price → match to band → get fsc_amount → apply to base tariff.
-    """
+    """ALG's fuel surcharge matrix, 135 diesel-price bands -> FSC amount (decimal fraction,
+    NOT the /100 the docstring used to say). seeded via `python -m backend.seed_rates`"""
     __tablename__ = "fuel_surcharge_rates"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -110,13 +86,8 @@ class ActionType(str, enum.Enum):
 # ---------------------------------------------------------------------------
 
 class BOLRecord(Base):
-    """
-    One row per freight reconciliation record, mirroring Excel Sheet 1.
-
-    Records are created at morning data-pull time (7/8/9am) and initially
-    have no BOL number — that is created in Prophecy by Katie during review.
-    Primary record identity before BOL creation: technique_trip + manifest + invoice_number.
-    """
+    """one row per freight reconciliation record. no bol_number until Katie creates one in
+    Prophecy; identified before then by technique_trip + manifest + invoice_number"""
     __tablename__ = "bol_records"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -157,35 +128,18 @@ class BOLRecord(Base):
     # Rate breakdown for tooltip: base_tariff × (1 + fsc_pct) = access_prog
     base_tariff: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     fsc_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
-    # ALG's own reported FSC for this invoice (from the "Fuel Surcharge" CSV footer row) —
-    # used to compute fsc_pct/access_prog instead of an EIA-diesel-derived guess.
+    # ALG's own reported FSC for this invoice, used instead of an EIA-diesel-derived guess
     alg_fsc_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
     alg_fsc_cost: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
-    # True when any pallet's tariff lookup had to fall back to nearest-zone matching
-    # (no exact zip3 in tariff_rates, and this invoice didn't bill that zone either).
+    # true when a pallet's rate had to fall back to nearest-zone matching
     tariff_zone_approximate: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    # True when our own pallet-level weight data (Technique/VisualMail or Prophecy) was
-    # unavailable and access_prog fell back to ALG's self-reported invoice weight.
+    # true when our own weight data was unavailable and access_prog fell back to ALG's self-reported weight
     weight_source_fallback: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    # True when at least one pallet's minimum-freight-charge floor could not be confirmed
-    # against alg_tariff_rates.mc1 (exact_dest_id missing/not found there) — distinct from
-    # tariff_zone_approximate, which is about the RATE lookup falling back, not the MINIMUM.
-    # A pallet can price via ALG's own exact invoiced rate (no rate approximation at all) and
-    # still have an unconfirmed minimum-charge floor, which this flag alone catches.
+    # true when a pallet's minimum-freight floor couldn't be confirmed against alg_tariff_rates.mc1
     min_charge_uncertain: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    # JSON-encoded list of per-pallet cost-calc detail dicts (dest_id, zip3, weight,
-    # rate_source, rate_used, mc1_used, mc1_source, floored, base, with_fsc) -- the
-    # same shape _apply_access_prog_calc()'s `detail` param builds. Stored once at
-    # real-calculation time so GET /api/bols/{id}/cost-breakdown never needs to
-    # re-locate/re-parse the original invoice CSV (INVOICE_FOLDER is a Windows UNC
-    # path the deployed Lambda can never reach). Null until first computed under
-    # this scheme; a pre-existing record stays null until recompute-access-prog
-    # backfills it.
+    # JSON list of per-pallet cost-calc detail dicts, stored at calc time -- powers the cost-breakdown route
     cost_calc_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # True when this manifest's technique_trip had more than one manifest in the live
-    # Technique search that matched it (set at match time by _wide_fallback_technique_search()
-    # / retry_match_invoice() — no daily pull recomputes this anymore, see CLAUDE.md's
-    # "Ambiguous trips" section).
+    # true when this manifest's trip had more than one manifest in the live technique search that matched it
     is_ambiguous_trip: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Quantity comparisons — Technique vs ALG invoice (populated on upload)
@@ -213,19 +167,10 @@ class BOLRecord(Base):
     no_invoice: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_third_party: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_do_not_pay: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    # Manually dismissed as a bad/duplicate sibling manifest on an ambiguous trip (added
-    # 2026-07-22) — set via POST /api/bols/{id}/dismiss from CompareManifestsModal.jsx,
-    # never on a record that has an invoice_number. Reversible in principle (nothing is
-    # deleted), but no undo route exists yet since nothing surfaces dismissed records in
-    # the UI to undo from. Excluded from the Compare-modal candidate list and from
-    # reassign-invoice's target lookup.
+    # manually dismissed as a bad/duplicate sibling manifest; never set on a record with an invoice_number.
+    # reversible in principle but no undo route exists yet
     is_dismissed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    # Clears the ~UNVERIFIED badge for a severe weight/pallet/piece mismatch that has no
-    # ambiguous trip to compare against (added 2026-07-22) — the Compare modal only
-    # applies when is_ambiguous_trip is set (multiple manifests to actually choose
-    # between); a single-manifest mismatch had no available action at all before this.
-    # Set via POST /api/bols/{id}/acknowledge-mismatch. No undo route — same reasoning
-    # as is_dismissed above.
+    # clears the ~UNVERIFIED badge for a mismatch with no ambiguous trip to compare against. no undo route
     mismatch_acknowledged: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     match_strategy: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     sid_exported_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
