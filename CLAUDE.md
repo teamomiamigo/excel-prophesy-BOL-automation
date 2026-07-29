@@ -374,12 +374,24 @@ documentation/           — Eight .md spec files: Design and Workflow - BOL Rec
                            closed GitHub issue, appended by the `/commit` command
                            (`.claude/commands/commit.md`). Read it for recent history that isn't yet
                            folded into this file.
-backend/agents/          — Design-only. `Agentic Automation Architecture.md` specs an LLM-agent layer
-                           (Task Registry, Proposals, human-in-the-loop review) that would live here,
-                           but no implementation is committed — the directory currently holds only a
-                           stale `__pycache__` from a deleted prototype (`runner.py`/`classify.py`/`llm.py`
-                           .pyc files with no matching .py source). Don't assume any of it is wired up;
-                           check for actual .py files before referencing this layer as if it exists.
+backend/agents/          — Real, working AI co-pilot layer (built 2026-07-22, commits 352a16d/42413b8;
+                           branch worktree-agentic-ai-layer, not yet merged to main or deployed live).
+                           classifier.py: deterministic rules engine (no LLM) that classifies every
+                           pending BOLRecord as approve/needs_review/flag, mirroring the dashboard's own
+                           cost_pct/mismatch/ambiguous-trip thresholds exactly. llm.py: optional direct
+                           Anthropic API call (ANTHROPIC_API_KEY in .env) used ONLY to draft the human-
+                           readable reasoning sentence for non-approve items — never the decision itself
+                           — with a hardcoded template fallback on any failure or missing key (the
+                           shipped default). pipeline.py: pure orchestration, no I/O. Routes under
+                           /api/agents/* in main.py; frontend surface is the "Agent Activity" dashboard
+                           tab (AgentActivitySection.jsx). Accepting a proposal calls the exact same
+                           approve_bol()/flag_bol() functions a manual dashboard click uses — no parallel
+                           mutation path; nothing here ever mutates a BOLRecord autonomously. Demoable
+                           end-to-end in mock mode; never tested against a real database, never load-
+                           tested against the cloud deployment, no tests exist. Full architecture,
+                           current gaps, and phase status: `documentation/Agentic Automation
+                           Architecture.md`. Doc-maintenance rules for this layer going forward:
+                           `documentation/AI Development and Documentation Standard.md`.
 README.md / ONBOARDING.md — README.md: local setup only (defers to this file for everything else).
                            ONBOARDING.md: non-technical project overview for anyone picking this up cold
                            (people, data sources, core features) — written 2026-07-01 and now stale on
