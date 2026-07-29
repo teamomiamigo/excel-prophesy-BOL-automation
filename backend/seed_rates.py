@@ -1,15 +1,5 @@
-"""
-Seed static rate tables: tariff_rates and fuel_surcharge_rates.
-
-Run once (or re-run to refresh after a rate update):
-    python -m backend.seed_rates
-
-Override file paths:
-    python -m backend.seed_rates --tariff PATH --fsc PATH
-
-Requires a live PostgreSQL connection (USE_MOCK_DATA does not affect this
-script — it writes directly to the database regardless).
-"""
+"""seed the three static rate tables. run: python -m backend.seed_rates [--tariff/--fsc/--alg-tariff PATH].
+requires a live postgres connection -- USE_MOCK_DATA doesn't affect this script"""
 import argparse
 import csv
 import uuid
@@ -68,17 +58,8 @@ def _extract_zip3(ep_zip: str) -> str:
 # ---------------------------------------------------------------------------
 
 def load_tariff_rates(tariff_path: Path, db) -> int:
-    """
-    Parse the SG360 Letters-Flats Tariff CSV and replace all tariff_rates rows.
-
-    CSV layout:
-      Row 1: 18 column headers
-      Rows 2-5: metadata (Name=, OriginZIP=, OriginText=, DropShipFileDate=)
-      Rows 6-258: one SCF facility per row (Facility Type = "SCF")
-
-    Only rows with Facility Type == "SCF" and Ignore flag == "N" are active
-    rate rows. Rows marked "Y" are stored but excluded from lookups.
-    """
+    """parse the SG360 Letters-Flats Tariff CSV and replace all tariff_rates rows.
+    only Facility Type == "SCF" rows are real; Ignore == "Y" rows are stored but excluded from lookups"""
     db.execute(text("DELETE FROM tariff_rates"))
 
     records = []
@@ -86,7 +67,7 @@ def load_tariff_rates(tariff_path: Path, db) -> int:
         reader = csv.DictReader(f)
         for row in reader:
             facility = row.get("Facility Type", "").strip()
-            # Metadata rows (Name=, OriginZIP=, etc.) have no valid Facility Type
+            # metadata rows (Name=, OriginZIP=, etc.) have no valid Facility Type
             if facility != "SCF":
                 continue
 
@@ -111,17 +92,8 @@ def load_tariff_rates(tariff_path: Path, db) -> int:
 
 
 def load_fsc_rates(fsc_path: Path, db) -> int:
-    """
-    Parse the ALG Worldwide FSC Matrix Excel and replace all fuel_surcharge_rates rows.
-
-    Sheet "Direct FSC" layout:
-      Rows 1-8: headers / branding (ALG WORLDWIDE LOGISTICS, FUEL SURCHARGE MATRIX)
-      Row 9: column headers (Fuel Price - At Least, Fuel Price - Up to, FSC)
-      Rows 10-144: 135 price-band rows
-
-    FSC unit: decimal multiplier (e.g., fsc_amount=0.365 → 36.5% surcharge).
-    The Excel stores 0.365, not 36.5. Applied as: access_prog = base_tariff × (1 + fsc_amount).
-    """
+    """parse the ALG FSC Matrix Excel ("Direct FSC" sheet, rows 10-144) and replace all
+    fuel_surcharge_rates rows. fsc_amount is a decimal multiplier (0.365 = 36.5%), not 36.5"""
     try:
         import openpyxl
     except ImportError:
@@ -157,14 +129,9 @@ def load_fsc_rates(fsc_path: Path, db) -> int:
 
 
 def load_alg_tariff_rates(alg_tariff_path: Path, db) -> int:
-    """
-    Parse the Access-sourced ALG5_2026 rate export (columns: tariff_id, destination,
-    rate1, mc1 — no header row) and replace all alg_tariff_rates rows.
-
-    destination is the exact Locations.AccountNumber-format code (e.g. "SCF606"),
-    confirmed 2026-07-15 to match our own pallet data's Dest_ID/destination_id exactly —
-    no zip3 derivation needed for this table, unlike tariff_rates.
-    """
+    """parse the ALG5_2026 rate export (tariff_id, destination, rate1, mc1 -- no header row)
+    and replace all alg_tariff_rates rows. destination is the exact Dest_ID/destination_id
+    format (e.g. "SCF606"), no zip3 derivation needed unlike tariff_rates"""
     db.execute(text("DELETE FROM alg_tariff_rates"))
 
     records = []

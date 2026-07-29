@@ -1,7 +1,6 @@
 import { useState } from 'react';
 
-// Same distribution list as backend/config.py's EMAIL_TO_ACCOUNTING — always all
-// four together, every send. Kept editable below; this is just the starting point.
+// same distribution list as backend/config.py's EMAIL_TO_ACCOUNTING; editable below
 const DEFAULT_RECIPIENTS = ['marym@sg360.com', 'katieb@sg360.com', 'invoices-frt@sg360.com', 'soniaf@sg360.com'];
 
 function fmtMoney(val) {
@@ -54,11 +53,8 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
   }
 
   function handleDownloadInvoices() {
-    // senderLabel is the invoice_email_sender this batch is grouped by — the
-    // same key the backend merged/stored a combined PDF under at upload time
-    // (see App.jsx's uploadInvoiceFiles). 'No Sender' means these records
-    // never carried a real sender label (e.g. a manual single-invoice
-    // upload), so there's no precomputed batch key to ask for.
+    // senderLabel is the batch key the backend merged a combined PDF under; 'No Sender'
+    // means these records never had a real sender label, so there's no batch key to ask for
     if (senderLabel && senderLabel !== 'No Sender') {
       window.open(`/api/invoices/batch-pdf?sender=${encodeURIComponent(senderLabel)}`, '_blank');
       return;
@@ -87,9 +83,7 @@ export default function EmailComposeModal({ records, senderLabel, onClose, onMar
     const subject = encodeURIComponent(subjectField);
     const body = encodeURIComponent(buildPlainTable());
     window.location.href = `mailto:${to}?subject=${subject}&body=${body}`;
-    // mailto links can't carry an attachment — there's no way around that
-    // browser/email-client limitation — so trigger the merged invoice PDF
-    // download at the same time, ready to drag into the draft this just opened.
+    // mailto can't carry an attachment -- trigger the PDF download too, ready to drag into the draft
     handleDownloadInvoices();
   }
 

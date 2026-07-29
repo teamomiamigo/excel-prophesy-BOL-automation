@@ -115,12 +115,7 @@ export default function LogSection() {
 
   useEffect(() => { fetchLogs('', '', ''); }, []);
 
-  // "Accidentally fully approved" undo — only offered once a record has actually
-  // been sent to accounting (accounting_exported_at set); an ordinary same-day
-  // approved-but-not-yet-sent record already has its own revert path in
-  // ApprovedSection.jsx. Does not refresh the Dashboard tab automatically (known
-  // limitation, not fixed here) — reverted record won't show in Pending until a
-  // manual reload or tab switch triggers App.jsx's own fetchPending().
+  // only for records already sent to accounting; doesn't auto-refresh the Dashboard tab
   async function handleRevert(record) {
     const label = record.invoice_number || record.technique_trip || record.id;
     if (!window.confirm(

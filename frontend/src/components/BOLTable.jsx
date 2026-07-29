@@ -35,7 +35,7 @@ function sortIndicator(sort, column) {
   return <span style={{ marginLeft: 4 }}>{sort.direction === 'asc' ? '▲' : '▼'}</span>;
 }
 
-// Sort accessors + comparator (issue #33 — sortable columns)
+// sort accessors + comparator for the sortable column headers
 const SORT_ACCESSORS = {
   trip:     { get: b => b.technique_trip, numeric: false },
   manifest: { get: b => b.manifest,       numeric: false },
@@ -55,10 +55,7 @@ function makeComparator(accessor, direction, isNumeric) {
   };
 }
 
-// No active column sort -> null, meaning "leave this group's records in their
-// incoming order" (whatever GET /api/bols already returned). Superseded the old
-// whole-list invoice_sent_at default sort (Phase 7, commit 0ea0a03, 2026-07-22) --
-// group order is now handled separately, by sender (see groupOrder below).
+// no active column sort -> null, meaning "leave this group's records in their incoming order"
 function getComparator(sort) {
   if (!sort.column) return null;
   const { get, numeric } = SORT_ACCESSORS[sort.column];
@@ -126,15 +123,9 @@ export default function BOLTable({
     b.invoice_email_sender,
   ].some(v => (v || '').toLowerCase().includes(lower));
 
-  // Sender is the highest form of organization: records are grouped into contiguous
-  // per-invoice_email_sender blocks (groupBySender), and groups themselves are ordered
-  // by recency (sortGroupsByRecency, outer sort, newest-first by default — groupOrder,
-  // replacing Phase 7's whole-list oldest-first default, commit 0ea0a03 2026-07-22).
-  // Clicking a column header (Trip/Manifest/BOL/Invoice #) only reorders records WITHIN
-  // each group (intraGroupComparator, inner sort) — a record can never leave its
-  // sender's block regardless of column-sort state. Technique-matched and
-  // Prophecy-BOL-matched records group identically since invoice_email_sender is set
-  // the same way regardless of match_strategy.
+  // records are grouped into contiguous per-sender blocks; groups are ordered by recency
+  // (groupOrder), and clicking a column header only reorders records within a group
+  // (intraGroupComparator) -- a record never leaves its sender's block
   const filteredBols = bols.filter(matchesBol);
   const orderedGroups = sortGroupsByRecency(groupBySender(filteredBols), groupOrder);
   const intraGroupComparator = getComparator(sort);
@@ -277,13 +268,7 @@ export default function BOLTable({
                 open
                 style={{ marginBottom: 12 }}
               >
-                {/* min-width: 100% (not width: 100%) so a table narrower than the
-                    viewport still fills it, but a wide table (many columns) can
-                    still exceed the viewport and drive real horizontal scroll on
-                    the shared scrollRef container below — a plain width: 100%
-                    forced every group's table to shrink-to-fit instead, and
-                    `overflow: hidden` on this box (removed) was clipping away
-                    whatever didn't fit rather than letting it scroll. */}
+                {/* min-width not width, so a wide table can still exceed the viewport and scroll */}
                 <summary
                   style={{
                     cursor: 'pointer',

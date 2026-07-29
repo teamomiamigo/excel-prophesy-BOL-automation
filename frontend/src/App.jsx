@@ -10,13 +10,9 @@ import CompareManifestsModal from './components/CompareManifestsModal.jsx';
 import LogSection from './components/LogSection.jsx';
 import BulkActionToolbar from './components/BulkActionToolbar.jsx';
 
-// When Module 2 ships: extract fetch helpers to src/api/bolsApi.js
-// and move this state/logic to src/pages/BolReconciliation.jsx
+// Module 2: extract fetch helpers to src/api/bolsApi.js, move this state to src/pages/BolReconciliation.jsx
 
-// Bounded-concurrency runner for the automatic post-upload retry-match pass —
-// a batch upload/poll can produce several new stubs at once, and firing all their
-// live Technique searches fully in parallel would hammer AWP-SQL-PROD. No library
-// needed at this scale, just a shared work queue with a fixed number of workers.
+// bounded-concurrency runner so a batch of retry-match searches doesn't hammer AWP-SQL-PROD
 async function runWithConcurrency(items, limit, fn) {
   const queue = [...items];
   async function worker() {
@@ -30,19 +26,12 @@ async function runWithConcurrency(items, limit, fn) {
 
 const AUTO_RETRY_CONCURRENCY = 3;
 
-// A "timed_out" retry-match response (2026-07-23) means the live Technique search
-// didn't finish within its deadline -- NOT that the trip was confirmed absent. Direct
-// measurement found get_technique_data()'s own latency varying 17.5s-26.3s+ even with
-// no concurrency, so a single timeout is expected occasionally and is worth another
-// attempt rather than being recorded as a permanent miss. 1 initial + 2 retries.
+// a "timed_out" response means the search didn't finish, not that the trip was confirmed
+// absent -- worth another attempt rather than recording it as a permanent miss
 const AUTO_RETRY_MAX_ATTEMPTS = 3;
 
-// Reconciles a batch's initial "unmatched" list against the automatic retry-match
-// pass that runs right after upload/poll (see autoRetryNewStubs) — without this, the
-// Invoice Upload/Poll Results summary keeps reporting a record as unmatched even
-// after it resolves a moment later, because that summary is otherwise built from the
-// immediate per-file response, before the automatic retry has a chance to run.
-// unmatchedByRecordId maps a stub's record_id to its entry in `unmatched`.
+// patches the initial "unmatched" list with results from the automatic retry-match pass
+// that runs right after upload/poll, so the summary doesn't keep showing a stale miss
 function reconcileWithRetryResults(unmatched, unmatchedByRecordId, retryResults) {
   const stillUnmatched = [...unmatched];
   const newlyMatched = [];
@@ -94,10 +83,7 @@ export default function App() {
   const [fixSenderSubmitting, setFixSenderSubmitting] = useState(false);
   const folderInputRef = useRef(null);
 
-  // React's JSX attribute mapping doesn't reliably set the `webkitdirectory`
-  // IDL property on the underlying <input> — it has to be assigned directly
-  // on the DOM node, or the browser silently falls back to a normal (non-folder)
-  // file picker and every file's webkitRelativePath stays empty.
+  // JSX can't reliably set the webkitdirectory IDL property; must assign it directly on the DOM node
   useEffect(() => {
     if (folderInputRef.current) {
       folderInputRef.current.webkitdirectory = true;
@@ -128,10 +114,7 @@ export default function App() {
     approvedToday:        approvedBols.length,
   };
 
-  // -------------------------------------------------------------------------
-  // Selection (issue #32 — multi-select bulk actions)
-  // -------------------------------------------------------------------------
-
+  // selection (multi-select bulk actions)
   function toggleSelect(id) {
     setSelectedIds(prev => {
       const next = new Set(prev);
@@ -157,10 +140,7 @@ export default function App() {
     setSelectedIds(new Set());
   }
 
-  // -------------------------------------------------------------------------
-  // Sorting (issue #33 — sortable columns)
-  // -------------------------------------------------------------------------
-
+  // sorting (sortable columns)
   function handleSort(column) {
     setSort(prev => {
       if (prev.column !== column) return { column, direction: 'asc' };
@@ -173,10 +153,7 @@ export default function App() {
     setGroupOrder(prev => (prev === 'desc' ? 'asc' : 'desc'));
   }
 
-  // -------------------------------------------------------------------------
-  // Fetch helpers
-  // -------------------------------------------------------------------------
-
+  // fetch helpers
   async function fetchPending() {
     setLoadingPending(true);
     try {
@@ -209,10 +186,7 @@ export default function App() {
     fetchApproved();
   }, []);
 
-  // -------------------------------------------------------------------------
-  // Actions
-  // -------------------------------------------------------------------------
-
+  // actions
   async function handleApprove(recordId) {
     setApprovingId(recordId);
     try {
@@ -361,16 +335,9 @@ export default function App() {
     }
   }
 
-  // Automatic follow-up for stubs a CSV upload/poll just created (2026-07-22) — fires
-  // the same live wide-Technique-search retry-match already exposed as the manual
-  // magnifying-glass button, once per new stub, each in its own isolated request so
-  // none of them shares a budget with anything else (that budget-sharing was the
-  // actual bug: a real trip that matched instantly on manual retry could fail to
-  // auto-match at upload time purely because the search ran inside the same request
-  // as everything else already done in it). Returns a Map(recordId -> {matched,
-  // trip, message}) so the caller can reconcile its upload/poll results summary —
-  // without that, the summary would keep reporting a stub as unmatched even after
-  // this resolves it a moment later (the exact bug the user hit 2026-07-22).
+  // automatic follow-up for stubs a CSV upload/poll just created; fires the same
+  // retry-match as the manual button, once per stub, each in its own isolated request.
+  // returns Map(recordId -> {matched, trip, message}) so the caller can reconcile its summary
   async function autoRetryNewStubs(recordIds) {
     const results = new Map();
     if (!recordIds.length) return results;
@@ -383,8 +350,7 @@ export default function App() {
         } catch (err) {
           data = { matched: false, message: err.message };
         }
-        // Only a timeout is worth another attempt -- a confirmed non-match (timed_out
-        // false) or a real match should stop immediately.
+        // only a timeout is worth another attempt -- a confirmed non-match or real match stops immediately
         if (!data.timed_out || attempt === AUTO_RETRY_MAX_ATTEMPTS) break;
       }
       results.set(id, { matched: !!data.matched, trip: data.matched_trip, message: data.message, timedOut: !!data.timed_out });
@@ -393,13 +359,7 @@ export default function App() {
     return results;
   }
 
-  // -------------------------------------------------------------------------
-  // Bulk actions (issue #32) — fire the same per-record endpoints used by the
-  // individual action buttons, once per eligible selected record, then a
-  // single refresh. Eligibility mirrors each action's per-row button
-  // condition in BOLRow.jsx.
-  // -------------------------------------------------------------------------
-
+  // bulk actions: fire the same per-record endpoints as the individual buttons, then one refresh
   function selectedRecords() {
     return visiblePendingBols.filter(b => selectedIds.has(b.id));
   }
@@ -521,10 +481,7 @@ export default function App() {
     if (!all.length) return;
     setBulkActionLoading(true);
     try {
-      // Sequential, not Promise.all — reduces (doesn't fully eliminate) the chance
-      // the browser blocks/prompts on multiple simultaneous downloads. Reuses the
-      // exact per-record handler from #35 unchanged, so each file is identical to
-      // what clicking that record's own SID button would produce.
+      // sequential, not Promise.all -- reduces the chance the browser blocks simultaneous downloads
       for (const b of eligible) {
         await handleExportRecordToProphecy(b.id);
       }
@@ -537,9 +494,7 @@ export default function App() {
     }
   }
 
-  // Shared upload loop — takes [{file, folderName}] regardless of which picker
-  // produced it (File System Access API walk, or the webkitdirectory fallback
-  // input) and does the actual per-file POST + results aggregation.
+  // shared upload loop -- takes [{file, folderName}] regardless of which picker produced it
   async function uploadInvoiceFiles(fileEntries) {
     if (!fileEntries.length) {
       setError('No CSV files found in the selected folder.');
@@ -571,8 +526,7 @@ export default function App() {
           if (data.match_strategy === 'invoice_only' && data.record_id) {
             newStubIds.push(data.record_id);
             unmatchedByRecordId.set(data.record_id, entry);
-            // Not a final verdict yet — the automatic retry below still has to run.
-            // Labeling this "unmatched" already would be a lie for however long that takes.
+            // not final -- the automatic retry below still has to run
             entry.checking = true;
           }
         }
@@ -582,19 +536,12 @@ export default function App() {
     }
     setInvoiceUploading(false);
     setUploadProgress(null);
-    // Show results right away — a batch with several unmatched invoices can take up
-    // to a minute for the automatic retry pass below to finish, and going silent for
-    // that whole stretch (2026-07-22 regression) reads as "broken", not "still working".
-    // Anything still being checked is honestly labeled, then patched in place once resolved.
+    // show results right away -- the retry pass below can take up to a minute; going silent
+    // that whole stretch reads as broken, not still working. anything still checking is labeled honestly
     setUploadResults({ matched, unmatched, errors, conflicts });
     await Promise.all([fetchPending(), fetchApproved()]);
 
-    // Automatic follow-up (2026-07-22): a stub that didn't match anything already in
-    // our DB gets one live wide-Technique-search retry right away, in its own isolated
-    // request — the same search the manual retry-match (magnifying glass) button
-    // fires, just automated. Upload itself never waits on a live query anymore (see
-    // _process_invoice_csv()'s removal note), so this is what actually resolves most
-    // new invoices now instead of it being a rare manual fallback.
+    // automatic follow-up: any stub that didn't match already gets one live retry-match now
     if (newStubIds.length) {
       const retryResults = await autoRetryNewStubs(newStubIds);
       const { stillUnmatched, newlyMatched } = reconcileWithRetryResults(unmatched, unmatchedByRecordId, retryResults);
@@ -603,12 +550,7 @@ export default function App() {
       setUploadResults({ matched, unmatched: stillUnmatched, errors, conflicts });
     }
 
-    // Best-effort: merge this batch's invoice PDFs into one file now, so
-    // "Download Invoices" in the Send to Accounting modal is ready instantly
-    // instead of merging on first click. One call per distinct sender, since
-    // a single folder pick can span several dated sender subfolders. Safe to
-    // skip/fail silently — GET /api/invoices/batch-pdf falls back to merging
-    // on the fly if no precomputed batch PDF is found.
+    // best-effort: pre-merge this batch's invoice PDFs so "Download Invoices" is instant later
     const sendersInBatch = [...new Set([...matched, ...unmatched].map(r => r.sender).filter(Boolean))];
     await Promise.allSettled(
       sendersInBatch.map(sender =>
@@ -621,11 +563,8 @@ export default function App() {
     );
   }
 
-  // Primary picker — File System Access API. Each directory handle carries its
-  // own real `.name`, so there's no path-string parsing or separator guessing:
-  // walking the tree and reading `.name` at each level always gives the correct
-  // immediate-parent folder for a file, whether the user selects a specific
-  // dated sender folder directly or the whole INVOICE_FOLDER root above it.
+  // primary picker: File System Access API -- each directory handle carries its own real
+  // .name, so the immediate-parent folder is always correct with no path-string guessing
   async function pickInvoiceFolder() {
     let rootHandle;
     try {
@@ -635,17 +574,13 @@ export default function App() {
       return;
     }
     const fileEntries = [];
-    // Pair by the leading Z-number, not the whole filename stem: ALG names the
-    // PDFs with a suffix the CSVs don't have ("Z558429 -Segerdahl Graphics,
-    // Inc..pdf" alongside "Z558429.CSV"), so exact-stem matching never pairs them.
+    // pair by the leading Z-number, not the full stem -- ALG's PDF filenames carry a suffix the CSVs don't
     const zNumberOf = (name) => {
       const m = name.match(/^\s*(Z\d+)/i);
       return m ? m[1].toUpperCase() : null;
     };
     async function walk(dirHandle, folderName) {
-      // Collect CSVs and PDFs from this directory level first — a companion PDF
-      // lives in the same folder as its CSV, so pairing is scoped per-directory
-      // rather than across the whole tree.
+      // pairing is scoped per-directory -- a companion PDF lives in the same folder as its CSV
       const csvEntries = [];
       const pdfByZ = new Map();
       const subdirs = [];
@@ -682,11 +617,7 @@ export default function App() {
     await uploadInvoiceFiles(fileEntries);
   }
 
-  // Fallback for browsers without the File System Access API (non-Chromium).
-  // webkitdirectory gives every file its full path from the selected root via
-  // webkitRelativePath — the sender/date info is the file's IMMEDIATE parent
-  // folder, not necessarily the top-level selected folder, so it's derived
-  // per file rather than once globally.
+  // fallback for non-Chromium browsers; sender/date is the file's immediate parent folder, derived per file
   function parentFolderName(file) {
     if (!file.webkitRelativePath) return '';
     const parts = file.webkitRelativePath.split(/[\\/]/).filter(Boolean);
@@ -709,11 +640,7 @@ export default function App() {
     if (!files.some(f => f.webkitRelativePath)) {
       setError('The browser did not report folder paths for these files — it may have opened a plain file picker instead of a folder picker. Sender/date will not be auto-detected; try again with the folder picker.');
     }
-    // Pair each CSV with its companion PDF in the same folder by leading Z-number
-    // (ALG's PDFs carry a name suffix the CSVs don't — "Z558429 -Segerdahl
-    // Graphics, Inc..pdf" — so exact-stem matching never pairs). Scoped per-folder
-    // via parentFolderName so a Z-number collision across sender folders can't
-    // cross-pair.
+    // pair each CSV with its companion PDF by leading Z-number, scoped per-folder to avoid cross-pairing
     const zNumberOf = (name) => {
       const m = name.match(/^\s*(Z\d+)/i);
       return m ? m[1].toUpperCase() : null;
@@ -849,9 +776,7 @@ export default function App() {
             }
           }
         }
-        // Show results right away (2026-07-22) — see uploadInvoiceFiles()'s comment;
-        // a batch can take up to a minute for the automatic retry pass to finish, and
-        // going silent for that whole stretch reads as "broken", not "still working".
+        // show results right away -- see uploadInvoiceFiles()'s comment on why
         setPollResults({ matched, unmatched, errors, conflicts });
         await Promise.all([fetchPending(), fetchApproved()]);
         if (newStubIds.length) {
@@ -919,9 +844,7 @@ export default function App() {
     }
   }
 
-  // Manual correction for a sender batch whose folder name failed to parse into a
-  // date (BOLTable.jsx's InvoiceSenderFixBanner) — moves every record sharing the
-  // raw sender string onto the corrected, parseable one.
+  // manual correction for a sender batch whose folder name failed to parse into a date
   async function handleFixInvoiceSender(rawSender, correctedFolderName) {
     setFixSenderSubmitting(true);
     try {
@@ -941,11 +864,7 @@ export default function App() {
     }
   }
 
-  // Dismiss a bad/duplicate sibling manifest from the Compare modal — returns
-  // true/false rather than throwing, so the modal can update its own candidate
-  // list in place without needing a full trip-manifests refetch. Dismissed
-  // records were never in Pending to begin with (no invoice_number), so no
-  // fetchPending() call is needed here.
+  // returns true/false rather than throwing, so Compare can update its own candidate list in place
   async function handleDismissSibling(recordId) {
     try {
       const res = await fetch(`/api/bols/${recordId}/dismiss`, { method: 'POST' });
@@ -978,10 +897,7 @@ export default function App() {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Render
-  // -------------------------------------------------------------------------
-
+  // render
   return (
     <div style={{ minHeight: '100vh', background: '#f4f5f7' }}>
       {/* Header */}

@@ -1,12 +1,7 @@
 import { useState } from 'react';
 
-// Safety net for a sender batch whose folder name failed to parse into a date
-// (issue #67's raw-fallback path) — shown inline under that batch's own group
-// header. Deliberately minimal: one input + submit, no local error/reset state.
-// A failed correction surfaces through App.jsx's existing global error banner;
-// a successful one makes the parent refetch pick up a real invoice_sent_at, at
-// which point this banner's own condition (BOLTable.jsx's needsCorrection) goes
-// false and it stops rendering — no manual cleanup needed here.
+// shown under a batch whose folder name failed to parse into a date; disappears on its own
+// once the parent refetch picks up a real invoice_sent_at (BOLTable.jsx's needsCorrection)
 export default function InvoiceSenderFixBanner({ rawSender, recordCount, submitting, onSubmit }) {
   const [value, setValue] = useState('');
 

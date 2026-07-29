@@ -1,18 +1,6 @@
-"""
-10 mock BOL records using real field formats and real data scale from
-the production spreadsheet (Technique and BOL Numbers New June 2026.xlsx).
-
-Covers every UI state the dashboard must handle:
-  - Records with and without BOL numbers (BOL is nullable until created in Prophecy)
-  - Records with null trip/manifest (blank rows in Excel belong to trip above)
-  - Cost % green / yellow / red ranges
-  - Null amount (invoice not yet received)
-  - CM_ comingle manifest prefix (future Module 2 marker)
-  - "cancels out" notes
-  - Approved, pending, and flagged statuses
-  - Type A (needs_sid_export=True) vs Type B (bol_number exists, needs_sid_export=False)
-  - Records 13–14: no_invoice=True for third-party button testing
-"""
+"""mock BOL records at real data scale, covering every UI state the dashboard handles:
+null bol_number/trip/manifest, cost % green/yellow/red, no amount yet, comingle prefix,
+approved/pending/flagged, Type A vs Type B, and (13-14) no_invoice for third-party testing"""
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -535,9 +523,8 @@ MOCK_BOLS = [
         "created_at": datetime(2026, 6, 10, 7, 0, 11, tzinfo=timezone.utc),
         "updated_at": datetime(2026, 6, 10, 7, 0, 11, tzinfo=timezone.utc),
     },
-    # Records 13–14: no_invoice=True — customer pays freight directly.
-    # Record 13: shows the "3rd Party" button in the pending table.
-    # Record 14: pre-seeded as already marked third-party (appears in ThirdPartySection on load).
+    # records 13-14: no_invoice=True, customer pays freight direct. 13 shows the 3rd Party
+    # button; 14 is pre-seeded as already third-party
     {
         "id": "aaaaaaaa-0013-0013-0013-000000000013",
         "bol_number": None,
@@ -623,10 +610,7 @@ MOCK_BOLS = [
         "created_at": datetime(2026, 6, 10, 7, 0, 13, tzinfo=timezone.utc),
         "updated_at": datetime(2026, 6, 10, 7, 0, 13, tzinfo=timezone.utc),
     },
-    # Records 15-16: two manifests sharing one trip (TEC_T_0999001) — regression
-    # fixture for invoice-matching fan-out. One trip can have several manifests;
-    # uploading test_data/Z999001_test.csv (Job Name "999001") should attach the
-    # invoice to BOTH of these, not just the first one found.
+    # records 15-16: two manifests sharing one trip -- fixture for invoice-matching fan-out
     {
         "id": "aaaaaaaa-0015-0015-0015-000000000015",
         "bol_number": None,
@@ -635,9 +619,7 @@ MOCK_BOLS = [
         "technique_weight": Decimal("16200.00"),
         "technique_pallets": 48,
         "technique_pcs": 210500,
-        # Invoice Z999001 landed here via job-name suffix match — is_ambiguous_trip
-        # (below) means this could just as easily belong to manifest ...0999012
-        # instead; this is the fixture for the new compare-manifests view.
+        # ambiguous: could just as easily belong to manifest ...0999012 -- fixture for the compare-manifests view
         "invoice_number": "Z999001",
         "invoice_email_sender": "Tanya 6/24/2026 9:15AM",
         "invoice_sent_at": datetime(2026, 6, 24, 9, 15, tzinfo=timezone.utc),

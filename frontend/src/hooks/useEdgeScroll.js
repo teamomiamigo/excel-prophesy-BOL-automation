@@ -3,10 +3,7 @@ import { useEffect } from 'react';
 const EDGE_SCROLL_ZONE_PX = 140;
 const EDGE_SCROLL_SPEED_PX = 8;
 
-// Drag-near-the-edge horizontal auto-scroll for a wide, horizontally-scrollable
-// table. scrollRef must point at the `overflowX: auto` container; enabled gates
-// whether the listeners are attached (e.g. pass a "content is rendered" boolean
-// so this doesn't attach to an empty/loading table).
+// drag-near-the-edge horizontal auto-scroll; scrollRef points at the overflowX:auto container
 export default function useEdgeScroll(scrollRef, enabled) {
   useEffect(() => {
     const el = scrollRef.current;

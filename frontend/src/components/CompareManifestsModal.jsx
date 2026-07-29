@@ -59,16 +59,12 @@ const TD = {
 
 const TD_R = { ...TD, textAlign: 'right' };
 
-// A candidate this modal is not offering an "Assign here" action for — either
-// it's the manifest the invoice already landed on, there's no invoice on this
-// trip at all yet, or Katie's already told us this leg is third-party.
+// not the reference manifest, and not already marked third-party
 function isAssignable(candidate, referenceId) {
   return candidate.id !== referenceId && !candidate.is_third_party;
 }
 
-// A candidate that can be dismissed as a bad/duplicate manifest — never the one
-// actually holding the invoice, and never one that already has its own real
-// invoice attached (that's a genuinely separate load, not junk data).
+// not the reference manifest, and doesn't already have its own real invoice
 function isDismissable(candidate, referenceId) {
   return candidate.id !== referenceId && !candidate.invoice_number;
 }
@@ -193,8 +189,7 @@ export default function CompareManifestsModal({ bol, submitting, onClose, onReas
                   const isReference = c.id === data.reference_id;
                   const assignable = isAssignable(c, data.reference_id) && !!data.reference_id;
                   const dismissable = isDismissable(c, data.reference_id);
-                  // Diffs match the main dashboard's convention: ALG (invoice) minus our
-                  // own Technique quantities. Only meaningful once an invoice has arrived.
+                  // same convention as the main dashboard: ALG minus our own technique quantities
                   const diffStr = (algVal, techVal) => {
                     if (algVal == null || techVal == null) return '—';
                     const d = Math.round(parseFloat(algVal) - parseFloat(techVal));

@@ -1,44 +1,20 @@
 import { useState } from 'react';
 
-// Do Not Pay is only offered for invoice-only stubs with no Technique/Prophecy
-// match at all — a fresh 'invoice_only' stub with no bol_number gets Retry/3P
-// buttons instead (still worth another Technique lookup, or writing it off as
-// third-party if it'll never match). Shared with App.jsx so eligibility can't
-// drift out of sync with this row's own button condition.
+// do not pay is only for invoice-only stubs with no technique/prophecy match at all
 export function isDoNotPayEligible(bol) {
   return bol.technique_trip == null
     && !!bol.invoice_number
     && !(bol.match_strategy === 'invoice_only' && !bol.bol_number);
 }
 
-// Third-party covers two distinct populations: (1) pre-invoice Technique records
-// (technique_trip set, no amount/BOL yet — "this shipment will never get an ALG
-// invoice"), and (2) invoice-only stubs that never matched any Technique/Prophecy
-// record at all (no technique_trip, no BOL — the invoice itself may still carry
-// an amount, since ALG billed something we just can't identify). Once a record has
-// BOTH a real technique_trip AND an amount, it's a normal matched/invoiced Corp
-// record and shouldn't be retroactively marked third-party. Once bol_number exists,
-// it's already tied to a real Prophecy load. Shared with App.jsx and the backend
-// guard in mark_third_party so eligibility can't drift.
+// covers pre-invoice technique records and never-matched invoice-only stubs, but not a normal matched record
 export function isThirdPartyEligible(bol) {
   return !bol.is_third_party
     && !bol.bol_number
     && !(bol.technique_trip && bol.amount);
 }
 
-// An ambiguous-trip manifest (Technique split one trip into several manifests, see
-// is_ambiguous_trip) that Katie hasn't resolved yet — no BOL created, not marked
-// third-party. technique_weight/pallets/pcs are real Query B numbers, just not yet
-// confirmed as belonging to the right manifest for this trip. Resolution comes only
-// from actions Katie already takes herself (SID export -> Prophecy import -> bol_number,
-// or mark-third-party) -- never inferred from Technique's own TranType/Notes fields.
-//
-// Second, independent trigger: a record CAN already have a bol_number and still be
-// wrongly matched -- the backend's "resolved candidate" shortcut (main.py) picks
-// whichever manifest already has a bol_number without checking whether its own
-// quantities are even close to what the invoice billed. weight_diff/pallet_diff/
-// pcs_diff are already computed for every record regardless of ambiguity, so a
-// severe mismatch is visible here with no backend change.
+// two triggers: an unresolved ambiguous trip, or a bol_number whose own quantities don't fit
 const QUANTITY_MISMATCH_THRESHOLD = 0.15; // mirrors backend's _CLOSE_MATCH_THRESHOLD (main.py)
 
 function _relDiff(diffVal, algVal) {
@@ -53,13 +29,8 @@ export function hasSevereQuantityMismatch(bol) {
   return score > QUANTITY_MISMATCH_THRESHOLD;
 }
 
-// A severe mismatch with no ambiguous trip has nothing for the Compare modal to
-// show (only one manifest exists) — Acknowledge is the only available action,
-// letting Katie clear the badge once she's confirmed the mismatch is expected/
-// explained. Once acknowledged, hasSevereQuantityMismatch stays true (the numbers
-// didn't change) but the badge and this button both stop showing (added 2026-07-22,
-// per direct feedback that a severe-mismatch-only row otherwise offered no action
-// at all — Compare only applies to the genuinely ambiguous-trip case).
+// a severe mismatch with no ambiguous trip has nothing for Compare to show -- Acknowledge
+// just clears the badge once Katie's confirmed the mismatch is expected
 export function isMismatchAcknowledgeEligible(bol) {
   return !bol.is_third_party
     && !bol.mismatch_acknowledged
@@ -74,23 +45,13 @@ export function isUnverifiedQuantity(bol) {
   return ambiguousUnresolved || severeMismatch;
 }
 
-// A flagged record needs to be unflagged before it can be approved (approving used
-// to silently un-flag it in the same call — see the backend guard in approve_bol).
-// A record with no bol_number hasn't had its Prophecy load created yet, so there's
-// nothing real to send to accounting -- except third-party records, which
-// structurally never get one (no real Prophecy load for a customer-pays-direct
-// shipment) and are approved through this same button via "Move All to Log".
-// Shared with App.jsx's bulk-approve so eligibility can't drift.
+// flagged records must be unflagged first; a record needs a bol_number to approve,
+// except third-party records, which structurally never get one
 export function isApproveEligible(bol) {
   return bol.status !== 'flagged' && (!!bol.bol_number || bol.is_third_party);
 }
 
-// ---------------------------------------------------------------------------
-// Cost % variance logic — primary metric (amount / access_prog) — reverted 2026-07-21
-// (was access_prog/amount 2026-07-16 to 2026-07-21). Color logic below is
-// symmetric/direction-agnostic — unaffected by either flip.
-// Green: within 3% | Orange: 3–6% off | Red: >6% off
-// ---------------------------------------------------------------------------
+// cost % = amount / access_prog. green: within 3% | orange: 3-6% off | red: >6% off
 function getCostPctStyle(costPct) {
   if (costPct == null) return { color: '#9ca3af' };
   const deviation = Math.abs(costPct * 100 - 100);
@@ -120,13 +81,8 @@ function fmtDiff(val) {
   return n > 0 ? `+${n.toLocaleString('en-US')}` : n.toLocaleString('en-US');
 }
 
-// Detects destinations that received more than one pallet row on this load, and how
-// much that costs: today's calc floors each row's minimum charge independently, so two
-// small pallets to the same destination can each hit the same minimum charge rather
-// than it applying once to the combined shipment (confirmed by hand against real live
-// records -- this pattern alone explained ~100% of the cost gap on two separate BOLs).
-// This is diagnostic only: it does NOT change access_prog/cost_calc_detail, just
-// explains where a gap against ALG's actual amount likely came from.
+// diagnostic only -- detects destinations billed a separate minimum charge per pallet
+// row instead of once for the combined shipment; doesn't change access_prog itself
 const MAX_DUPLICATE_LINES = 5;
 
 function analyzeDuplicateDestinations(pallets) {
@@ -167,12 +123,8 @@ function analyzeDuplicateDestinations(pallets) {
   return { dupes, totalExcessWithFsc };
 }
 
-// Cost summary popover (GET /api/bols/{id}/cost-breakdown) — shown on hover over the
-// Calc Cost cell. Deliberately a rollup, not a per-pallet table: a real invoice can carry
-// 100+ line items, and Katie only needs to know whether this number is trustworthy and
-// why, not which specific pallet did what. The duplicate-destination section below is
-// the one exception carrying real per-pallet detail, since it's the single biggest
-// explainer of "why doesn't this match what ALG billed" seen so far.
+// cost summary popover, shown on hover over the Calc Cost cell -- a rollup, not a
+// per-pallet table, since a real invoice can carry 100+ line items
 function CostBreakdownPopover({ data }) {
   if (data === 'loading') {
     return (
@@ -329,9 +281,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
         .catch(() => setCostBreakdown({ _error: 'Cost check failed — request error.' }));
     }
   }
-  // Invoice-only stub that never matched any Technique/Prophecy record — Retry
-  // (try again next pull) and 3P (write it off as third-party) are both offered,
-  // since a stub like this can otherwise sit forever with no way to resolve it.
+  // a never-matched stub -- otherwise this could sit forever, so both Retry and 3P are offered
   const isUnresolvedInvoiceOnly = bol.technique_trip == null && bol.match_strategy === 'invoice_only' && !bol.bol_number;
 
   const rowBg = isFlagged
@@ -371,10 +321,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
         }
       </td>
 
-      {/* Technique quantities — substituted with Prophecy (plain text + indigo P marker) for Wolf/311 rows.
-          A record with neither a technique_trip nor Prophecy data (a genuinely unmatched invoice-only
-          stub) has no independent baseline at all — technique_weight/pallets/pcs are 0 there only
-          because the DB columns are non-nullable, not because we know our own quantity is zero. */}
+      {/* technique quantities, substituted with prophecy (P marker) for Wolf/311 rows */}
       {(() => {
         const isP = !bol.technique_trip && (bol.prophecy_weight != null || bol.prophecy_pallets != null);
         const hasNoBaseline = !bol.technique_trip && bol.prophecy_weight == null && bol.prophecy_pallets == null;
@@ -517,10 +464,10 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
         )}
       </td>
 
-      {/* Actions — routine zone (Approve/Flag/SID/BOL) + exception zone (3P/Ignore) + Notes, fixed-size slots so every row has identical column width */}
+      {/* actions: routine zone + exception zone, fixed-size slots so every row is the same width */}
       <td style={{ ...TD, textAlign: 'center', borderLeft: '1px solid #f3f4f6' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: 8 }}>
-          {/* Routine zone: Approve, Flag/Unflag, SID, Refresh BOL — used constantly, always one click */}
+          {/* routine zone: Approve, Flag/Unflag, SID, Refresh BOL */}
           <div style={{ display: 'grid', gridTemplateColumns: '80px 26px 42px 42px', gap: 4, alignItems: 'center' }}>
             {/* Approve */}
             <button
@@ -546,7 +493,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
             >
               {isApproving ? '…' : '✓ Approve'}
             </button>
-            {/* Flag ↔ Unflag (swaps in place, same slot) — small neutral icon button, secondary to Approve */}
+            {/* flag/unflag swaps in the same slot */}
             {isFlagged ? (
               <button
                 onClick={onUnflag}
@@ -570,8 +517,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
                 ⚑
               </button>
             )}
-            {/* Export to Prophecy / Check BOL — only for pending Corp records
-                (no BOL yet, has a manifest, not third-party) */}
+            {/* export/check BOL -- only for pending Corp records */}
             {bol.needs_sid_export && bol.manifest && !bol.is_third_party ? (
               <button
                 onClick={onExportSid}
@@ -623,8 +569,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
           {/* Divider between routine and exception-handling actions */}
           <div style={{ width: 1, alignSelf: 'stretch', background: '#e5e7eb' }} />
 
-          {/* Exception zone: 3P | Retry+3P | Do Not Pay — mutually exclusive except
-              the unresolved-invoice-only case, which offers both Retry and 3P */}
+          {/* exception zone: 3P | Retry+3P | Do Not Pay, mutually exclusive except the unresolved-invoice-only case */}
           <div style={{ width: isUnresolvedInvoiceOnly ? 88 : 44 }}>
             {isThirdPartyEligible(bol) ? (
               isUnresolvedInvoiceOnly ? (
@@ -705,11 +650,7 @@ export default function BOLRow({ bol, isApproving, isUnflagging, isMarkingThirdP
             )}
           </div>
 
-          {/* Compare Manifests (ambiguous trip — multiple manifests, invoice not yet
-              confirmed on the right one) or Acknowledge (severe quantity mismatch with
-              only one manifest — nothing to compare against, just a "confirmed fine"
-              dismissal). Mutually exclusive with each other; independent of the
-              3P/Retry/Do-Not-Pay zone above, so its own slot. */}
+          {/* Compare (ambiguous trip) or Acknowledge (single-manifest mismatch), mutually exclusive */}
           <div style={{ width: 44 }}>
             {bol.is_ambiguous_trip && !bol.bol_number && !bol.is_third_party ? (
               <button
