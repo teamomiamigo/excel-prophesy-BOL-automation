@@ -2,12 +2,12 @@ import csv
 import io
 import json
 import logging
+import multiprocessing
 import os
 import re
 import tempfile
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -31,18 +31,59 @@ class _HardTimeout(Exception):
     """raised when the wrapped call runs past its deadline"""
 
 
-def _call_with_timeout(func, seconds, *args, **kwargs):
-    # pyodbc's own timeouts aren't reliable here, so bound the call with a thread instead
-    # don't use ThreadPoolExecutor as a context manager -- __exit__ blocks until the
-    # thread finishes, which defeats the timeout; shutdown(wait=False) below is required
-    pool = ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(func, *args, **kwargs)
+def _call_with_timeout_target(conn, func, args, kwargs):
     try:
-        return future.result(timeout=max(1, seconds))
-    except FutureTimeoutError:
-        raise _HardTimeout(f"exceeded {seconds}s hard deadline") from None
+        result = ("ok", func(*args, **kwargs))
+    except Exception as exc:  # noqa: BLE001 -- reported back to the parent, not swallowed
+        result = ("error", exc)
+    try:
+        conn.send(result)
     finally:
-        pool.shutdown(wait=False)
+        conn.close()
+
+
+def _call_with_timeout(func, seconds, *args, **kwargs):
+    # Fixed 2026-07-30, three rounds -- see git history/commit message for the first two
+    # (ThreadPoolExecutor, then a plain ProcessPoolExecutor/multiprocessing.Queue) and why each
+    # didn't hold up under live testing against job 111427/Z559268's genuinely stuck AWP-SQL-PROD
+    # query. The Queue-based process attempt failed a different, more basic way: creating a
+    # multiprocessing.Queue needs a Lock (a POSIX named semaphore, sem_open() under /dev/shm),
+    # and Lambda's execution environment doesn't reliably provide a writable /dev/shm -- it
+    # failed immediately with "[Errno 2] No such file or directory", which this function's own
+    # except-and-report-back design silently turned into a false "timed out" instead of a crash.
+    # multiprocessing.Pipe() has no such dependency -- it's a plain os.pipe() under the hood, no
+    # semaphore/shared-memory involved -- so it works the same regardless of /dev/shm.
+    #
+    # Known residual risk (found 2026-07-30 via timestamped diagnostic logging, since removed):
+    # this backstop still occasionally misses its own deadline -- one request logged NOTHING for
+    # 28s before Lambda's hard kill, not even this function's own very first log line, with only
+    # trivial non-blocking Python between the prior DB fetch and here. That rules out anything in
+    # our own code; it looks like an AWS Lambda infrastructure-level pause of the whole execution
+    # environment, not a bug this function can detect or work around. Accepted as a rare residual
+    # risk -- the frontend's own auto-retry (up to 3 attempts per stub) absorbs most occurrences.
+    ctx = multiprocessing.get_context("fork")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_call_with_timeout_target, args=(child_conn, func, args, kwargs))
+    proc.start()
+    child_conn.close()  # the parent only needs its read end; the child's copy is closed there
+    try:
+        if parent_conn.poll(max(1, seconds)):
+            status, payload = parent_conn.recv()
+            proc.join(timeout=2)
+            if status == "error":
+                raise payload
+            return payload
+        # timed out -- kill the stuck worker so its socket to AWP-SQL-PROD actually closes,
+        # instead of just declining to wait on it any longer (confirmed live: that alone doesn't
+        # bound this call when the underlying query is genuinely stuck, not just slow)
+        proc.terminate()
+        proc.join(timeout=2)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=2)
+        raise _HardTimeout(f"exceeded {seconds}s hard deadline")
+    finally:
+        parent_conn.close()
 
 from backend.config import settings
 from backend.database import get_db, engine
@@ -1905,15 +1946,35 @@ def _flag_if_resolved_match_looks_wrong(
 
 
 # tight deadline only under lambda (avoids an ungraceful 29s kill); local dev has no such ceiling
+# 27 reverted back to 25 (2026-07-30, same day): pushing to 27 (+query_timeout=24) regressed to a
+# raw Lambda hard-timeout crash (Status: timeout at 29000ms) on the very next test -- the query's
+# real execution time isn't fixed, it varies run to run, and 27s left only ~2s of margin for
+# terminate()/join() cleanup overhead before hitting Lambda's own 29s ceiling. A graceful
+# {"timed_out": true} response (reliable at 25s) is a much better outcome than an occasional raw
+# 500 (the risk introduced by cutting the margin this thin) -- don't push this deadline higher
+# again without also solving the underlying query performance, see query_timeout's docstring below.
 _RUNNING_ON_LAMBDA = bool(os.environ.get("AWS_SECRET_NAME"))
 _WIDE_FALLBACK_DEADLINE = 25 if _RUNNING_ON_LAMBDA else 300  # seconds
 
 
 def _wide_fallback_technique_search(
     job_name: str, alg_weight: "float | None", alg_pallets: "int | None", alg_pcs: "int | None",
-    days_back: int = 90, query_timeout: "int | None" = 15,
+    days_back: int = 90, query_timeout: "int | None" = 22,
 ) -> "tuple[dict | None, list[dict], bool]":
     """live technique search across `days_back` days for a trip/manifest suffix matching job_name.
+    query_timeout raised, then partially reverted, same day (2026-07-30): 15 -> 22 -> 24 -> 22.
+    Confirmed live that a 90-day scan routinely needs more than 15s (multiple different job
+    suffixes all hit a clean HYT00 query-timeout-expired at exactly 15s, never once completing) --
+    genuinely slow right now, not just occasionally unlucky. Pushing further to 24s (with the
+    outer _WIDE_FALLBACK_DEADLINE also raised 25 -> 27) regressed on the very next live test to a
+    raw Lambda hard-timeout crash instead of a graceful response -- the query's real execution
+    time varies run to run, and 27s left too little margin under Lambda's 29s ceiling for
+    terminate()/join() cleanup. Settled back on 22s/25s: reliable graceful degradation beats
+    squeezing a few more seconds of query time at the cost of occasional raw crashes. If 22s isn't
+    enough (it may still time out for the genuinely slowest queries), the fix is no longer "raise
+    the timeout further" -- see the 2026-07-30 entry in project memory/CLAUDE.md for next steps
+    (query optimization, most likely needing Marge's input on `_TECHNIQUE_QUERY`, since 90 days' worth of unfiltered manifests is a
+    lot to pull and filter client-side for a single suffix lookup).
     returns (best, all_candidates, timed_out) -- timed_out distinguishes "ran to completion,
     found nothing" from "didn't finish", since a fixed deadline can clip a call that would've matched.
     all_candidates lets the caller persist ambiguous-trip siblings too, not just the winner."""
@@ -3493,8 +3554,18 @@ def refresh_bol_for_record(record_id: uuid.UUID, db: Session = Depends(get_db)):
 @app.post("/api/bols/{record_id}/retry-match", tags=["Admin"])
 def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
     """on-demand retry for one stuck invoice_only stub against a wide 90-day technique window.
-    query_timeout=None -- this endpoint has the full request budget to itself, unlike the
-    inline callers that share a budget with other work"""
+
+    Uses _wide_fallback_technique_search()'s default query_timeout=15 (fixed 2026-07-30,
+    was query_timeout=None here on the theory that this route has the full request budget to
+    itself so no query-level cap was needed) -- confirmed live that the outer _WIDE_FALLBACK_DEADLINE
+    (a ThreadPoolExecutor + future.result(timeout=...) wrapper) is NOT a reliable backstop on its own:
+    pyodbc's blocking call doesn't release the GIL while waiting on AWP-SQL-PROD (the same documented
+    characteristic that made _get_connection() add a raw-socket pre-check for the connect phase), so
+    when the live query itself runs long, the wrapper's own timeout can't fire on schedule either --
+    the request just runs until Lambda's hard 29s function limit kills it outright (an ungraceful 500,
+    not this endpoint's intended "timed_out": true response). pyodbc's own query_timeout is enforced by
+    the ODBC driver itself, independent of the GIL, so it can actually cut a stuck query off in time for
+    the graceful degrade below to run."""
     if settings.USE_MOCK_DATA:
         raise HTTPException(status_code=400, detail="Retry-match is disabled in mock mode.")
 
@@ -3510,7 +3581,6 @@ def retry_match_invoice(record_id: uuid.UUID, db: Session = Depends(get_db)):
 
     wide_match, all_candidates, timed_out = _wide_fallback_technique_search(
         job_name_s, float(stub.alg_weight or 0), stub.alg_pallets, stub.alg_pcs,
-        query_timeout=None,
     )
     if wide_match is None:
         if timed_out:
